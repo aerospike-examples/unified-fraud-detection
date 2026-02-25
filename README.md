@@ -4,10 +4,18 @@ A comprehensive fraud detection system built with FastAPI backend and Next.js fr
 
 ## 🚀 Quick Start
 
-Run Docker compose to build. the necessary containers
+1. Copy the sample env file and add your Gemini API key:
+```bash
+cp .env.sample .env
 ```
-export GEMINI_API_KEY=""
-DOCKER_BUILDKIT=0 docker compose up -d
+Then edit `.env` and set your key:
+```
+GEMINI_API_KEY=your-gemini-api-key-here
+```
+
+2. Start all services:
+```bash
+docker compose up -d
 ```
 
 **Access the application:**
@@ -15,25 +23,36 @@ DOCKER_BUILDKIT=0 docker compose up -d
 
 ## 🏗️ Architecture
 
-### Backend (Python + FastAPI)
-- **Framework**: FastAPI with async support
-- **Graph Database**: Aerospike Graph Service (AGS) via Gremlin queries
-- **Features**:
-  - RESTful API endpoints for fraud detection
-  - Real-time Gremlin query execution
-  - Sample data seeding
-  - User and transaction management
-  - Fraud pattern detection algorithms
+```
+┌──────────────┐     ┌──────────────┐     ┌────────────────────┐     ┌───────────────┐
+│   Frontend   │────▶│   Backend    │────▶│  Aerospike Graph   │────▶│  Aerospike DB │
+│  :8080       │     │  :4000       │     │  Service :8182     │     │  :3000        │
+└──────────────┘     └──────┬───────┘     └────────┬───────────┘     └───────────────┘
+                            │                      │
+                       ┌────▼─────┐          ┌─────▼──────┐
+                       │  Gemini  │          │   Zipkin   │
+                       │  API     │          │   :9411    │
+                       └──────────┘          └────────────┘
 
-### Frontend (Next.js + TailwindCSS)
-- **Framework**: Next.js 14 with App Router
-- **Styling**: TailwindCSS with dark/light theme support
-- **Features**:
-  - Modern, responsive dashboard
-  - Real-time data visualization
-  - User and transaction exploration
-  - Fraud pattern analysis
-  - Interactive graph visualization (Phase 2)
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Aerospike   │────▶│  Prometheus  │────▶│   Grafana    │
+│  Exporter    │     │  :9091       │     │   :3030      │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
+
+### Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **Frontend** | 8080 | Next.js dashboard for exploring users, transactions, and fraud patterns |
+| **Backend** | 4000 | FastAPI server handling fraud detection logic and Gremlin queries |
+| **Generator** | 4001 | Synthetic data generator for seeding the graph |
+| **Aerospike DB** | 3000 | Key-value and graph data store |
+| **Aerospike Graph Service** | 8182 | Gremlin-compatible graph query engine on top of Aerospike |
+| **Zipkin** | 9411 | Distributed tracing for graph query performance |
+| **Aerospike Exporter** | 9145 | Prometheus metrics exporter for Aerospike |
+| **Prometheus** | 9091 | Metrics collection and storage |
+| **Grafana** | 3030 | Monitoring dashboards (default login `admin`/`admin`) |
 
 
 ## 🕵️ Fraud Detection System
