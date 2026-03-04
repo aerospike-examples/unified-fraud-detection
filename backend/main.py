@@ -546,6 +546,17 @@ def create_manual_transaction(
         raise HTTPException(status_code=500, detail=f"Failed to create manual transaction: {str(e)}")
 
 
+@app.post("/transaction-generation/generate")
+def generate_single_transaction():
+    """Generate one transaction (used by Bulk Generation workers). Writes to Graph and KV so transactions appear on the Transaction page."""
+    try:
+        transaction_generator.generate_transaction()
+        return {"status": "created"}
+    except Exception as e:
+        logger.warning(f"Transaction generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Max Rate Configuration Endpoints
 @app.get("/transaction-generation/max-rate")
 def get_max_generation_rate():

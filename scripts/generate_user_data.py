@@ -325,7 +325,7 @@ class UserDataGenerator:
         age = random.randint(18, 70)
         location = random.choice(self.config['cities'])
         occupation = random.choice(self.config['occupations'])
-        risk_score = round(random.uniform(0, 100), 1)
+        risk_score = 0.0
         
         # Generate signup date within last 2 years
         signup_date = (datetime.now() - timedelta(days=random.randint(0, 730))).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -363,8 +363,8 @@ class UserDataGenerator:
             bank_name = random.choice(self.config['banks'])
             created_date = (datetime.now() - timedelta(days=random.randint(0, 1000))).strftime('%Y-%m-%dT%H:%M:%SZ')
             
-            # Add fraud flag for some accounts (10% chance)
-            fraud_flag = random.random() < 0.1
+            # Generated data: fraud flag always false
+            fraud_flag = False
             
             account = {
                 'id': account_id,
@@ -441,7 +441,7 @@ class UserDataGenerator:
             # Update device with user-specific data
             device['last_login'] = last_login
             device['login_count'] = login_count
-            device['fraud_flag'] = random.random() < 0.05  # 5% chance
+            device['fraud_flag'] = False  # Generated data: always false
             
             # Create usage edge
             self.uses_edges.append({
