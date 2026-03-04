@@ -80,10 +80,7 @@ The system implements real-time fraud detection using graph-based analysis:
 
 ## 📚 Documentation
 
-- **[Setup Instructions](./docs/setup.md)** - Complete installation and configuration guide
 - **[Data Model](./docs/datamodel.md)** - Detailed data structure documentation
-- **[RT1 Fraud Detection](./docs/RT1_FRAUD_DETECTION.md)** - RT1 implementation details
-- **[Project Plan](./docs/plan.md)** - Development roadmap and milestones
 
 ## 📄 License
 
