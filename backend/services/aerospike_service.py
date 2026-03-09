@@ -27,9 +27,20 @@ except ImportError:
 logger = logging.getLogger('fraud_detection.aerospike')
 
 # Aerospike configuration
+# AEROSPIKE_HOST = os.environ.get('AEROSPIKE_HOST', 'localhost')
+# AEROSPIKE_PORT = int(os.environ.get('AEROSPIKE_KV_PORT', '3000'))
+# AEROSPIKE_NAMESPACE = os.environ.get('AEROSPIKE_NAMESPACE', 'test')
+# Aerospike configuration
 AEROSPIKE_HOST = os.environ.get('AEROSPIKE_HOST', 'localhost')
 AEROSPIKE_PORT = int(os.environ.get('AEROSPIKE_KV_PORT', '3000'))
 AEROSPIKE_NAMESPACE = os.environ.get('AEROSPIKE_NAMESPACE', 'test')
+# TLS and auth (for Aerospike Cloud)
+AEROSPIKE_TLS_ENABLE = os.environ.get('AEROSPIKE_TLS_ENABLE', '').lower() in ('1', 'true', 'yes')
+AEROSPIKE_TLS_NAME = os.environ.get('AEROSPIKE_TLS_NAME', '')
+AEROSPIKE_TLS_CAFILE = os.environ.get('AEROSPIKE_TLS_CAFILE', '')
+AEROSPIKE_USER = os.environ.get('AEROSPIKE_USER', '')
+AEROSPIKE_PASSWORD = os.environ.get('AEROSPIKE_PASSWORD', '')
+AEROSPIKE_POLICY_TIMEOUT_MS = int(os.environ.get('AEROSPIKE_POLICY_TIMEOUT_MS', '5000'))
 
 # Set names
 SET_USERS = 'users'
@@ -119,20 +130,55 @@ class AerospikeService:
         self.connected = False
         self.namespace = AEROSPIKE_NAMESPACE
         
+    # def connect(self) -> bool:
+    #     """Connect to Aerospike cluster."""
+    #     if not AEROSPIKE_AVAILABLE:
+    #         logger.warning("Aerospike Python client not available. Using fallback storage.")
+    #         return False
+            
+    #     try:
+    #         config = {
+    #             'hosts': [(AEROSPIKE_HOST, AEROSPIKE_PORT)]
+    #         }
+    #         self.client = aerospike.client(config).connect()
+    #         self.connected = True
+    #         logger.info(f"✅ Connected to Aerospike at {AEROSPIKE_HOST}:{AEROSPIKE_PORT}")
+    #         # Create secondary indexes after connection
+    #         self.create_secondary_indexes()
+    #         return True
+    #     except Exception as e:
+    #         logger.error(f"❌ Failed to connect to Aerospike: {e}")
+    #         self.connected = False
+    #         return False
     def connect(self) -> bool:
-        """Connect to Aerospike cluster."""
+        """Connect to Aerospike cluster (supports TLS + auth for Aerospike Cloud)."""
         if not AEROSPIKE_AVAILABLE:
             logger.warning("Aerospike Python client not available. Using fallback storage.")
             return False
-            
+
         try:
-            config = {
-                'hosts': [(AEROSPIKE_HOST, AEROSPIKE_PORT)]
-            }
+            if AEROSPIKE_TLS_ENABLE and AEROSPIKE_TLS_CAFILE:
+                # Aerospike Cloud: TLS + auth (same pattern as test.py)
+                if not os.path.isfile(AEROSPIKE_TLS_CAFILE):
+                    logger.error(f"CA file not found: {AEROSPIKE_TLS_CAFILE}")
+                    self.connected = False
+                    return False
+                config = {
+                    "hosts": [(AEROSPIKE_HOST, AEROSPIKE_PORT, AEROSPIKE_TLS_NAME or AEROSPIKE_HOST)],
+                    "policies": {"timeout": AEROSPIKE_POLICY_TIMEOUT_MS},
+                    "tls": {"cafile": AEROSPIKE_TLS_CAFILE, "enable": True},
+                    "auth_mode": aerospike.AUTH_INTERNAL,
+                    "user": AEROSPIKE_USER,
+                    "password": AEROSPIKE_PASSWORD,
+                }
+            else:
+                # Local / non-TLS
+                config = {
+                    "hosts": [(AEROSPIKE_HOST, AEROSPIKE_PORT)],
+                }
             self.client = aerospike.client(config).connect()
             self.connected = True
             logger.info(f"✅ Connected to Aerospike at {AEROSPIKE_HOST}:{AEROSPIKE_PORT}")
-            # Create secondary indexes after connection
             self.create_secondary_indexes()
             return True
         except Exception as e:

@@ -1,31 +1,65 @@
 services:
-  aerospike-db:
-    image: aerospike/aerospike-server-enterprise:8.0.0.7
-    container_name: aerospike-db
-    volumes:
-      - ./config/aerospike.conf:/etc/aerospike/aerospike.conf
-    healthcheck:
-      test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
-      interval: 5s
-      timeout: 20s
-      retries: 4
-    networks:
-      - asgraph_net
-    ports:
-      - "3000-3002:3000-3002"
+  # aerospike-db:
+  #   image: aerospike/aerospike-server-enterprise:8.0.0.7
+  #   container_name: aerospike-db
+  #   volumes:
+  #     - ./config/aerospike.conf:/etc/aerospike/aerospike.conf
+  #   healthcheck:
+  #     test: ["CMD", "asinfo", "-p", "3000", "-v", "build"]
+  #     interval: 5s
+  #     timeout: 20s
+  #     retries: 4
+  #   networks:
+  #     - asgraph_net
+  #   ports:
+  #     - "3000-3002:3000-3002"
+  # aerospike-graph-service:
+  #   image: aerospike/aerospike-graph-service:3.0.0
+  #   container_name: asgraph-service
+  #   depends_on:
+  #     # aerospike-db:
+  #     #   condition: service_healthy
+  #     zipkin:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./data:/data
+  #     - ./tls:/opt/aerospike-graph/aerospike-client-tls:ro
+  #   environment:
+  #     - aerospike.client.namespace=${AEROSPIKE_NAMESPACE:-test}
+  #     # - aerospike.client.host=${AEROSPIKE_HOST}
+  #     # - aerospike.client.port=${AEROSPIKE_KV_PORT:-4000}
+  #     - aerospike.client.host=3737e0de-825f-4256-b899-991b7b4f07a4.aerospike.internal:3737e0de-825f-4256-b899-991b7b4f07a4.aerospike.internal:4000
+  #     - aerospike.client.tls=true
+  #     - aerospike.graph.index.vertex.label.enabled=true
+  #     - aerospike.graph.query-tracing.threshold-ms=5
+  #     - aerospike.graph.query-tracing.opentelemetry-host=zipkin
+  #   healthcheck:
+  #     test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/healthcheck"]
+  #     interval: 5s
+  #     timeout: 10s
+  #     retries: 4
+  #   networks:
+  #     - asgraph_net
+  #   ports:
+  #     - "8182:8182"
+  #     - "9090:9090"
   aerospike-graph-service:
     image: aerospike/aerospike-graph-service:3.0.0
     container_name: asgraph-service
     depends_on:
-      aerospike-db:
-        condition: service_healthy
       zipkin:
         condition: service_healthy
     volumes:
       - ./data:/data
+      - ./tls:/opt/aerospike-graph/aerospike-client-tls:ro
     environment:
-      - aerospike.client.namespace=test
-      - aerospike.client.host=aerospike-db
+      - aerospike.client.namespace=${AEROSPIKE_NAMESPACE:-test}
+      - aerospike.client.host=${AEROSPIKE_HOST}
+      - aerospike.client.port=${AEROSPIKE_KV_PORT:-4000}
+      - aerospike.client.tls=true
+      - aerospike.client.user=${AEROSPIKE_USER}
+      - aerospike.client.password=${AEROSPIKE_PASSWORD}
+      - aerospike.client.auth.mode=INTERNAL
       - aerospike.graph.index.vertex.label.enabled=true
       - aerospike.graph.query-tracing.threshold-ms=5
       - aerospike.graph.query-tracing.opentelemetry-host=zipkin
@@ -76,14 +110,21 @@ services:
       dockerfile: backend.Dockerfile
     container_name: "asgraph-backend"
     depends_on:
-      aerospike-db:
-        condition: service_healthy
+      # aerospike-db:
+      #   condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
       # Using host's Ollama instead of Docker container for GPU support
     environment:
-      - AEROSPIKE_HOST=aerospike-db
-      - AEROSPIKE_KV_PORT=3000
+      - AEROSPIKE_HOST=${AEROSPIKE_HOST}
+      - AEROSPIKE_KV_PORT=${AEROSPIKE_KV_PORT:-4000}
+      - AEROSPIKE_NAMESPACE=${AEROSPIKE_NAMESPACE:-test}
+      - AEROSPIKE_TLS_ENABLE=${AEROSPIKE_TLS_ENABLE:-true}
+      - AEROSPIKE_TLS_NAME=${AEROSPIKE_TLS_NAME}
+      - AEROSPIKE_TLS_CAFILE=${AEROSPIKE_TLS_CAFILE:-/tls/ca.pem}
+      - AEROSPIKE_USER=${AEROSPIKE_USER}
+      - AEROSPIKE_PASSWORD=${AEROSPIKE_PASSWORD}
+      - GRAPH_HOST_ADDRESS=asgraph-service
       # LLM Provider: "gemini" or "ollama"
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       # Ollama settings (used when LLM_PROVIDER=ollama)
@@ -94,6 +135,7 @@ services:
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
     volumes:
       - ./data:/data
+      - ./tls:/tls
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://0.0.0.0:4000/health"]
       interval: 5s
@@ -131,61 +173,61 @@ services:
     ports:
       - "4001:4001"
   # Monitoring Stack
-  aerospike-exporter:
-    image: aerospike/aerospike-prometheus-exporter:latest
-    container_name: aerospike-exporter
-    depends_on:
-      aerospike-db:
-        condition: service_healthy
-    environment:
-      - AS_HOST=aerospike-db
-      - AS_PORT=3000
-    networks:
-      - asgraph_net
-    ports:
-      - "9145:9145"
+  # aerospike-exporter:
+  #   image: aerospike/aerospike-prometheus-exporter:latest
+  #   container_name: aerospike-exporter
+  #   depends_on:
+  #     aerospike-db:
+  #       condition: service_healthy
+  #   environment:
+  #     - AS_HOST=aerospike-db
+  #     - AS_PORT=3000
+  #   networks:
+  #     - asgraph_net
+  #   ports:
+  #     - "9145:9145"
 
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    depends_on:
-      - aerospike-exporter
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-lifecycle'
-    networks:
-      - asgraph_net
-    ports:
-      - "9091:9090"
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: prometheus
+  #   depends_on:
+  #     - aerospike-exporter
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #     - prometheus_data:/prometheus
+  #   command:
+  #     - '--config.file=/etc/prometheus/prometheus.yml'
+  #     - '--storage.tsdb.path=/prometheus'
+  #     - '--web.enable-lifecycle'
+  #   networks:
+  #     - asgraph_net
+  #   ports:
+  #     - "9091:9090"
 
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    depends_on:
-      - prometheus
-    environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards/custom
-      - ./monitoring/dashboards:/var/lib/grafana/dashboards/aerospike
-    networks:
-      - asgraph_net
-    ports:
-      - "3030:3000"
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: grafana
+  #   depends_on:
+  #     - prometheus
+  #   environment:
+  #     - GF_SECURITY_ADMIN_USER=admin
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #     - GF_USERS_ALLOW_SIGN_UP=false
+  #   volumes:
+  #     - grafana_data:/var/lib/grafana
+  #     - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+  #     - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards/custom
+  #     - ./monitoring/dashboards:/var/lib/grafana/dashboards/aerospike
+  #   networks:
+  #     - asgraph_net
+  #   ports:
+  #     - "3030:3000"
 
 networks:
   asgraph_net:
     name: asgraph_net
 
-volumes:
-  ollama_data:
-  prometheus_data:
-  grafana_data:
+# volumes:
+#   ollama_data:
+#   prometheus_data:
+#   grafana_data:
