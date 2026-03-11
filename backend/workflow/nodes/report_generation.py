@@ -3,16 +3,17 @@ Report Generation Node
 
 Uses LLM to generate a comprehensive markdown report of the investigation.
 Updated for agentic workflow - uses FinalAssessment from LLM agent.
-
-Data Source: Ollama (Mistral)
+LLM calls go through the OpenAI-compatible SDK (provider configured at runtime).
 """
 
+import time
 from datetime import datetime
 from typing import Dict, Any
 import logging
-import os
-import httpx
 
+from openai import AsyncOpenAI
+
+from services.llm_config import get_llm_config
 from workflow.state import InvestigationState, TraceEvent
 
 logger = logging.getLogger('investigation.report_generation')
@@ -74,14 +75,12 @@ Do NOT include an investigation timeline or tool call log. Use clear, profession
 
 async def report_generation_node(
     state: InvestigationState,
-    ollama_client: Any = None  # Not used, we create our own client
 ) -> Dict[str, Any]:
     """
     Generate investigation report using LLM.
     
     Args:
         state: Current investigation state with FinalAssessment
-        ollama_client: (Deprecated) HTTP client for Ollama
         
     Returns:
         Updated state with report markdown
@@ -189,85 +188,34 @@ async def report_generation_node(
         }
 
 
-async def _call_ollama(prompt: str) -> str:
-    """Call Ollama API with the prompt."""
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "mistral")
-    
-    logger.info(f"[Report] Calling Ollama at {base_url} with model {model}")
-    
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            f"{base_url}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.4,
-                    "num_predict": 1500
-                }
-            }
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result.get("response", "")
-
-
-async def _call_gemini(prompt: str) -> str:
-    """Call Google Gemini API using native generateContent endpoint."""
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-    
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
-    
-    logger.info(f"[Report] Calling Gemini API with model {model}")
-    
-    # Use native Gemini API endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key
-            },
-            json={
-                "contents": [
-                    {
-                        "parts": [{"text": prompt}]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.4,
-                    "maxOutputTokens": 1500
-                }
-            }
-        )
-        response.raise_for_status()
-        result = response.json()
-        
-        # Extract response text from Gemini format
-        candidates = result.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            if parts:
-                return parts[0].get("text", "")
-        
-        return ""
-
-
 async def _call_llm(prompt: str) -> str:
-    """Call the configured LLM provider (Gemini or Ollama)."""
-    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
-    
-    if provider == "gemini":
-        return await _call_gemini(prompt)
-    else:
-        return await _call_ollama(prompt)
+    """Call the configured LLM provider via the OpenAI-compatible API."""
+    config = get_llm_config()
+
+    if not config.get("api_key"):
+        raise ValueError("LLM API key is not configured. Set it via the Agent Setup tab or GEMINI_API_KEY env var.")
+
+    logger.info(f"[Report] Calling {config['provider']} model={config['model']}")
+    start = time.time()
+
+    try:
+        client = AsyncOpenAI(
+            api_key=config["api_key"],
+            base_url=config["base_url"],
+            timeout=300.0,
+        )
+        response = await client.chat.completions.create(
+            model=config["model"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=1500,
+        )
+        elapsed = time.time() - start
+        logger.info(f"[Report] {config['provider']} responded in {elapsed:.1f}s")
+        return response.choices[0].message.content or ""
+    except Exception as e:
+        logger.error(f"[Report] {config['provider']} error: {e}")
+        raise
 
 
 def _build_fraud_ring_section(tool_calls: list, user_id: str) -> str:

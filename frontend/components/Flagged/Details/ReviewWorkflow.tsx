@@ -211,14 +211,20 @@ const ReviewWorkflow = ({
         }
     }, [investigationStatus, currentStep, onStepChange])
 
-    // Extract tool call info from trace events
-    const extractedToolCalls = traceEvents
-        .filter(e => e.type === 'tool_call' && e.data)
-        .map(e => ({
-            tool: e.data?.tool || 'unknown',
-            params: e.data?.params || {},
-            result_summary: e.data?.result_summary,
+    // Prefer toolCalls prop (populated by polling) with traceEvents fallback (SSE)
+    const extractedToolCalls = toolCalls.length > 0
+        ? toolCalls.map(tc => ({
+            tool: tc.tool || 'unknown',
+            params: tc.params || {},
+            result_summary: tc.result?.result_summary || '',
         }))
+        : traceEvents
+            .filter(e => e.type === 'tool_call' && e.data)
+            .map(e => ({
+                tool: e.data?.tool || 'unknown',
+                params: e.data?.params || {},
+                result_summary: e.data?.result_summary,
+            }))
 
     const getMainStepStatus = (stepIndex: number): StepStatus => {
         const step = workflowSteps[stepIndex]

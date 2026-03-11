@@ -4,19 +4,18 @@ LLM Reasoning Agent Node
 ReAct-style agent that uses tools to gather evidence and make decisions.
 The LLM decides what data to collect, how many hops to traverse, etc.
 Loops until it calls submit_assessment or hits safety limits.
-
-LLM: Mistral via Ollama (local or Docker)
 """
 
 import json
-import os
 import re
 import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 import logging
-import httpx
 
+from openai import AsyncOpenAI
+
+from services.llm_config import get_llm_config
 from workflow.state import InvestigationState, AgentMessage, ToolCall, FinalAssessment, TraceEvent
 from workflow.tools.investigation_tools import InvestigationTools
 from workflow.metrics import get_collector
@@ -29,7 +28,7 @@ MAX_TOOL_CALLS = 40
 TIMEOUT_SECONDS = 600
 
 
-def llm_agent_node(
+async def llm_agent_node(
     state: InvestigationState,
     aerospike_service: Any,
     graph_service: Any
@@ -50,6 +49,8 @@ def llm_agent_node(
     Returns:
         Updated state with final assessment
     """
+    from services.investigation_progress import update_progress
+
     user_id = state["user_id"]
     investigation_id = state["investigation_id"]
     node_name = "llm_agent"
@@ -87,6 +88,24 @@ def llm_agent_node(
     final_assessment = None
     error_count = 0
     
+    def _publish_progress():
+        """Push current agent state into the shared progress store."""
+        serializable_tool_calls = []
+        for tc in tool_calls:
+            serializable_tool_calls.append({
+                "tool": tc.get("tool", ""),
+                "params": tc.get("params", {}),
+                "result": tc.get("result"),
+                "timestamp": tc.get("timestamp", ""),
+                "iteration": tc.get("iteration", 0),
+            })
+        update_progress(investigation_id, {
+            "currentNode": node_name,
+            "currentPhase": "reasoning",
+            "agentIterations": iteration,
+            "toolCalls": serializable_tool_calls,
+        })
+    
     try:
         while iteration < MAX_ITERATIONS:
             iteration += 1
@@ -113,7 +132,7 @@ def llm_agent_node(
             # Call LLM (supports both Gemini and Ollama via env config)
             try:
                 llm_start = time.time()
-                llm_response = _call_llm(prompt)
+                llm_response = await _call_llm(prompt)
                 llm_duration = (time.time() - llm_start) * 1000
                 
                 # Track LLM call metrics (estimate tokens based on char length)
@@ -145,7 +164,6 @@ def llm_agent_node(
                 error_count += 1
                 
                 if error_count >= 3:
-                    # Fallback to deterministic assessment
                     logger.warning(f"[{node_name}] Falling back to deterministic assessment")
                     final_assessment = _deterministic_assessment(initial_evidence, alert_evidence)
                     break
@@ -192,6 +210,7 @@ def llm_agent_node(
                     }
                 ))
                 
+                _publish_progress()
                 break
             
             # Check tool call limit
@@ -242,6 +261,9 @@ def llm_agent_node(
                 timestamp=datetime.now().isoformat(),
                 tool_name=tool_name
             ))
+            
+            # Publish intermediate progress after each iteration
+            _publish_progress()
         
         # If we hit max iterations without assessment
         if not final_assessment:
@@ -493,108 +515,34 @@ YOUR JSON RESPONSE:"""
     return prompt
 
 
-def _call_ollama(base_url: str, model: str, prompt: str) -> str:
-    """Call Ollama API synchronously."""
-    import time
-    
-    logger.info(f"[LLM] Calling Ollama at {base_url} with model {model}")
+async def _call_llm(prompt: str) -> str:
+    """Call the configured LLM provider via the OpenAI-compatible API."""
+    config = get_llm_config()
+
+    if not config.get("api_key"):
+        raise ValueError("LLM API key is not configured. Set it via the Agent Setup tab or GEMINI_API_KEY env var.")
+
+    logger.info(f"[LLM] Calling {config['provider']} model={config['model']}")
     start = time.time()
-    
+
     try:
-        with httpx.Client(timeout=300.0) as client:
-            response = client.post(
-                f"{base_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "num_predict": 1000
-                    }
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
-            
-            elapsed = time.time() - start
-            logger.info(f"[LLM] Ollama responded in {elapsed:.1f}s")
-            
-            return result.get("response", "")
-            
+        client = AsyncOpenAI(
+            api_key=config["api_key"],
+            base_url=config["base_url"],
+            timeout=300.0,
+        )
+        response = await client.chat.completions.create(
+            model=config["model"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        elapsed = time.time() - start
+        logger.info(f"[LLM] {config['provider']} responded in {elapsed:.1f}s")
+        return response.choices[0].message.content or ""
     except Exception as e:
-        logger.error(f"[LLM] Ollama error: {e}")
+        logger.error(f"[LLM] {config['provider']} error: {e}")
         raise
-
-
-def _call_gemini(api_key: str, model: str, prompt: str) -> str:
-    """Call Google Gemini API using native generateContent endpoint."""
-    import time
-    
-    logger.info(f"[LLM] Calling Gemini API with model {model}")
-    start = time.time()
-    
-    try:
-        # Use native Gemini API endpoint
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        
-        with httpx.Client(timeout=300.0) as client:
-            response = client.post(
-                url,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": api_key
-                },
-                json={
-                    "contents": [
-                        {
-                            "parts": [{"text": prompt}]
-                        }
-                    ],
-                    "generationConfig": {
-                        "temperature": 0.3,
-                        "maxOutputTokens": 1000
-                    }
-                }
-            )
-            response.raise_for_status()
-            result = response.json()
-            
-            elapsed = time.time() - start
-            logger.info(f"[LLM] Gemini responded in {elapsed:.1f}s")
-            
-            # Extract response text from Gemini format
-            candidates = result.get("candidates", [])
-            if candidates:
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                if parts:
-                    return parts[0].get("text", "")
-            
-            return ""
-            
-    except Exception as e:
-        logger.error(f"[LLM] Gemini error: {e}")
-        raise
-
-
-def _call_llm(prompt: str) -> str:
-    """Call the configured LLM provider (Gemini or Ollama)."""
-    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
-    
-    if provider == "gemini":
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-        
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
-        
-        return _call_gemini(api_key, model, prompt)
-    else:
-        # Default to Ollama
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        model = os.environ.get("OLLAMA_MODEL", "mistral")
-        return _call_ollama(base_url, model, prompt)
 
 
 def _parse_tool_call(response: str) -> Tuple[Optional[str], Dict[str, Any]]:

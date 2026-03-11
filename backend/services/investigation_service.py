@@ -2,7 +2,7 @@
 Investigation Service
 
 Manages fraud investigations using the LangGraph workflow.
-Provides SSE streaming for real-time investigation progress.
+Progress is tracked via an in-memory store and consumed by polling.
 """
 
 import asyncio
@@ -11,10 +11,14 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, Optional
 
-import httpx
-
 from workflow.graph import create_investigation_workflow, run_investigation, get_workflow_steps
 from workflow.state import InvestigationState
+from services.investigation_progress import (
+    init_progress,
+    update_progress,
+    get_progress,
+    remove_progress,
+)
 
 logger = logging.getLogger('investigation.service')
 
@@ -28,16 +32,9 @@ class InvestigationService:
         self,
         aerospike_service: Any,
         graph_service: Any,
-        ollama_base_url: str = "http://localhost:11434",
-        ollama_model: str = "mistral"
     ):
         self.aerospike_service = aerospike_service
         self.graph_service = graph_service
-        self.ollama_base_url = ollama_base_url
-        self.ollama_model = ollama_model
-        
-        # HTTP client for Ollama - 5 minute timeout for model loading
-        self.ollama_client = httpx.AsyncClient(timeout=300.0)
         
         # Workflow instance
         self.workflow = None
@@ -46,7 +43,7 @@ class InvestigationService:
         self._active_investigations: Dict[str, Dict[str, Any]] = {}
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
         
-        logger.info(f"Investigation service initialized with Ollama at {ollama_base_url}")
+        logger.info("Investigation service initialized")
     
     async def initialize(self):
         """Initialize the investigation workflow."""
@@ -54,40 +51,14 @@ class InvestigationService:
             self.workflow = create_investigation_workflow(
                 self.aerospike_service,
                 self.graph_service,
-                self.ollama_client
             )
             logger.info("Investigation workflow initialized")
-            
-            # Check Ollama connectivity
-            await self._check_ollama()
-            
         except Exception as e:
             logger.error(f"Failed to initialize investigation service: {e}")
             raise
     
-    async def _check_ollama(self):
-        """Check if Ollama is available and pull model if needed."""
-        try:
-            response = await self.ollama_client.get(f"{self.ollama_base_url}/api/tags")
-            if response.status_code == 200:
-                models = response.json().get("models", [])
-                model_names = [m.get("name", "").split(":")[0] for m in models]
-                
-                if self.ollama_model not in model_names:
-                    logger.info(f"Model {self.ollama_model} not found, pulling...")
-                    # Note: Model pull happens automatically on first use
-                else:
-                    logger.info(f"Ollama connected, model {self.ollama_model} available")
-            else:
-                logger.warning(f"Ollama health check returned {response.status_code}")
-                
-        except Exception as e:
-            logger.warning(f"Could not connect to Ollama: {e}")
-            logger.warning("Investigations will use fallback logic without LLM")
-    
     async def close(self):
         """Clean up resources."""
-        await self.ollama_client.aclose()
         logger.info("Investigation service closed")
     
     def get_workflow_steps(self) -> list[Dict[str, str]]:
@@ -146,6 +117,9 @@ class InvestigationService:
         if not self.workflow:
             await self.initialize()
         
+        # Initialize shared progress store for polling
+        init_progress(investigation_id, user_id)
+        
         # Yield initial event
         yield {
             "event": "start",
@@ -173,6 +147,15 @@ class InvestigationService:
                     # Update active investigation tracking
                     if investigation_id in self._active_investigations:
                         self._active_investigations[investigation_id]["current_step"] = trace.get("node", "")
+                    
+                    # Write to progress store for polling
+                    progress_updates: Dict[str, Any] = {"currentNode": trace.get("node", "")}
+                    if trace.get("type") == "node_complete":
+                        current_completed = (get_progress(investigation_id) or {}).get("completedSteps", [])
+                        node = trace.get("node", "")
+                        if node and node not in current_completed:
+                            progress_updates["completedSteps"] = current_completed + [node]
+                    update_progress(investigation_id, progress_updates)
                 
                 elif event_type == "state_update":
                     node = event.get("node", "")
@@ -191,9 +174,23 @@ class InvestigationService:
                     if not final_state:
                         final_state = {}
                     final_state.update(data)
+                    
+                    # Write to progress store for polling
+                    state_updates: Dict[str, Any] = {
+                        "currentNode": node,
+                        "currentPhase": data.get("current_phase", ""),
+                    }
+                    if data.get("initial_evidence"):
+                        state_updates["initialEvidence"] = data["initial_evidence"]
+                    if data.get("alert_evidence"):
+                        state_updates["alertEvidence"] = data["alert_evidence"]
+                    if data.get("final_assessment"):
+                        state_updates["finalAssessment"] = data["final_assessment"]
+                    if data.get("report_markdown"):
+                        state_updates["report"] = data["report_markdown"]
+                    update_progress(investigation_id, state_updates)
                 
                 elif event_type == "metrics":
-                    # Forward performance metrics to frontend
                     yield {
                         "event": "metrics",
                         "data": {
@@ -201,6 +198,9 @@ class InvestigationService:
                             "data": event.get("data", {})
                         }
                     }
+                    update_progress(investigation_id, {
+                        "performanceMetrics": event.get("data", {}),
+                    })
                 
                 elif event_type == "complete":
                     yield {
@@ -210,6 +210,10 @@ class InvestigationService:
                             "user_id": user_id
                         }
                     }
+                    update_progress(investigation_id, {
+                        "status": "completed",
+                        "completedSteps": ["alert_validation", "data_collection", "llm_agent", "report_generation"],
+                    })
                     
                 elif event_type == "error":
                     yield {
@@ -219,6 +223,10 @@ class InvestigationService:
                             "investigation_id": investigation_id
                         }
                     }
+                    update_progress(investigation_id, {
+                        "status": "error",
+                        "error": event.get("error", "Unknown error"),
+                    })
             
             # Store final result
             if final_state:
@@ -272,15 +280,14 @@ class InvestigationService:
                 }
             }
             
+            update_progress(investigation_id, {
+                "status": "error",
+                "error": str(e),
+            })
+            
             if investigation_id in self._active_investigations:
                 self._active_investigations[investigation_id]["status"] = "error"
                 self._active_investigations[investigation_id]["error"] = str(e)
-    
-    def get_investigation_status(self, investigation_id: str) -> Optional[Dict[str, Any]]:
-        """Get status of an investigation."""
-        if investigation_id in self._active_investigations:
-            return self._active_investigations[investigation_id]
-        return None
     
     def get_investigation_result(self, investigation_id: str) -> Optional[Dict[str, Any]]:
         """Get result of a completed investigation."""

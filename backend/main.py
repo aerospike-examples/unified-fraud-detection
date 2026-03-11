@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Path, Body, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 from typing import Optional, List
 from datetime import datetime
@@ -10,11 +9,8 @@ import tempfile
 import zipfile
 import os
 import shutil
-import json
 import subprocess
 import sys
-
-from sse_starlette.sse import EventSourceResponse
 
 from services.fraud_service import FraudService
 from services.graph_service import GraphService
@@ -27,6 +23,19 @@ from services.investigation_service import InvestigationService
 from services.feature_service import FeatureService
 from services.transaction_injector import TransactionInjector
 from services.progress_service import progress_service
+from services.investigation_progress import (
+    init_progress,
+    update_progress,
+    get_progress,
+)
+from services.llm_config import (
+    init_llm_config,
+    get_llm_config_safe,
+    update_llm_config,
+    get_available_providers,
+)
+
+import asyncio
 
 from logging_config import setup_logging, get_logger
 
@@ -70,15 +79,13 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Aerospike KV service not available, using file-based storage")
     
-    # Initialize investigation service
-    ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "mistral")
+    # Initialize LLM config from env vars
+    init_llm_config()
     
+    # Initialize investigation service
     investigation_service = InvestigationService(
         aerospike_service=aerospike_service,
         graph_service=graph_service,
-        ollama_base_url=ollama_base_url,
-        ollama_model=ollama_model
     )
     
     try:
@@ -1423,95 +1430,60 @@ def get_investigation_steps():
         raise HTTPException(status_code=500, detail=f"Failed to get steps: {str(e)}")
 
 
-@app.get("/investigation/{user_id}/stream")
-async def stream_investigation(
-    user_id: str = Path(..., description="User ID to investigate"),
-    investigation_id: Optional[str] = Query(None, description="Optional existing investigation ID")
-):
-    """
-    SSE endpoint that streams investigation progress.
-    
-    Events:
-    - start: Investigation started with workflow steps
-    - trace: Node execution trace events
-    - progress: State updates from each node
-    - complete: Investigation completed
-    - error: Error occurred
-    """
-    if not investigation_service:
-        raise HTTPException(status_code=503, detail="Investigation service not initialized")
-    
-    def json_serializer(obj):
-        """Custom JSON serializer for objects not serializable by default json code"""
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-    
-    async def event_generator():
-        try:
-            async for event in investigation_service.stream_investigation(user_id, investigation_id):
-                event_type = event.get("event", "message")
-                event_data = event.get("data", event)
-                
-                yield {
-                    "event": event_type,
-                    "data": json.dumps(event_data, default=json_serializer)
-                }
-        except Exception as e:
-            logger.error(f"Investigation stream error: {e}")
-            yield {
-                "event": "error",
-                "data": json.dumps({"error": str(e)})
-            }
-    
-    return EventSourceResponse(event_generator())
-
-
-@app.post("/investigation/{user_id}/start")
-async def start_investigation(
+@app.post("/investigation/{user_id}/start-poll")
+async def start_investigation_poll(
     user_id: str = Path(..., description="User ID to investigate"),
     triggered_by: str = Query("manual", description="What triggered the investigation")
 ):
-    """Start a new investigation and return the investigation ID"""
-    try:
-        if not investigation_service:
-            raise HTTPException(status_code=503, detail="Investigation service not initialized")
-        
-        investigation_id = await investigation_service.start_investigation(user_id, triggered_by)
-        
-        return {
-            "investigation_id": investigation_id,
-            "user_id": user_id,
-            "triggered_by": triggered_by,
-            "stream_url": f"/investigation/{user_id}/stream?investigation_id={investigation_id}"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Failed to start investigation: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to start investigation: {str(e)}")
+    """
+    Start an investigation and return immediately.
+    The workflow runs as a background asyncio task.
+    Use GET /investigation/{investigation_id}/poll to follow progress.
+    """
+    if not investigation_service:
+        raise HTTPException(status_code=503, detail="Investigation service not initialized")
+
+    investigation_id = await investigation_service.start_investigation(user_id, triggered_by)
+
+    if not investigation_service.workflow:
+        await investigation_service.initialize()
+
+    init_progress(investigation_id, user_id)
+
+    async def _run_in_background():
+        """Consume the full SSE generator in the background, which
+        populates the shared progress store as a side-effect."""
+        try:
+            async for _ in investigation_service.stream_investigation(user_id, investigation_id):
+                pass
+        except Exception as exc:
+            logger.error(f"Background investigation {investigation_id} failed: {exc}")
+            update_progress(investigation_id, {
+                "status": "error",
+                "error": str(exc),
+            })
+
+    asyncio.create_task(_run_in_background())
+
+    return {
+        "investigation_id": investigation_id,
+        "user_id": user_id,
+        "status": "running",
+    }
 
 
-@app.get("/investigation/{investigation_id}/status")
-def get_investigation_status(
+@app.get("/investigation/{investigation_id}/poll")
+def poll_investigation(
     investigation_id: str = Path(..., description="Investigation ID")
 ):
-    """Get current investigation status (for reconnection)"""
-    try:
-        if not investigation_service:
-            raise HTTPException(status_code=503, detail="Investigation service not initialized")
-        
-        status = investigation_service.get_investigation_status(investigation_id)
-        
-        if not status:
-            raise HTTPException(status_code=404, detail="Investigation not found")
-        
-        return status
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Failed to get investigation status: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
+    """
+    Return the current live progress for a running investigation.
+    The frontend calls this every ~1.5 seconds.
+    """
+    progress = get_progress(investigation_id)
+    if progress is None:
+        raise HTTPException(status_code=404, detail="Investigation not found or already cleaned up")
+    return progress
 
 
 @app.get("/investigation/{investigation_id}/result")
@@ -1624,4 +1596,38 @@ def get_user_latest_investigation(
     except Exception as e:
         logger.error(f"❌ Failed to get latest investigation for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get latest investigation: {str(e)}")
+
+
+# ── LLM Configuration ───────────────────────────────────────────────
+
+@app.get("/llm/providers")
+def list_llm_providers():
+    """Return available LLM providers and their models."""
+    return {"providers": get_available_providers()}
+
+
+@app.get("/llm/config")
+def get_llm_config_endpoint():
+    """Return current LLM configuration (API key is masked)."""
+    return get_llm_config_safe()
+
+
+class LLMConfigUpdate(BaseModel):
+    provider: str
+    model: str
+    api_key: Optional[str] = None
+
+
+@app.post("/llm/config")
+def update_llm_config_endpoint(body: LLMConfigUpdate):
+    """Update LLM configuration at runtime."""
+    try:
+        update_llm_config(
+            provider=body.provider,
+            model=body.model,
+            api_key=body.api_key,
+        )
+        return get_llm_config_safe()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 

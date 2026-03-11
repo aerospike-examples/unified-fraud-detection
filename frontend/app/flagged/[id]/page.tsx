@@ -32,7 +32,7 @@ import ReviewWorkflow from '@/components/Flagged/Details/ReviewWorkflow'
 import GraphVisualization from '@/components/Flagged/Details/GraphVisualization'
 import { InvestigationReport } from '@/components/Flagged/Details/InvestigationReport'
 import PerformanceMetricsPanel from '@/components/Flagged/Details/PerformanceMetricsPanel'
-import { useInvestigation } from '@/hooks/useInvestigation'
+import { useInvestigationPolling } from '@/hooks/useInvestigationPolling'
 import { useAccountData } from '@/hooks/useAccountData'
 import { formatCurrency } from '@/lib/utils'
 
@@ -109,12 +109,22 @@ export default function FlaggedAccountDetailsPage() {
     const [currentStep, setCurrentStep] = useState(0)
     const [activeTab, setActiveTab] = useState('overview')
     const [loadedExisting, setLoadedExisting] = useState(false)
+    const [llmConfigured, setLlmConfigured] = useState<boolean | null>(null)
+    const [llmWarning, setLlmWarning] = useState(false)
     
     // Fetch real account data
     const { data: account, loading, error, refetch } = useAccountData(accountId)
     
     // Investigation hook
-    const investigation = useInvestigation()
+    const investigation = useInvestigationPolling()
+
+    // Check LLM configuration on mount
+    useEffect(() => {
+        fetch('/api/llm/config')
+            .then(r => r.json())
+            .then(data => setLlmConfigured(!!data.api_key_set))
+            .catch(() => setLlmConfigured(false))
+    }, [])
 
     // Load existing investigation on mount
     useEffect(() => {
@@ -131,6 +141,11 @@ export default function FlaggedAccountDetailsPage() {
     }, [account?.user_id, investigation.status, loadedExisting])
 
     const handleStartInvestigation = () => {
+        if (!llmConfigured) {
+            setLlmWarning(true)
+            return
+        }
+        setLlmWarning(false)
         if (account) {
             investigation.startInvestigation(account.user_id)
             setActiveTab('investigation')
@@ -212,6 +227,20 @@ export default function FlaggedAccountDetailsPage() {
                     </Link>
                 </div>
             </div>
+
+            {/* LLM Not Configured Warning */}
+            {llmWarning && !llmConfigured && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+                    <AlertTriangle className="h-5 w-5 text-amber-600 mt-0.5 shrink-0" />
+                    <div>
+                        <h3 className="font-semibold text-amber-800">LLM API Key Not Configured</h3>
+                        <p className="text-sm text-amber-700 mt-1">
+                            An API key is required to run AI investigations. Please configure it in{' '}
+                            <Link href="/admin" className="underline font-medium hover:text-amber-900">Admin &rarr; Agent Setup</Link>.
+                        </p>
+                    </div>
+                </div>
+            )}
 
             {/* Alert Banner */}
             <div className="bg-red-50 border border-red-200 rounded-lg p-4">

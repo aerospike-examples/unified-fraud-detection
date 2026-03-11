@@ -85,25 +85,6 @@ services:
       interval: 5s
       timeout: 10s
       retries: 4
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: asgraph-ollama
-  #   volumes:
-  #     - ollama_data:/root/.ollama
-  #   networks:
-  #     - asgraph_net
-  #   ports:
-  #     - "11434:11434"
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "ollama list || exit 0"]
-  #     interval: 10s
-  #     timeout: 30s
-  #     retries: 5
-  #     start_period: 30s
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         memory: 4G
   backend:
     build:
       context: .
@@ -114,7 +95,6 @@ services:
       #   condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
-      # Using host's Ollama instead of Docker container for GPU support
     environment:
       - AEROSPIKE_HOST=${AEROSPIKE_HOST}
       - AEROSPIKE_KV_PORT=${AEROSPIKE_KV_PORT:-4000}
@@ -125,14 +105,6 @@ services:
       - AEROSPIKE_USER=${AEROSPIKE_USER}
       - AEROSPIKE_PASSWORD=${AEROSPIKE_PASSWORD}
       - GRAPH_HOST_ADDRESS=asgraph-service
-      # LLM Provider: "gemini" or "ollama"
-      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
-      # Ollama settings (used when LLM_PROVIDER=ollama)
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=mistral
-      # Gemini settings (used when LLM_PROVIDER=gemini)
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
     volumes:
       - ./data:/data
       - ./tls:/tls
@@ -143,8 +115,6 @@ services:
       retries: 4
     networks:
       - asgraph_net
-    ports:
-      - "4000:4000"
   frontend:
     build:
       context: .
@@ -155,7 +125,6 @@ services:
         condition: service_healthy
     environment:
       - BACKEND_URL=http://asgraph-backend:4000
-      - NEXT_PUBLIC_BACKEND_URL=http://localhost:4000
     networks:
       - asgraph_net
     ports:
@@ -226,8 +195,3 @@ services:
 networks:
   asgraph_net:
     name: asgraph_net
-
-# volumes:
-#   ollama_data:
-#   prometheus_data:
-#   grafana_data:

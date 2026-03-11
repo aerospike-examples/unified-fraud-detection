@@ -2,11 +2,12 @@
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useState } from 'react'
-import { Activity, BarChart3, RefreshCw, Database, Shield } from 'lucide-react'
+import { Activity, BarChart3, RefreshCw, Database, Shield, Bot } from 'lucide-react'
 import Performance from '@/components/Admin/Performance'
 import Generation from '@/components/Admin/Generation'
 import DataManagement from '@/components/Admin/DataManagement'
 import FraudDetection from '@/components/Admin/FraudDetection'
+import AgentSetup from '@/components/Admin/AgentSetup'
 
 export default function AdminPage() {
 	const [active, setActive] = useState('data');
@@ -27,7 +28,7 @@ export default function AdminPage() {
 				</h3>
       		</div>
 			<Tabs value={active} onValueChange={setActive} className="space-y-4">
-				<TabsList className="grid w-full grid-cols-4">
+				<TabsList className="grid w-full grid-cols-5">
 				<TabsTrigger value="data" className="flex items-center space-x-2">
 						<Database className="w-4 h-4" />
 						<span>Data Management</span>
@@ -41,11 +42,15 @@ export default function AdminPage() {
 						<span>Fraud Detection Rules</span>
 					</TabsTrigger>
 	
-					<TabsTrigger value="performance" className="flex items-center space-x-2">
-						<BarChart3 className="w-4 h-4" />
-						<span>Performance</span>
-					</TabsTrigger>
-				</TabsList>
+				<TabsTrigger value="performance" className="flex items-center space-x-2">
+					<BarChart3 className="w-4 h-4" />
+					<span>Performance</span>
+				</TabsTrigger>
+				<TabsTrigger value="agent-setup" className="flex items-center space-x-2">
+					<Bot className="w-4 h-4" />
+					<span>Agent Setup</span>
+				</TabsTrigger>
+			</TabsList>
 			<TabsContent forceMount value="data" className={`space-y-4 ${active !== 'data' ? 'hidden' : ''}`}>
 				<DataManagement />
 			</TabsContent>
@@ -55,10 +60,13 @@ export default function AdminPage() {
 			<TabsContent forceMount value="fraud-detection" className={`space-y-4 ${active !== 'fraud-detection' ? 'hidden' : ''}`}>
 				<FraudDetection />
 			</TabsContent>
-			<TabsContent forceMount value="performance" className={`space-y-4 ${active !== 'performance' ? 'hidden' : ''}`}>
-				<Performance />                
-			</TabsContent>
-			</Tabs>
+		<TabsContent forceMount value="performance" className={`space-y-4 ${active !== 'performance' ? 'hidden' : ''}`}>
+			<Performance />                
+		</TabsContent>
+		<TabsContent forceMount value="agent-setup" className={`space-y-4 ${active !== 'agent-setup' ? 'hidden' : ''}`}>
+			<AgentSetup />
+		</TabsContent>
+		</Tabs>
     	</div>
   	)
 } 

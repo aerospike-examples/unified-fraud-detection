@@ -110,12 +110,11 @@ class InstrumentedAerospikeSaver(AerospikeSaver):
 def create_investigation_workflow(
     aerospike_service: Any,
     graph_service: Any,
-    ollama_client: Any = None  # Kept for backwards compatibility but not used
 ) -> StateGraph:
     """
     Create the LangGraph investigation workflow.
     
-    New 4-node agentic workflow:
+    4-node agentic workflow:
     - alert_validation: Get flag context from KV
     - data_collection: Gather baseline evidence from KV + Graph
     - llm_agent: ReAct agent that uses tools to gather more data
@@ -124,7 +123,6 @@ def create_investigation_workflow(
     Args:
         aerospike_service: Aerospike KV service instance
         graph_service: Aerospike Graph service instance
-        ollama_client: (Deprecated) HTTP client for Ollama - agent handles this internally
         
     Returns:
         Compiled StateGraph workflow
@@ -152,8 +150,8 @@ def create_investigation_workflow(
     # ------------------------------------------
     # Node 3: LLM Reasoning Agent (with tools)
     # ------------------------------------------
-    def _llm_agent(state: InvestigationState) -> Dict[str, Any]:
-        return llm_agent_node(state, aerospike_service, graph_service)
+    async def _llm_agent(state: InvestigationState) -> Dict[str, Any]:
+        return await llm_agent_node(state, aerospike_service, graph_service)
     
     workflow.add_node("llm_agent", _llm_agent)
     
@@ -161,7 +159,7 @@ def create_investigation_workflow(
     # Node 4: Report Generation
     # ------------------------------------------
     async def _report_generation(state: InvestigationState) -> Dict[str, Any]:
-        return await report_generation_node(state, ollama_client)
+        return await report_generation_node(state)
     
     workflow.add_node("report_generation", _report_generation)
     
