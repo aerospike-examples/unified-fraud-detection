@@ -59,6 +59,9 @@ class InstrumentedAerospikeSaver(AerospikeSaver):
         try:
             result = super().put(config, checkpoint, metadata, new_versions)
             return result
+        except Exception as e:
+            logger.warning(f"Checkpoint put failed (non-fatal): {e}")
+            return config
         finally:
             duration_ms = (time.time() - start) * 1000
             if inv_id:
@@ -80,6 +83,8 @@ class InstrumentedAerospikeSaver(AerospikeSaver):
         start = time.time()
         try:
             super().put_writes(config, writes, task_id, task_path)
+        except Exception as e:
+            logger.warning(f"Checkpoint put_writes failed (non-fatal): {e}")
         finally:
             duration_ms = (time.time() - start) * 1000
             if inv_id:

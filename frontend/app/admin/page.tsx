@@ -2,11 +2,11 @@
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useState } from 'react'
-import { Activity, BarChart3, RefreshCw, Database, Shield } from 'lucide-react'
-import Performance from '@/components/Admin/Performance'
+import { Activity, RefreshCw, Database, Shield, Brain } from 'lucide-react'
 import Generation from '@/components/Admin/Generation'
 import DataManagement from '@/components/Admin/DataManagement'
 import FraudDetection from '@/components/Admin/FraudDetection'
+import AISettings from '@/components/Admin/AISettings'
 
 export default function AdminPage() {
 	const [active, setActive] = useState('data');
@@ -41,9 +41,9 @@ export default function AdminPage() {
 						<span>Fraud Detection Rules</span>
 					</TabsTrigger>
 	
-					<TabsTrigger value="performance" className="flex items-center space-x-2">
-						<BarChart3 className="w-4 h-4" />
-						<span>Performance</span>
+					<TabsTrigger value="ai-settings" className="flex items-center space-x-2">
+						<Brain className="w-4 h-4" />
+						<span>AI Settings</span>
 					</TabsTrigger>
 				</TabsList>
 			<TabsContent forceMount value="data" className={`space-y-4 ${active !== 'data' ? 'hidden' : ''}`}>
@@ -55,8 +55,8 @@ export default function AdminPage() {
 			<TabsContent forceMount value="fraud-detection" className={`space-y-4 ${active !== 'fraud-detection' ? 'hidden' : ''}`}>
 				<FraudDetection />
 			</TabsContent>
-			<TabsContent forceMount value="performance" className={`space-y-4 ${active !== 'performance' ? 'hidden' : ''}`}>
-				<Performance />                
+			<TabsContent forceMount value="ai-settings" className={`space-y-4 ${active !== 'ai-settings' ? 'hidden' : ''}`}>
+				<AISettings />
 			</TabsContent>
 			</Tabs>
     	</div>

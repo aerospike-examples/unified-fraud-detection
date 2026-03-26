@@ -68,7 +68,13 @@ Generate a professional investigation report with the following sections:
 5. Recommendation and Rationale
 6. Next Steps for Analyst
 
-Do NOT include an investigation timeline or tool call log. Use clear, professional language suitable for compliance review.
+CRITICAL FORMATTING RULES:
+- Use proper Markdown with BLANK LINES between every section, heading, and paragraph.
+- Each ## heading MUST be on its own line with a blank line before and after it.
+- Each bullet point (- item) must be on its own line.
+- Do NOT put multiple sections on the same line.
+- Do NOT include an investigation timeline or tool call log.
+- Use clear, professional language suitable for compliance review.
 """
 
 
@@ -189,85 +195,73 @@ async def report_generation_node(
         }
 
 
-async def _call_ollama(prompt: str) -> str:
-    """Call Ollama API with the prompt."""
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "mistral")
-    
-    logger.info(f"[Report] Calling Ollama at {base_url} with model {model}")
-    
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            f"{base_url}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.4,
-                    "num_predict": 1500
-                }
-            }
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result.get("response", "")
-
-
-async def _call_gemini(prompt: str) -> str:
-    """Call Google Gemini API using native generateContent endpoint."""
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-    
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
-    
-    logger.info(f"[Report] Calling Gemini API with model {model}")
-    
-    # Use native Gemini API endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key
-            },
-            json={
-                "contents": [
-                    {
-                        "parts": [{"text": prompt}]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.4,
-                    "maxOutputTokens": 1500
-                }
-            }
-        )
-        response.raise_for_status()
-        result = response.json()
-        
-        # Extract response text from Gemini format
-        candidates = result.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            if parts:
-                return parts[0].get("text", "")
-        
-        return ""
-
-
 async def _call_llm(prompt: str) -> str:
-    """Call the configured LLM provider (Gemini or Ollama)."""
-    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    """Call the configured LLM provider using shared config from llm_agent."""
+    from workflow.nodes.llm_agent import _get_llm_config
+    
+    cfg = _get_llm_config()
+    provider = cfg["provider"]
     
     if provider == "gemini":
-        return await _call_gemini(prompt)
+        api_key = cfg["gemini_api_key"]
+        model = cfg["gemini_model"]
+        if not api_key:
+            raise ValueError("Gemini API key is not configured.")
+        
+        logger.info(f"[Report] Calling Gemini API with model {model}")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                url,
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500}
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            candidates = result.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+            return ""
     else:
-        return await _call_ollama(prompt)
+        api_key = cfg["mistral_api_key"]
+        model = cfg["mistral_model"]
+        if not api_key:
+            raise ValueError("Mistral API key is not configured.")
+        
+        reasoning_effort = cfg.get("mistral_reasoning_effort", "none")
+        logger.info(f"[Report] Calling Mistral API with model {model} (reasoning={reasoning_effort})")
+        
+        is_magistral = model.startswith("magistral")
+        body: dict = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.4,
+            "max_tokens": 1500,
+        }
+        if not is_magistral and reasoning_effort == "high":
+            body["reasoning_effort"] = "high"
+        
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                json=body,
+            )
+            response.raise_for_status()
+            result = response.json()
+            choices = result.get("choices", [])
+            if not choices:
+                return ""
+            content = choices[0].get("message", {}).get("content", "")
+            if isinstance(content, list):
+                return "".join(c.get("text", "") for c in content if c.get("type") == "text")
+            return content if isinstance(content, str) else ""
 
 
 def _build_fraud_ring_section(tool_calls: list, user_id: str) -> str:
@@ -422,10 +416,21 @@ def _build_tool_call_summary(tool_calls: list) -> str:
 
 def _clean_report(response: str, state: InvestigationState) -> str:
     """Clean and format the generated report."""
+    import re as _re
+    
     initial = state.get("initial_evidence") or {}
     profile = initial.get("profile", {})
     tool_calls = state.get("tool_calls") or []
     user_id = state.get("user_id", "")
+    
+    # Ensure markdown headings are on their own lines with blank lines around them
+    response = _re.sub(r'(?<!\n)(#{1,4}\s)', r'\n\n\1', response)
+    # Ensure bullet points are on their own lines
+    response = _re.sub(r'(?<!\n)(- \*\*)', r'\n\1', response)
+    # Ensure --- separators have blank lines
+    response = _re.sub(r'(?<!\n)(---)', r'\n\n\1', response)
+    # Collapse 3+ consecutive newlines into 2
+    response = _re.sub(r'\n{3,}', '\n\n', response)
     
     # Add header if not present
     if not response.strip().startswith("#"):

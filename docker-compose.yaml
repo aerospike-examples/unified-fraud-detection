@@ -51,25 +51,6 @@ services:
       interval: 5s
       timeout: 10s
       retries: 4
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: asgraph-ollama
-  #   volumes:
-  #     - ollama_data:/root/.ollama
-  #   networks:
-  #     - asgraph_net
-  #   ports:
-  #     - "11434:11434"
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "ollama list || exit 0"]
-  #     interval: 10s
-  #     timeout: 30s
-  #     retries: 5
-  #     start_period: 30s
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         memory: 4G
   backend:
     build:
       context: .
@@ -80,18 +61,19 @@ services:
         condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
-      # Using host's Ollama instead of Docker container for GPU support
     environment:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
-      # LLM Provider: "gemini" or "ollama"
+      # LLM Provider: "gemini" or "mistral"
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
-      # Ollama settings (used when LLM_PROVIDER=ollama)
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=mistral
       # Gemini settings (used when LLM_PROVIDER=gemini)
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      # Mistral settings (used when LLM_PROVIDER=mistral)
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+      - MISTRAL_MODEL=${MISTRAL_MODEL:-mistral-small-latest}
+      # Mistral reasoning: "none" (fast, default) or "high" (deep thinking)
+      - MISTRAL_REASONING_EFFORT=${MISTRAL_REASONING_EFFORT:-none}
     volumes:
       - ./data:/data
     healthcheck:
@@ -186,6 +168,5 @@ networks:
     name: asgraph_net
 
 volumes:
-  ollama_data:
   prometheus_data:
   grafana_data:

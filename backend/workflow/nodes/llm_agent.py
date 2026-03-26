@@ -493,37 +493,76 @@ YOUR JSON RESPONSE:"""
     return prompt
 
 
-def _call_ollama(base_url: str, model: str, prompt: str) -> str:
-    """Call Ollama API synchronously."""
+def _call_mistral(api_key: str, model: str, prompt: str, reasoning_effort: str = "none") -> str:
+    """Call Mistral API with optional reasoning support.
+    
+    Supports both adjustable reasoning (mistral-small-latest with reasoning_effort)
+    and native reasoning models (magistral-small-latest, magistral-medium-latest).
+    
+    reasoning_effort: "none" (no reasoning, fast) or "high" (deep thinking, slower).
+    """
     import time
     
-    logger.info(f"[LLM] Calling Ollama at {base_url} with model {model}")
+    logger.info(f"[LLM] Calling Mistral API with model {model} (reasoning={reasoning_effort})")
     start = time.time()
+    
+    is_magistral = model.startswith("magistral")
+    
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 2000,
+    }
+    
+    if not is_magistral and reasoning_effort == "high":
+        body["reasoning_effort"] = "high"
     
     try:
         with httpx.Client(timeout=300.0) as client:
             response = client.post(
-                f"{base_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "num_predict": 1000
-                    }
-                }
+                "https://api.mistral.ai/v1/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                json=body,
             )
             response.raise_for_status()
             result = response.json()
             
             elapsed = time.time() - start
-            logger.info(f"[LLM] Ollama responded in {elapsed:.1f}s")
+            logger.info(f"[LLM] Mistral responded in {elapsed:.1f}s")
             
-            return result.get("response", "")
+            choices = result.get("choices", [])
+            if not choices:
+                return ""
+            
+            content = choices[0].get("message", {}).get("content", "")
+            
+            # Reasoning models return content as an array of typed chunks
+            if isinstance(content, list):
+                thinking_text = ""
+                answer_text = ""
+                for chunk in content:
+                    if chunk.get("type") == "thinking":
+                        for part in chunk.get("thinking", []):
+                            thinking_text += part.get("text", "")
+                    elif chunk.get("type") == "text":
+                        answer_text += chunk.get("text", "")
+                
+                if thinking_text:
+                    logger.info(f"[LLM] Mistral reasoning: {thinking_text[:200]}...")
+                
+                return answer_text
+            
+            # Non-reasoning models return content as a plain string
+            return content if isinstance(content, str) else ""
             
     except Exception as e:
-        logger.error(f"[LLM] Ollama error: {e}")
+        logger.error(f"[LLM] Mistral error: {e}")
         raise
 
 
@@ -578,23 +617,47 @@ def _call_gemini(api_key: str, model: str, prompt: str) -> str:
         raise
 
 
+def _get_llm_config() -> Dict[str, str]:
+    """Get merged LLM config: runtime overrides > env vars > defaults."""
+    try:
+        from main import get_llm_runtime_config
+        runtime = get_llm_runtime_config()
+    except Exception:
+        runtime = {}
+    
+    provider = runtime.get("provider") or os.environ.get("LLM_PROVIDER", "gemini")
+    return {
+        "provider": provider.lower(),
+        "gemini_api_key": runtime.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", ""),
+        "gemini_model": runtime.get("gemini_model") or os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+        "mistral_api_key": runtime.get("mistral_api_key") or os.environ.get("MISTRAL_API_KEY", ""),
+        "mistral_model": runtime.get("mistral_model") or os.environ.get("MISTRAL_MODEL", "mistral-small-latest"),
+        "mistral_reasoning_effort": runtime.get("mistral_reasoning_effort") or os.environ.get("MISTRAL_REASONING_EFFORT", "none"),
+    }
+
+
 def _call_llm(prompt: str) -> str:
-    """Call the configured LLM provider (Gemini or Ollama)."""
-    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    """Call the configured LLM provider (Gemini or Mistral)."""
+    cfg = _get_llm_config()
+    provider = cfg["provider"]
     
     if provider == "gemini":
-        api_key = os.environ.get("GEMINI_API_KEY", "")
-        model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+        api_key = cfg["gemini_api_key"]
+        model = cfg["gemini_model"]
         
         if not api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
+            raise ValueError("Gemini API key is not configured. Set it in Admin > AI Settings or via GEMINI_API_KEY env var.")
         
         return _call_gemini(api_key, model, prompt)
     else:
-        # Default to Ollama
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        model = os.environ.get("OLLAMA_MODEL", "mistral")
-        return _call_ollama(base_url, model, prompt)
+        api_key = cfg["mistral_api_key"]
+        model = cfg["mistral_model"]
+        reasoning_effort = cfg.get("mistral_reasoning_effort", "none")
+        
+        if not api_key:
+            raise ValueError("Mistral API key is not configured. Set it in Admin > AI Settings or via MISTRAL_API_KEY env var.")
+        
+        return _call_mistral(api_key, model, prompt, reasoning_effort=reasoning_effort)
 
 
 def _parse_tool_call(response: str) -> Tuple[Optional[str], Dict[str, Any]]:

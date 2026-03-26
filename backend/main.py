@@ -1383,6 +1383,92 @@ def update_detection_config(
         raise HTTPException(status_code=500, detail=f"Failed to update config: {str(e)}")
 
 
+# ==========================================
+# LLM Settings
+# ==========================================
+
+_llm_runtime_config: dict = {}
+
+@app.get("/settings/llm")
+def get_llm_settings():
+    """Get current LLM configuration (runtime overrides + env defaults)."""
+    provider = _llm_runtime_config.get(
+        "provider", os.environ.get("LLM_PROVIDER", "gemini")
+    ).lower()
+    
+    env_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    env_mistral_key = os.environ.get("MISTRAL_API_KEY", "")
+    
+    return {
+        "provider": provider,
+        "gemini_api_key": "",
+        "gemini_model": _llm_runtime_config.get(
+            "gemini_model", os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        ),
+        "mistral_api_key": "",
+        "mistral_model": _llm_runtime_config.get(
+            "mistral_model", os.environ.get("MISTRAL_MODEL", "mistral-small-latest")
+        ),
+        "mistral_reasoning_effort": _llm_runtime_config.get(
+            "mistral_reasoning_effort", os.environ.get("MISTRAL_REASONING_EFFORT", "none")
+        ),
+        "has_env_gemini_key": bool(env_gemini_key),
+        "has_env_mistral_key": bool(env_mistral_key),
+    }
+
+
+@app.post("/settings/llm")
+def update_llm_settings(
+    provider: Optional[str] = Body(None),
+    gemini_api_key: Optional[str] = Body(None),
+    gemini_model: Optional[str] = Body(None),
+    mistral_api_key: Optional[str] = Body(None),
+    mistral_model: Optional[str] = Body(None),
+    mistral_reasoning_effort: Optional[str] = Body(None),
+):
+    """Update LLM configuration at runtime (overrides env defaults)."""
+    if provider is not None:
+        _llm_runtime_config["provider"] = provider
+    if gemini_api_key is not None and gemini_api_key.strip():
+        _llm_runtime_config["gemini_api_key"] = gemini_api_key.strip()
+    if gemini_model is not None:
+        _llm_runtime_config["gemini_model"] = gemini_model
+    if mistral_api_key is not None and mistral_api_key.strip():
+        _llm_runtime_config["mistral_api_key"] = mistral_api_key.strip()
+    if mistral_model is not None:
+        _llm_runtime_config["mistral_model"] = mistral_model
+    if mistral_reasoning_effort is not None:
+        _llm_runtime_config["mistral_reasoning_effort"] = mistral_reasoning_effort
+    
+    logger.info(f"LLM settings updated: provider={_llm_runtime_config.get('provider')}")
+    return {"message": "LLM settings updated", "provider": _llm_runtime_config.get("provider")}
+
+
+@app.post("/settings/llm/test")
+def test_llm_connection():
+    """Send a short test prompt to the currently configured LLM."""
+    import time
+    from workflow.nodes.llm_agent import _call_llm, _get_llm_config
+    
+    try:
+        start = time.time()
+        response = _call_llm("Respond with exactly: OK")
+        duration = round((time.time() - start) * 1000)
+        
+        return {
+            "success": True,
+            "duration_ms": duration,
+            "response_preview": (response or "")[:100],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def get_llm_runtime_config() -> dict:
+    """Accessor for runtime LLM config, used by llm_agent."""
+    return _llm_runtime_config
+
+
 @app.get("/detection/history")
 def get_detection_history(
     limit: int = Query(20, ge=1, le=100, description="Number of history records to return")
