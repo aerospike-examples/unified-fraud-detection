@@ -415,7 +415,11 @@ def _build_tool_call_summary(tool_calls: list) -> str:
 
 
 def _clean_report(response: str, state: InvestigationState) -> str:
-    """Clean and format the generated report."""
+    """Clean and format the generated report.
+    
+    Aggressively ensures proper markdown structure even when the LLM
+    returns everything on a single line or with minimal newlines.
+    """
     import re as _re
     
     initial = state.get("initial_evidence") or {}
@@ -423,21 +427,69 @@ def _clean_report(response: str, state: InvestigationState) -> str:
     tool_calls = state.get("tool_calls") or []
     user_id = state.get("user_id", "")
     
-    # Ensure markdown headings are on their own lines with blank lines around them
-    response = _re.sub(r'(?<!\n)(#{1,4}\s)', r'\n\n\1', response)
-    # Ensure bullet points are on their own lines
-    response = _re.sub(r'(?<!\n)(- \*\*)', r'\n\1', response)
-    # Ensure --- separators have blank lines
-    response = _re.sub(r'(?<!\n)(---)', r'\n\n\1', response)
-    # Collapse 3+ consecutive newlines into 2
+    # Strip markdown code fences that some LLMs (Mistral) wrap their response in
+    response = response.strip()
+    if response.startswith("```"):
+        first_newline = response.find('\n')
+        if first_newline != -1:
+            response = response[first_newline + 1:]
+        if response.rstrip().endswith("```"):
+            response = response.rstrip()[:-3]
+        response = response.strip()
+    
+    newline_count = response.count('\n')
+    logger.info(f"[Report] Raw LLM output: {len(response)} chars, {newline_count} newlines")
+    
+    # Normalize em-dashes and en-dashes used as bullet markers
+    response = _re.sub(r'[—–]\s*\*\*', '- **', response)
+    response = _re.sub(r'[—–]\s+([A-Z])', r'- \1', response)
+    
+    # Remove stray lone `#` separators before actual headings (e.g. "# # Heading" → "## Heading")
+    response = _re.sub(r'(?:^|\n)\s*#\s*\n?\s*(#{1,4}\s)', r'\n\n\1', response)
+    response = _re.sub(r'(\S)\s+#\s+(#{1,4}\s)', r'\1\n\n\2', response)
+    
+    # Step 1: Ensure newlines BEFORE heading markers (# to ####)
+    response = _re.sub(r'([^\n])(#{1,4}\s)', r'\1\n\n\2', response)
+    
+    # Step 2: Ensure newlines BEFORE bullet points (- text or * text)
+    response = _re.sub(r'([^\n])(- )', r'\1\n\2', response)
+    response = _re.sub(r'([^\n])(\* )', r'\1\n\2', response)
+    
+    # Step 3: Ensure newlines BEFORE and AFTER horizontal rules (--- or more)
+    response = _re.sub(r'([^\n])(---+)', r'\1\n\n\2', response)
+    response = _re.sub(r'(---+)([^\n])', r'\1\n\n\2', response)
+    
+    # Step 4: Split heading lines that have body text appended
+    # e.g. "## Executive Summary This investigation found..." should become
+    # "## Executive Summary\n\nThis investigation found..."
+    def _split_heading_line(line: str) -> str:
+        m = _re.match(r'^(#{1,4}\s+.{3,80}?(?:Summary|Factors|Analysis|Recommendation|Steps|Evidence|Assessment|Report|Rationale|Conclusion|Details|Information|Overview|Findings|Profile))\s+([A-Z(])', line)
+        if m:
+            return m.group(1) + '\n\n' + m.group(2) + line[m.end():]
+        m2 = _re.match(r'^(#{1,4}\s+\S+(?:\s+\S+){0,6})\s{2,}(.+)', line)
+        if m2:
+            return m2.group(1) + '\n\n' + m2.group(2)
+        return line
+    
+    lines = response.split('\n')
+    lines = [_split_heading_line(line) for line in lines]
+    response = '\n'.join(lines)
+    
+    # Step 5: Ensure blank lines AFTER headings (heading line followed immediately by text)
+    response = _re.sub(r'(^#{1,4}\s+[^\n]+)\n([^#\-\*\n])', r'\1\n\n\2', response, flags=_re.MULTILINE)
+    
+    # Step 6: Collapse 3+ consecutive newlines into 2
     response = _re.sub(r'\n{3,}', '\n\n', response)
     
-    # Add header if not present
+    # Step 7: Add header if not present
     if not response.strip().startswith("#"):
         user_name = profile.get("name", "Unknown")
         response = f"# Fraud Investigation Report\n## User: {user_name}\n\n{response}"
     
-    # Append fraud ring section (for LLM-generated reports)
+    final_newlines = response.count('\n')
+    logger.info(f"[Report] After cleanup: {len(response)} chars, {final_newlines} newlines (was {newline_count})")
+    
+    # Append fraud ring section
     fraud_ring_section = _build_fraud_ring_section(tool_calls, user_id)
     if fraud_ring_section:
         response = response.strip() + "\n" + fraud_ring_section

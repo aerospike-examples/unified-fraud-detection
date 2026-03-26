@@ -59,6 +59,53 @@ interface InvestigationReportProps {
   networkEvidence?: Record<string, any>;
 }
 
+function normalizeMarkdown(text: string): string {
+  if (!text) return text;
+
+  let s = text.trim();
+
+  // Strip markdown code fences that some LLMs wrap their response in
+  if (s.includes("```markdown")) {
+    s = s.replace(/```markdown\s*\n/g, "");
+    s = s.replace(/```\s*$/g, "");
+    s = s.trim();
+  }
+
+  // Normalize em/en-dashes used as bullet markers
+  s = s.replace(/[—–]\s*\*\*/g, "- **");
+  s = s.replace(/[—–]\s+([A-Z])/g, "- $1");
+
+  // Remove stray lone `#` that appear between sections (e.g. "--- # # Heading" → "---\n\n## Heading")
+  // Pattern: `# # Heading` (lone # separator before actual heading) → `## Heading`
+  s = s.replace(/(?:^|\n)\s*#\s*\n?\s*(#{1,4}\s)/gm, "\n\n$1");
+  // Inline version: `text # # Heading` → `text\n\n## Heading`
+  s = s.replace(/(\S)\s+#\s+(#{1,4}\s)/g, "$1\n\n$2");
+
+  // Ensure newlines before heading markers (# to ####)
+  s = s.replace(/([^\n])(#{1,4}\s)/g, "$1\n\n$2");
+  // Ensure newlines before bullet points
+  s = s.replace(/([^\n])(- )/g, "$1\n$2");
+  // Ensure newlines around horizontal rules
+  s = s.replace(/([^\n])(---+)/g, "$1\n\n$2");
+  s = s.replace(/(---+)([^\n])/g, "$1\n\n$2");
+
+  // Split heading lines that have body text appended
+  s = s.split("\n").map((line) => {
+    const m = line.match(
+      /^(#{1,4}\s+.{3,80}?(?:Summary|Factors|Analysis|Recommendation|Steps|Evidence|Assessment|Report|Rationale|Conclusion|Details|Overview|Findings|Profile|Typology|Information))\s+([A-Z(])/
+    );
+    if (m) return m[1] + "\n\n" + m[2] + line.slice(m[0].length);
+    return line;
+  }).join("\n");
+
+  // Ensure blank line after headings when followed by body text
+  s = s.replace(/^(#{1,4}\s+[^\n]+)\n([^#\-\*\n])/gm, "$1\n\n$2");
+  // Collapse excess newlines
+  s = s.replace(/\n{3,}/g, "\n\n");
+
+  return s.trim();
+}
+
 const riskLevelColors: Record<string, string> = {
   low: "bg-emerald-100 text-emerald-700 border-emerald-200",
   medium: "bg-amber-100 text-amber-700 border-amber-200",
@@ -691,7 +738,7 @@ export function InvestigationReport({
                   hr: () => <hr className="my-4 border-slate-200" />,
                 }}
               >
-                {report}
+                {normalizeMarkdown(report || "")}
               </ReactMarkdown>
             </div>
 

@@ -145,9 +145,11 @@ def llm_agent_node(
                 error_count += 1
                 
                 if error_count >= 3:
-                    # Fallback to deterministic assessment
                     logger.warning(f"[{node_name}] Falling back to deterministic assessment")
-                    final_assessment = _deterministic_assessment(initial_evidence, alert_evidence)
+                    final_assessment = _deterministic_assessment(
+                        initial_evidence, alert_evidence,
+                        iteration_count=iteration, tool_count=len(tool_calls)
+                    )
                     break
                 
                 continue
@@ -159,7 +161,10 @@ def llm_agent_node(
                 logger.warning(f"[{node_name}] No valid tool call in response, retrying")
                 error_count += 1
                 if error_count >= 3:
-                    final_assessment = _deterministic_assessment(initial_evidence, alert_evidence)
+                    final_assessment = _deterministic_assessment(
+                        initial_evidence, alert_evidence,
+                        iteration_count=iteration, tool_count=len(tool_calls)
+                    )
                     break
                 continue
             
@@ -200,7 +205,8 @@ def llm_agent_node(
                 final_assessment = _deterministic_assessment(
                     initial_evidence, 
                     alert_evidence,
-                    accumulated_evidence
+                    accumulated_evidence,
+                    iteration_count=iteration, tool_count=len(tool_calls)
                 )
                 break
             
@@ -249,7 +255,8 @@ def llm_agent_node(
             final_assessment = _deterministic_assessment(
                 initial_evidence, 
                 alert_evidence,
-                accumulated_evidence
+                accumulated_evidence,
+                iteration_count=iteration, tool_count=len(tool_calls)
             )
         
         # Emit complete
@@ -293,7 +300,10 @@ def llm_agent_node(
         
         # Return with deterministic assessment on error
         return {
-            "final_assessment": _deterministic_assessment(initial_evidence, alert_evidence),
+            "final_assessment": _deterministic_assessment(
+                initial_evidence, alert_evidence,
+                iteration_count=iteration, tool_count=len(tool_calls)
+            ),
             "agent_messages": agent_messages,
             "tool_calls": tool_calls,
             "agent_iterations": iteration,
@@ -520,50 +530,64 @@ def _call_mistral(api_key: str, model: str, prompt: str, reasoning_effort: str =
     if not is_magistral and reasoning_effort == "high":
         body["reasoning_effort"] = "high"
     
-    try:
-        with httpx.Client(timeout=300.0) as client:
-            response = client.post(
-                "https://api.mistral.ai/v1/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-                json=body,
-            )
-            response.raise_for_status()
-            result = response.json()
-            
-            elapsed = time.time() - start
-            logger.info(f"[LLM] Mistral responded in {elapsed:.1f}s")
-            
-            choices = result.get("choices", [])
-            if not choices:
-                return ""
-            
-            content = choices[0].get("message", {}).get("content", "")
-            
-            # Reasoning models return content as an array of typed chunks
-            if isinstance(content, list):
-                thinking_text = ""
-                answer_text = ""
-                for chunk in content:
-                    if chunk.get("type") == "thinking":
-                        for part in chunk.get("thinking", []):
-                            thinking_text += part.get("text", "")
-                    elif chunk.get("type") == "text":
-                        answer_text += chunk.get("text", "")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with httpx.Client(timeout=300.0) as client:
+                response = client.post(
+                    "https://api.mistral.ai/v1/chat/completions",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    json=body,
+                )
                 
-                if thinking_text:
-                    logger.info(f"[LLM] Mistral reasoning: {thinking_text[:200]}...")
+                if response.status_code == 429 and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)
+                    logger.warning(f"[LLM] Mistral 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
                 
-                return answer_text
-            
-            # Non-reasoning models return content as a plain string
-            return content if isinstance(content, str) else ""
-            
-    except Exception as e:
-        logger.error(f"[LLM] Mistral error: {e}")
-        raise
+                response.raise_for_status()
+                result = response.json()
+                
+                elapsed = time.time() - start
+                logger.info(f"[LLM] Mistral responded in {elapsed:.1f}s")
+                
+                choices = result.get("choices", [])
+                if not choices:
+                    return ""
+                
+                content = choices[0].get("message", {}).get("content", "")
+                
+                # Reasoning models return content as an array of typed chunks
+                if isinstance(content, list):
+                    thinking_text = ""
+                    answer_text = ""
+                    for chunk in content:
+                        if chunk.get("type") == "thinking":
+                            for part in chunk.get("thinking", []):
+                                thinking_text += part.get("text", "")
+                        elif chunk.get("type") == "text":
+                            answer_text += chunk.get("text", "")
+                    
+                    if thinking_text:
+                        logger.info(f"[LLM] Mistral reasoning: {thinking_text[:200]}...")
+                    
+                    return answer_text
+                
+                # Non-reasoning models return content as a plain string
+                return content if isinstance(content, str) else ""
+                
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning(f"[LLM] Mistral 429 rate limit, retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            logger.error(f"[LLM] Mistral error: {e}")
+            raise
 
 
 def _call_gemini(api_key: str, model: str, prompt: str) -> str:
@@ -769,7 +793,9 @@ def _parse_tool_call(response: str) -> Tuple[Optional[str], Dict[str, Any]]:
 def _deterministic_assessment(
     initial: Dict[str, Any],
     alert: Dict[str, Any],
-    accumulated: Dict[str, Any] = None
+    accumulated: Dict[str, Any] = None,
+    iteration_count: int = 0,
+    tool_count: int = 0
 ) -> FinalAssessment:
     """
     Fallback deterministic assessment when LLM fails.
@@ -875,6 +901,6 @@ def _deterministic_assessment(
         risk_score=risk_score,
         decision=decision,
         reasoning=reasoning,
-        iteration=0,
-        tool_calls_made=0
+        iteration=iteration_count,
+        tool_calls_made=tool_count
     )
