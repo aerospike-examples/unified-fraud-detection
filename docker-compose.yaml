@@ -130,6 +130,29 @@ services:
       - asgraph_net
     ports:
       - "4001:4001"
+  synktron-agent-service:
+    build:
+      context: ..
+      dockerfile: Agent/python/Dockerfile
+    container_name: synktron-agent-service
+    depends_on:
+      aerospike-db:
+        condition: service_healthy
+    environment:
+      - AEROSPIKE_HOST=aerospike-db
+      - AEROSPIKE_KV_PORT=3000
+      - AEROSPIKE_NAMESPACE=test
+    networks:
+      - asgraph_net
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
   # Monitoring Stack
   aerospike-exporter:
     image: aerospike/aerospike-prometheus-exporter:latest
