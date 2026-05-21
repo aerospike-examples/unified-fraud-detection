@@ -10,7 +10,5 @@ pytest-asyncio==0.21.1
 async-timeout>=4.0.2,<5
 apscheduler==3.10.4
 aerospike>=15.0.0
-langgraph>=0.0.40
-langgraph-checkpoint-aerospike>=0.1.0
 sse-starlette>=1.6.5
 faker>=30.0.0

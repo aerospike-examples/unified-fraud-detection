@@ -7,8 +7,7 @@ from each investigation phase.
 Updated for agentic tool-calling architecture.
 """
 
-from typing import TypedDict, List, Dict, Any, Optional, Annotated
-from operator import add
+from typing import TypedDict, List, Dict, Any, Optional
 from datetime import datetime
 
 
@@ -201,7 +200,7 @@ class InvestigationState(TypedDict):
     error_message: Optional[str]
     
     # SSE streaming
-    trace_events: Annotated[List[TraceEvent], add]
+    trace_events: List[TraceEvent]
 
 
 def create_initial_state(

@@ -80,15 +80,12 @@ services:
         condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
-      # Using host's Ollama instead of Docker container for GPU support
     environment:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
+      - MESH_BASE_URL=http://synktron-meshruntime-local:8080
       # LLM Provider: "gemini" or "ollama"
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
-      # Ollama settings (used when LLM_PROVIDER=ollama)
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=mistral
       # Gemini settings (used when LLM_PROVIDER=gemini)
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
