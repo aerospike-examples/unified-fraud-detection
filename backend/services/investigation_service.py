@@ -172,7 +172,10 @@ class InvestigationService:
                         "initial_evidence": final_state.get("initial_evidence", {}),
                         "final_assessment": final_state.get("final_assessment", {}),
                         "tool_calls": final_state.get("tool_calls", []),
-                        "specialist_findings": final_state.get("specialist_findings", {}),
+                        # NOTE: Aerospike truncates bin names to 15 chars, so this
+                        # MUST stay short ("specialist_findings" would collide as
+                        # "specialist_find"). Remapped back on read below.
+                        "spec_findings": final_state.get("specialist_findings", {}),
                         "enacted_actions": final_state.get("enacted_actions", []),
                         "agent_iterations": final_state.get("agent_iterations", 0),
                         "report_markdown": final_state.get("report_markdown", ""),
@@ -286,11 +289,19 @@ class InvestigationService:
         
         return None
     
+    @staticmethod
+    def _restore_bin_names(record: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Map short Aerospike bin names back to their full API field names
+        (Aerospike truncates bin names to 15 chars)."""
+        if isinstance(record, dict) and "spec_findings" in record and "specialist_findings" not in record:
+            record["specialist_findings"] = record.pop("spec_findings")
+        return record
+
     def get_user_latest_investigation(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Get the most recent completed investigation for a user."""
         # Check KV store (has persistence)
         if self.aerospike_service and self.aerospike_service.is_connected():
-            return self.aerospike_service.get_user_latest_investigation(user_id)
+            return self._restore_bin_names(self.aerospike_service.get_user_latest_investigation(user_id))
         
         # Fall back to memory cache
         user_investigations = [
