@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, Optional
 
-from workflow.runner import build_runner, run_investigation, get_workflow_steps
+from workflow.runner import build_runner, run_investigation, resume_investigation, get_workflow_steps
 
 logger = logging.getLogger('investigation.service')
 
@@ -37,6 +37,8 @@ class InvestigationService:
         # Active investigations cache
         self._active_investigations: Dict[str, Dict[str, Any]] = {}
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
+        # Investigations paused awaiting analyst action approval (HITL)
+        self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
 
         logger.info(f"Investigation service initialized (ADK model={self.model})")
 
@@ -93,157 +95,170 @@ class InvestigationService:
         
         return investigation_id
     
+    async def _consume(
+        self,
+        investigation_id: str,
+        user_id: str,
+        event_agen: AsyncGenerator[Dict[str, Any], None],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Translate runner events into SSE events, handle HITL pauses, and persist
+        the final result on completion. Shared by the initial run and the resume."""
+        final_state = None
+        paused = False
+
+        async for event in event_agen:
+            event_type = event.get("type", "unknown")
+
+            if event_type == "trace":
+                trace = event.get("event", {})
+                yield {"event": "trace", "data": trace}
+                if investigation_id in self._active_investigations:
+                    self._active_investigations[investigation_id]["current_step"] = trace.get("node", "")
+
+            elif event_type == "action_confirmation_required":
+                # Surface the proposed action so the analyst can approve/reject.
+                yield {"event": "action_confirmation_required", "data": event.get("data", {})}
+
+            elif event_type == "_paused":
+                # Internal: stash the paused confirmation so /resume can continue it.
+                data = event.get("data", {})
+                self._pending_confirmations[investigation_id] = {**data, "user_id": user_id}
+                if investigation_id in self._active_investigations:
+                    self._active_investigations[investigation_id]["status"] = "awaiting_confirmation"
+                paused = True
+
+            elif event_type == "state_update":
+                data = event.get("data", {})
+                yield {
+                    "event": "progress",
+                    "data": {
+                        "node": event.get("node", ""),
+                        "phase": data.get("current_phase", ""),
+                        **{k: v for k, v in data.items() if k != "trace_events"},
+                    },
+                }
+                if not final_state:
+                    final_state = {}
+                final_state.update(data)
+
+            elif event_type == "metrics":
+                yield {"event": "metrics", "data": {"investigation_id": investigation_id, "data": event.get("data", {})}}
+
+            elif event_type == "complete":
+                yield {"event": "complete", "data": {"investigation_id": investigation_id, "user_id": user_id}}
+
+            elif event_type == "error":
+                yield {"event": "error", "data": {"error": event.get("error", "Unknown error"), "investigation_id": investigation_id}}
+
+        if paused:
+            # Investigation is parked awaiting approval; do not persist yet.
+            return
+
+        # Store + persist the completed result.
+        if final_state:
+            completed_at = datetime.now().isoformat()
+            self._investigation_results[investigation_id] = {
+                "user_id": user_id,
+                "completed_at": completed_at,
+                "state": final_state,
+            }
+            if self.aerospike_service and self.aerospike_service.is_connected():
+                try:
+                    kv_data = {
+                        "investigation_id": investigation_id,
+                        "user_id": user_id,
+                        "completed_at": completed_at,
+                        "status": "completed",
+                        "initial_evidence": final_state.get("initial_evidence", {}),
+                        "final_assessment": final_state.get("final_assessment", {}),
+                        "tool_calls": final_state.get("tool_calls", []),
+                        "specialist_findings": final_state.get("specialist_findings", {}),
+                        "enacted_actions": final_state.get("enacted_actions", []),
+                        "agent_iterations": final_state.get("agent_iterations", 0),
+                        "report_markdown": final_state.get("report_markdown", ""),
+                        "completed_steps": ["alert_validation", "data_collection", "llm_agent", "report_generation"],
+                    }
+                    self.aerospike_service.put_investigation(investigation_id, kv_data)
+                    logger.info(f"Investigation {investigation_id} persisted to KV store")
+                except Exception as e:
+                    logger.warning(f"Failed to persist investigation to KV: {e}")
+
+        self._pending_confirmations.pop(investigation_id, None)
+        if investigation_id in self._active_investigations:
+            self._active_investigations[investigation_id]["status"] = "completed"
+
     async def stream_investigation(
         self,
         user_id: str,
         investigation_id: Optional[str] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """
-        Stream investigation progress as SSE events.
-        
-        Args:
-            user_id: User ID to investigate
-            investigation_id: Optional existing investigation ID
-            
-        Yields:
-            SSE event data
-        """
-        # Create investigation ID if not provided
+        """Stream investigation progress as SSE events (may pause for HITL approval)."""
         if not investigation_id:
             investigation_id = await self.start_investigation(user_id)
-        
         if not self.inv_runner:
             await self.initialize()
-        
-        # Yield initial event
-        yield {
-            "event": "start",
-            "data": {
-                "investigation_id": investigation_id,
-                "user_id": user_id,
-                "steps": self.get_workflow_steps()
-            }
-        }
-        
+
+        yield {"event": "start", "data": {
+            "investigation_id": investigation_id, "user_id": user_id, "steps": self.get_workflow_steps(),
+        }}
+
         try:
-            # Run the workflow and stream events
-            final_state = None
-            
-            async for event in run_investigation(self.inv_runner, user_id, investigation_id):
-                event_type = event.get("type", "unknown")
-                
-                if event_type == "trace":
-                    trace = event.get("event", {})
-                    yield {
-                        "event": "trace",
-                        "data": trace
-                    }
-                    
-                    # Update active investigation tracking
-                    if investigation_id in self._active_investigations:
-                        self._active_investigations[investigation_id]["current_step"] = trace.get("node", "")
-                
-                elif event_type == "state_update":
-                    node = event.get("node", "")
-                    data = event.get("data", {})
-                    
-                    yield {
-                        "event": "progress",
-                        "data": {
-                            "node": node,
-                            "phase": data.get("current_phase", ""),
-                            **{k: v for k, v in data.items() if k not in ["trace_events"]}
-                        }
-                    }
-                    
-                    # Capture final state components
-                    if not final_state:
-                        final_state = {}
-                    final_state.update(data)
-                
-                elif event_type == "metrics":
-                    # Forward performance metrics to frontend
-                    yield {
-                        "event": "metrics",
-                        "data": {
-                            "investigation_id": investigation_id,
-                            "data": event.get("data", {})
-                        }
-                    }
-                
-                elif event_type == "complete":
-                    yield {
-                        "event": "complete",
-                        "data": {
-                            "investigation_id": investigation_id,
-                            "user_id": user_id
-                        }
-                    }
-                    
-                elif event_type == "error":
-                    yield {
-                        "event": "error",
-                        "data": {
-                            "error": event.get("error", "Unknown error"),
-                            "investigation_id": investigation_id
-                        }
-                    }
-            
-            # Store final result
-            if final_state:
-                completed_at = datetime.now().isoformat()
-                
-                # Store in memory cache
-                self._investigation_results[investigation_id] = {
-                    "user_id": user_id,
-                    "completed_at": completed_at,
-                    "state": final_state
-                }
-                
-                # Persist to Aerospike KV for durability
-                if self.aerospike_service and self.aerospike_service.is_connected():
-                    try:
-                        kv_data = {
-                            "investigation_id": investigation_id,
-                            "user_id": user_id,
-                            "completed_at": completed_at,
-                            "status": "completed",
-                            # Evidence collected
-                            "initial_evidence": final_state.get("initial_evidence", {}),
-                            # AI assessment
-                            "final_assessment": final_state.get("final_assessment", {}),
-                            # Tool calls made
-                            "tool_calls": final_state.get("tool_calls", []),
-                            # Agent iterations
-                            "agent_iterations": final_state.get("agent_iterations", 0),
-                            # Generated report
-                            "report_markdown": final_state.get("report_markdown", ""),
-                            # Completed steps - if investigation completed successfully, all steps are done
-                            "completed_steps": ["alert_validation", "data_collection", "llm_agent", "report_generation"],
-                        }
-                        self.aerospike_service.put_investigation(investigation_id, kv_data)
-                        logger.info(f"Investigation {investigation_id} persisted to KV store")
-                    except Exception as e:
-                        logger.warning(f"Failed to persist investigation to KV: {e}")
-            
-            # Update status
-            if investigation_id in self._active_investigations:
-                self._active_investigations[investigation_id]["status"] = "completed"
-                
+            async for ev in self._consume(
+                investigation_id, user_id,
+                run_investigation(self.inv_runner, user_id, investigation_id),
+            ):
+                yield ev
         except Exception as e:
             logger.error(f"Investigation error: {e}")
-            
-            yield {
-                "event": "error",
-                "data": {
-                    "error": str(e),
-                    "investigation_id": investigation_id
-                }
-            }
-            
+            yield {"event": "error", "data": {"error": str(e), "investigation_id": investigation_id}}
             if investigation_id in self._active_investigations:
                 self._active_investigations[investigation_id]["status"] = "error"
                 self._active_investigations[investigation_id]["error"] = str(e)
+
+    def has_pending_action(self, investigation_id: str) -> bool:
+        """Whether the investigation is paused awaiting analyst approval."""
+        return investigation_id in self._pending_confirmations
+
+    async def resume_investigation_action(
+        self,
+        investigation_id: str,
+        approved: bool,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Resume a paused investigation after the analyst approves/rejects the action."""
+        pending = self._pending_confirmations.get(investigation_id)
+        if not pending:
+            yield {"event": "error", "data": {"error": "No pending action to confirm", "investigation_id": investigation_id}}
+            return
+
+        user_id = pending["user_id"]
+        if not self.inv_runner:
+            await self.initialize()
+
+        # Claim it so it can't be double-resumed.
+        self._pending_confirmations.pop(investigation_id, None)
+        if investigation_id in self._active_investigations:
+            self._active_investigations[investigation_id]["status"] = "running"
+
+        yield {"event": "start", "data": {
+            "investigation_id": investigation_id, "user_id": user_id,
+            "steps": self.get_workflow_steps(), "resumed": True,
+        }}
+
+        try:
+            agen = resume_investigation(
+                self.inv_runner, user_id, investigation_id,
+                fc_id=pending["fc_id"], approved=approved,
+                hint=pending.get("hint", ""),
+                payload={"decision": pending.get("decision"), "account_id": pending.get("account_id"),
+                         "reason": pending.get("reason")},
+            )
+            async for ev in self._consume(investigation_id, user_id, agen):
+                yield ev
+        except Exception as e:
+            logger.error(f"Resume investigation error: {e}")
+            yield {"event": "error", "data": {"error": str(e), "investigation_id": investigation_id}}
+            if investigation_id in self._active_investigations:
+                self._active_investigations[investigation_id]["status"] = "error"
     
     def get_investigation_status(self, investigation_id: str) -> Optional[Dict[str, Any]]:
         """Get status of an investigation."""

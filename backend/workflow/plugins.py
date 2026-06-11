@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional
 from google.adk.plugins.base_plugin import BasePlugin
 
 from workflow.metrics import get_collector
+from workflow.agent import INVESTIGATOR_NAME, SPECIALIST_NAMES
 
 logger = logging.getLogger('investigation.plugin')
 
@@ -49,9 +50,12 @@ class MetricsPlugin(BasePlugin):
     # ── Tools ────────────────────────────────────────────────────────────────
     async def before_tool_callback(self, *, tool: Any, tool_args: dict, tool_context: Any):
         tool_name = getattr(tool, "name", "")
-        # Enforce the tool-call budget: short-circuit further evidence gathering
-        # (but never submit_assessment) once the cap is reached.
-        if tool_name != "submit_assessment":
+        agent_name = getattr(tool_context, "agent_name", "") or ""
+        # Enforce the tool-call budget ONLY for the investigator (the synthesis
+        # agent) — never the exit tool (submit_assessment) or action tool
+        # (enact_decision), and never the parallel specialists (each is bounded by
+        # its own instruction, and a shared counter would race under concurrency).
+        if agent_name == INVESTIGATOR_NAME and tool_name not in ("submit_assessment", "enact_decision"):
             count = int(tool_context.state.get("tool_calls_count", 0))
             if count >= MAX_TOOL_CALLS:
                 logger.info(f"Tool-call budget ({MAX_TOOL_CALLS}) reached — nudging agent to submit")
@@ -81,17 +85,30 @@ class MetricsPlugin(BasePlugin):
 
         # Accumulate the call into session state (reassign to trigger state tracking).
         state = tool_context.state
-        calls = list(state.get("tool_calls", []))
-        calls.append({
+        agent_name = getattr(tool_context, "agent_name", "") or ""
+        record = {
             "tool": tool_name,
             "params": dict(tool_args or {}),
             "result": result,
             "timestamp": datetime.now().isoformat(),
             "iteration": int(state.get("agent_iterations", 0)),
             "duration_ms": round(duration_ms, 2),
-        })
-        state["tool_calls"] = calls
-        state["tool_calls_count"] = len(calls)
+            "agent": agent_name,
+        }
+        # Parallel specialists write to per-agent keys so their concurrent
+        # appends never collide on a single shared list (ADK merges state deltas
+        # per key, so one shared list under fan-out would drop entries). The
+        # runner merges these back into the final tool_calls at finalize.
+        if agent_name in SPECIALIST_NAMES:
+            key = f"specialist_tool_calls_{agent_name}"
+            calls = list(state.get(key, []))
+            calls.append(record)
+            state[key] = calls
+        else:
+            calls = list(state.get("tool_calls", []))
+            calls.append(record)
+            state["tool_calls"] = calls
+            state["tool_calls_count"] = len(calls)
         return None
 
     # ── Model (LLM) ──────────────────────────────────────────────────────────

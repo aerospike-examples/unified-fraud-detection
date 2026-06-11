@@ -27,7 +27,10 @@ from adk_aerospike import (
     AerospikeArtifactService,
 )
 
-from workflow.agent import build_investigation_agent, APP_NAME, INVESTIGATOR_NAME, REPORT_WRITER_NAME
+from workflow.agent import (
+    build_investigation_agent, APP_NAME, INVESTIGATOR_NAME, REPORT_WRITER_NAME,
+    SPECIALIST_NAMES, SPECIALIST_OUTPUT_KEYS,
+)
 from workflow.plugins import MetricsPlugin
 from workflow.assessment import deterministic_assessment
 from workflow.nodes.report_generation import generate_fallback_report
@@ -37,10 +40,13 @@ from workflow.metrics import get_collector, remove_collector
 
 logger = logging.getLogger('investigation.runner')
 
-# Map ADK sub-agent names → the step ids the frontend renders.
+# Map ADK sub-agent names → the step ids the frontend renders. The parallel
+# evidence specialists and the investigator both fall under the "llm_agent" step
+# (the AI Investigation phase), so the 4-step UI contract is unchanged.
 _AGENT_TO_STEP = {
     INVESTIGATOR_NAME: "llm_agent",
     REPORT_WRITER_NAME: "report_generation",
+    **{name: "llm_agent" for name in SPECIALIST_NAMES},
 }
 
 
@@ -124,35 +130,227 @@ def _trace(node: str, type_: str, data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+async def _read_state(inv_runner: InvestigationRunner, user_id: str, investigation_id: str) -> Dict[str, Any]:
+    session = await inv_runner.session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=investigation_id,
+    )
+    if session is None:
+        return {}
+    return session.state.to_dict() if hasattr(session.state, "to_dict") else dict(session.state)
+
+
+async def _drive_agent(
+    inv_runner: InvestigationRunner,
+    user_id: str,
+    investigation_id: str,
+    new_message: Any,
+    metrics: Any,
+    start_step: Optional[str],
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Drive runner.run_async and translate the ADK event stream into SSE dicts.
+
+    If the agent pauses for an action confirmation (adk_request_confirmation),
+    emits an ``action_confirmation_required`` event + an internal ``_paused``
+    marker and stops WITHOUT finalizing. Otherwise finalizes on completion.
+    """
+    current_step = start_step
+    iteration = 0
+    paused: Optional[Dict[str, Any]] = None
+
+    async for event in inv_runner.runner.run_async(
+        user_id=user_id, session_id=investigation_id, new_message=new_message,
+    ):
+        step = _AGENT_TO_STEP.get(event.author)
+        if step and current_step != step:
+            if current_step:
+                yield _trace(current_step, "node_complete", {"status": "success"})
+                metrics.end_node(current_step)
+            current_step = step
+            metrics.start_node(step)
+            yield _trace(step, "node_start", {"user_id": user_id})
+
+        for fc in event.get_function_calls():
+            args = dict(fc.args or {})
+
+            # Human-in-the-loop: the agent paused for analyst approval.
+            if fc.name == "adk_request_confirmation":
+                tc = args.get("toolConfirmation") or args.get("tool_confirmation") or {}
+                tc = tc if isinstance(tc, dict) else {}
+                payload = tc.get("payload") if isinstance(tc.get("payload"), dict) else {}
+                paused = {
+                    "investigation_id": investigation_id,
+                    "user_id": user_id,
+                    "fc_id": fc.id,
+                    "hint": tc.get("hint", ""),
+                    "decision": payload.get("decision"),
+                    "account_id": payload.get("account_id"),
+                    "reason": payload.get("reason"),
+                    "current_step": current_step,
+                }
+                yield _trace("llm_agent", "action_confirmation_required", paused)
+                yield {"type": "action_confirmation_required", "data": paused}
+                break
+
+            if fc.name == "submit_assessment":
+                yield _trace("llm_agent", "assessment", {
+                    "typology": args.get("typology"),
+                    "risk_level": args.get("risk_level"),
+                    "risk_score": args.get("risk_score"),
+                    "decision": args.get("decision"),
+                    "reasoning": args.get("reasoning"),
+                })
+            elif fc.name == "enact_decision":
+                yield _trace("llm_agent", "action_proposed", {
+                    "decision": args.get("decision"),
+                    "account_id": args.get("account_id"),
+                    "reason": args.get("reason"),
+                })
+            else:
+                is_specialist = event.author in SPECIALIST_NAMES
+                # Only count investigator (synthesis) tool calls as iterations;
+                # the parallel specialists run concurrently and shouldn't inflate it.
+                if not is_specialist:
+                    iteration += 1
+                    yield _trace("llm_agent", "agent_iteration", {
+                        "iteration": iteration, "tool_calls_so_far": iteration,
+                    })
+                yield _trace("llm_agent", "tool_call", {
+                    "tool": fc.name, "params": args, "iteration": iteration,
+                    "agent": event.author,
+                })
+
+        if paused:
+            break
+
+        # Parallel specialist finished → surface its findings summary live.
+        if event.author in SPECIALIST_NAMES and not event.partial and event.content:
+            text = "".join(p.text or "" for p in (event.content.parts or []) if getattr(p, "text", None))
+            if text.strip():
+                yield _trace("llm_agent", "specialist_finding", {
+                    "agent": event.author, "finding": text.strip()[:1500],
+                })
+
+        if event.author == INVESTIGATOR_NAME and not event.partial and event.content:
+            text = "".join(p.text or "" for p in (event.content.parts or []) if getattr(p, "text", None))
+            if text.strip():
+                yield _trace("llm_agent", "agent_thinking", {
+                    "iteration": iteration, "response_preview": text[:200],
+                })
+
+    if paused:
+        # Paused for confirmation — let the service stash it and stop (no finalize).
+        yield {"type": "_paused", "data": paused}
+        return
+
+    async for ev in _finalize(inv_runner, user_id, investigation_id, metrics, current_step):
+        yield ev
+
+
+async def _finalize(
+    inv_runner: InvestigationRunner,
+    user_id: str,
+    investigation_id: str,
+    metrics: Any,
+    current_step: Optional[str],
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Close the run: read final state, persist report artifact + memory, emit
+    final state_update / metrics / complete."""
+    if current_step:
+        yield _trace(current_step, "node_complete", {"status": "success"})
+        metrics.end_node(current_step)
+
+    final_session = await inv_runner.session_service.get_session(
+        app_name=APP_NAME, user_id=user_id, session_id=investigation_id,
+    )
+    final_state = (
+        final_session.state.to_dict() if final_session and hasattr(final_session.state, "to_dict")
+        else (dict(final_session.state) if final_session else {})
+    )
+
+    alert = final_state.get("alert_evidence") or {}
+    initial = final_state.get("initial_evidence") or {}
+    assessment = final_state.get("final_assessment")
+    if not assessment:
+        logger.warning(f"[{investigation_id}] No assessment submitted — using deterministic fallback")
+        assessment = deterministic_assessment(initial, alert)
+
+    report_markdown = final_state.get("report_markdown") or ""
+    if not report_markdown:
+        report_markdown = generate_fallback_report({**final_state, "final_assessment": assessment})
+
+    # Merge the parallel specialists' (per-agent) tool calls with the
+    # investigator's into one chronological list — specialists ran first.
+    specialist_calls = []
+    for name in SPECIALIST_NAMES:
+        specialist_calls.extend(final_state.get(f"specialist_tool_calls_{name}", []))
+    tool_calls = specialist_calls + final_state.get("tool_calls", [])
+
+    specialist_findings = {
+        name: (final_state.get(SPECIALIST_OUTPUT_KEYS[name]) or "")
+        for name in SPECIALIST_NAMES
+    }
+    enacted_actions = final_state.get("enacted_actions", [])
+    agent_iterations = final_state.get("agent_iterations", 0)
+
+    try:
+        await inv_runner.artifact_service.save_artifact(
+            app_name=APP_NAME, user_id=user_id, session_id=investigation_id,
+            filename="investigation_report.md", artifact=types.Part(text=report_markdown),
+        )
+    except Exception as e:
+        logger.warning(f"[{investigation_id}] Failed to save report artifact: {e}")
+
+    try:
+        if final_session:
+            await inv_runner.memory_service.add_session_to_memory(final_session)
+    except Exception as e:
+        logger.warning(f"[{investigation_id}] Failed to add session to memory: {e}")
+
+    yield {
+        "type": "state_update",
+        "data": {
+            "final_assessment": assessment,
+            "tool_calls": tool_calls,
+            "specialist_findings": specialist_findings,
+            "enacted_actions": enacted_actions,
+            "agent_iterations": agent_iterations,
+            "report_markdown": report_markdown,
+            "initial_evidence": initial,
+            "current_phase": "report",
+            "workflow_status": "completed",
+        },
+    }
+
+    final_metrics = metrics.get_metrics()
+    logger.info(
+        f"Investigation {investigation_id} completed in {final_metrics['total_duration_ms']:.0f}ms — "
+        f"DB calls: {final_metrics['total_db_calls']} (KV {final_metrics['kv_calls']}, Graph {final_metrics['graph_calls']}), "
+        f"LLM calls: {final_metrics['llm_calls']}, tools: {final_metrics['tool_calls_count']}, "
+        f"actions: {len(enacted_actions)}"
+    )
+    yield {"type": "metrics", "investigation_id": investigation_id, "data": final_metrics}
+    yield {"type": "complete", "investigation_id": investigation_id, "user_id": user_id}
+    remove_collector(investigation_id)
+
+
 async def run_investigation(
     inv_runner: InvestigationRunner,
     user_id: str,
     investigation_id: str,
 ) -> AsyncGenerator[Dict[str, Any], None]:
-    """Run one investigation, yielding SSE event dicts."""
+    """Run one investigation, yielding SSE event dicts (may pause for HITL)."""
     metrics = get_collector(investigation_id)
     metrics.reset()
-
     started_at = datetime.now().isoformat()
     logger.info(f"Starting investigation {investigation_id} for user {user_id}")
 
-    current_step: Optional[str] = None
-
-    def _start_step(step: str):
-        nonlocal current_step
-        if current_step and current_step != step:
-            metrics.end_node(current_step)
-        if current_step != step:
-            metrics.start_node(step)
-            current_step = step
-
     try:
-        # ── Deterministic pre-steps (KV reads) → seed session state ──────────
         seed_state = {
             "user_id": user_id,
             "investigation_id": investigation_id,
             "started_at": started_at,
             "tool_calls": [],
+            "enacted_actions": [],
             "agent_iterations": 0,
             "tool_calls_count": 0,
             "final_assessment": None,
@@ -160,14 +358,15 @@ async def run_investigation(
         }
 
         # 1) Alert validation
-        _start_step("alert_validation")
+        metrics.start_node("alert_validation")
         av = alert_validation_node({"user_id": user_id}, inv_runner.aerospike_service)
         seed_state["alert_evidence"] = av.get("alert_evidence")
         for ev in av.get("trace_events", []):
             yield {"type": "trace", "event": ev}
+        metrics.end_node("alert_validation")
 
         # 2) Data collection
-        _start_step("data_collection")
+        metrics.start_node("data_collection")
         dc = data_collection_node(
             {"user_id": user_id, "investigation_id": investigation_id, "alert_evidence": seed_state["alert_evidence"]},
             inv_runner.aerospike_service,
@@ -176,8 +375,8 @@ async def run_investigation(
         seed_state["initial_evidence"] = dc.get("initial_evidence")
         for ev in dc.get("trace_events", []):
             yield {"type": "trace", "event": ev}
+        metrics.end_node("data_collection")
 
-        # Push early evidence so the UI can render it immediately.
         yield {
             "type": "state_update",
             "data": {
@@ -187,155 +386,61 @@ async def run_investigation(
             },
         }
 
-        # ── Create the ADK session with seeded state ─────────────────────────
         await inv_runner.session_service.create_session(
-            app_name=APP_NAME,
-            user_id=user_id,
-            session_id=investigation_id,
-            state=seed_state,
+            app_name=APP_NAME, user_id=user_id, session_id=investigation_id, state=seed_state,
         )
 
-        # ── Drive the agent, translate the event stream ──────────────────────
-        new_message = types.Content(
-            role="user",
-            parts=[types.Part(text=(
-                "Investigate this flagged account using the available tools, then "
-                "submit your assessment and write the investigation report."
-            ))],
-        )
+        new_message = types.Content(role="user", parts=[types.Part(text=(
+            "Investigate this flagged account using the available tools, then submit your "
+            "assessment, enact your recommended decision, and write the investigation report."
+        ))])
 
-        iteration = 0
-        assessment_emitted = False
-
-        async for event in inv_runner.runner.run_async(
-            user_id=user_id,
-            session_id=investigation_id,
-            new_message=new_message,
-        ):
-            step = _AGENT_TO_STEP.get(event.author)
-            if step:
-                # Step transition: close the previous step, open this one.
-                if current_step != step:
-                    if current_step:
-                        yield _trace(current_step, "node_complete", {"status": "success"})
-                    _start_step(step)
-                    yield _trace(step, "node_start", {"user_id": user_id})
-
-            # Tool calls → tool_call / assessment trace events
-            for fc in event.get_function_calls():
-                args = dict(fc.args or {})
-                if fc.name == "submit_assessment":
-                    assessment_emitted = True
-                    yield _trace("llm_agent", "assessment", {
-                        "typology": args.get("typology"),
-                        "risk_level": args.get("risk_level"),
-                        "risk_score": args.get("risk_score"),
-                        "decision": args.get("decision"),
-                        "reasoning": args.get("reasoning"),
-                    })
-                else:
-                    iteration += 1
-                    yield _trace("llm_agent", "agent_iteration", {
-                        "iteration": iteration, "tool_calls_so_far": iteration,
-                    })
-                    yield _trace("llm_agent", "tool_call", {
-                        "tool": fc.name,
-                        "params": args,
-                        "iteration": iteration,
-                    })
-
-            # Investigator free-text reasoning → agent_thinking
-            if event.author == INVESTIGATOR_NAME and not event.partial and event.content:
-                text = "".join(p.text or "" for p in (event.content.parts or []) if getattr(p, "text", None))
-                if text.strip():
-                    yield _trace("llm_agent", "agent_thinking", {
-                        "iteration": iteration,
-                        "response_preview": text[:200],
-                    })
-
-        # Close the final step.
-        if current_step:
-            yield _trace(current_step, "node_complete", {"status": "success"})
-            metrics.end_node(current_step)
-            current_step = None
-
-        # ── Read final session state ─────────────────────────────────────────
-        final_session = await inv_runner.session_service.get_session(
-            app_name=APP_NAME, user_id=user_id, session_id=investigation_id,
-        )
-        if final_session is None:
-            final_state = {}
-        elif hasattr(final_session.state, "to_dict"):
-            final_state = final_session.state.to_dict()
-        else:
-            final_state = dict(final_session.state)
-
-        assessment = final_state.get("final_assessment")
-        if not assessment:
-            logger.warning(f"[{investigation_id}] No assessment submitted — using deterministic fallback")
-            assessment = deterministic_assessment(
-                seed_state.get("initial_evidence") or {},
-                seed_state.get("alert_evidence") or {},
-            )
-
-        report_markdown = final_state.get("report_markdown") or ""
-        if not report_markdown:
-            report_markdown = generate_fallback_report({**final_state, **seed_state, "final_assessment": assessment})
-
-        tool_calls = final_state.get("tool_calls", [])
-        agent_iterations = final_state.get("agent_iterations", iteration)
-
-        # ── Persist report as an Aerospike artifact ──────────────────────────
-        try:
-            await inv_runner.artifact_service.save_artifact(
-                app_name=APP_NAME,
-                user_id=user_id,
-                session_id=investigation_id,
-                filename="investigation_report.md",
-                artifact=types.Part(text=report_markdown),
-            )
-        except Exception as e:
-            logger.warning(f"[{investigation_id}] Failed to save report artifact: {e}")
-
-        # ── Add the session to long-term memory for future recall ────────────
-        try:
-            if final_session:
-                await inv_runner.memory_service.add_session_to_memory(final_session)
-        except Exception as e:
-            logger.warning(f"[{investigation_id}] Failed to add session to memory: {e}")
-
-        # ── Final state_update (also what investigation_service persists to KV)
-        yield {
-            "type": "state_update",
-            "data": {
-                "final_assessment": assessment,
-                "tool_calls": tool_calls,
-                "agent_iterations": agent_iterations,
-                "report_markdown": report_markdown,
-                "initial_evidence": seed_state.get("initial_evidence"),
-                "current_phase": "report",
-                "workflow_status": "completed",
-            },
-        }
-
-        final_metrics = metrics.get_metrics()
-        logger.info(
-            f"Investigation {investigation_id} completed in {final_metrics['total_duration_ms']:.0f}ms — "
-            f"DB calls: {final_metrics['total_db_calls']} (KV {final_metrics['kv_calls']}, Graph {final_metrics['graph_calls']}), "
-            f"LLM calls: {final_metrics['llm_calls']}, tools: {final_metrics['tool_calls_count']}"
-        )
-        yield {"type": "metrics", "investigation_id": investigation_id, "data": final_metrics}
-        yield {"type": "complete", "investigation_id": investigation_id, "user_id": user_id}
-        remove_collector(investigation_id)
+        async for ev in _drive_agent(inv_runner, user_id, investigation_id, new_message, metrics, start_step=None):
+            yield ev
 
     except Exception as e:
         logger.error(f"Investigation workflow error: {e}")
         logger.error(f"Full traceback:\n{traceback.format_exc()}")
-        if current_step:
-            try:
-                metrics.end_node(current_step)
-            except Exception:
-                pass
+        try:
+            yield {"type": "metrics", "investigation_id": investigation_id, "data": metrics.get_metrics()}
+        except Exception:
+            pass
+        yield {"type": "error", "investigation_id": investigation_id, "user_id": user_id, "error": str(e)}
+        remove_collector(investigation_id)
+
+
+async def resume_investigation(
+    inv_runner: InvestigationRunner,
+    user_id: str,
+    investigation_id: str,
+    fc_id: str,
+    approved: bool,
+    hint: str = "",
+    payload: Optional[Dict[str, Any]] = None,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """Resume a paused investigation after the analyst approves/rejects the action."""
+    metrics = get_collector(investigation_id)  # continue the same run's metrics
+    logger.info(f"Resuming investigation {investigation_id}: approved={approved} fc={fc_id}")
+
+    try:
+        yield _trace("llm_agent", "action_decision", {
+            "approved": bool(approved),
+            "decision": (payload or {}).get("decision"),
+            "account_id": (payload or {}).get("account_id"),
+        })
+
+        # Reply to the adk_request_confirmation call with the analyst's decision.
+        confirmation_response = {"confirmed": bool(approved), "hint": hint or "", "payload": payload or {}}
+        new_message = types.Content(role="user", parts=[types.Part(function_response=types.FunctionResponse(
+            id=fc_id, name="adk_request_confirmation", response=confirmation_response,
+        ))])
+
+        async for ev in _drive_agent(inv_runner, user_id, investigation_id, new_message, metrics, start_step="llm_agent"):
+            yield ev
+
+    except Exception as e:
+        logger.error(f"Resume investigation error: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         try:
             yield {"type": "metrics", "investigation_id": investigation_id, "data": metrics.get_metrics()}
         except Exception:

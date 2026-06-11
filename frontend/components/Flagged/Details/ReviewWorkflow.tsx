@@ -45,7 +45,7 @@ interface Props {
     currentStep: number
     onStepChange: (step: number) => void
     // AI Investigation props
-    investigationStatus?: 'idle' | 'connecting' | 'running' | 'completed' | 'error'
+    investigationStatus?: 'idle' | 'connecting' | 'running' | 'awaiting_confirmation' | 'completed' | 'error'
     investigationSteps?: InvestigationStep[]
     completedInvestigationSteps?: string[]
     currentNode?: string

@@ -32,6 +32,8 @@ import ReviewWorkflow from '@/components/Flagged/Details/ReviewWorkflow'
 import GraphVisualization from '@/components/Flagged/Details/GraphVisualization'
 import { InvestigationReport } from '@/components/Flagged/Details/InvestigationReport'
 import PerformanceMetricsPanel from '@/components/Flagged/Details/PerformanceMetricsPanel'
+import { ActionApprovalCard } from '@/components/Flagged/Details/ActionApprovalCard'
+import { EvidenceSpecialists } from '@/components/Flagged/Details/EvidenceSpecialists'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useAccountData } from '@/hooks/useAccountData'
 import { formatCurrency } from '@/lib/utils'
@@ -412,6 +414,13 @@ export default function FlaggedAccountDetailsPage() {
 
                         {/* Investigation Tab - Shows report (progress is in Review Workflow on the right) */}
                         <TabsContent value="investigation" className="mt-6 space-y-6">
+                            <EvidenceSpecialists
+                                specialistFindings={investigation.specialistFindings}
+                                toolCalls={investigation.toolCalls}
+                                active={investigation.currentNode === 'llm_agent' &&
+                                    (investigation.status === 'running' || investigation.status === 'awaiting_confirmation')}
+                            />
+
                             <InvestigationReport
                                 userId={accountId}
                                 finalAssessment={investigation.finalAssessment}
@@ -426,7 +435,36 @@ export default function FlaggedAccountDetailsPage() {
                                 accountProfile={investigation.accountProfile}
                                 networkEvidence={investigation.networkEvidence}
                             />
-                            
+
+                            {/* Actions enacted by the agent (after analyst approval) */}
+                            {investigation.enactedActions.length > 0 && (
+                                <Card className="bg-white border-slate-200 shadow-sm">
+                                    <CardHeader>
+                                        <CardTitle className="flex items-center gap-2 text-lg text-slate-900">
+                                            <Shield className="h-5 w-5 text-emerald-600" />
+                                            Actions Taken
+                                        </CardTitle>
+                                        <CardDescription className="text-slate-500">
+                                            Mitigation actions the agent enacted on this account
+                                        </CardDescription>
+                                    </CardHeader>
+                                    <CardContent className="space-y-3">
+                                        {investigation.enactedActions.map((action, idx) => (
+                                            <div key={idx} className="flex items-start gap-3 rounded-lg border border-emerald-100 bg-emerald-50 p-3">
+                                                <div className="mt-0.5 h-2 w-2 rounded-full bg-emerald-500" />
+                                                <div className="flex-1">
+                                                    <p className="font-medium text-slate-900">
+                                                        {action.action.replace(/_/g, ' ')}
+                                                        <span className="ml-2 font-mono text-xs text-slate-500">{action.account_id}</span>
+                                                    </p>
+                                                    <p className="text-sm text-slate-600">{action.effect}</p>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </CardContent>
+                                </Card>
+                            )}
+
                             {/* Graph visualization from investigation if available */}
                             {investigation.networkEvidence?.subgraph_nodes && investigation.networkEvidence.subgraph_nodes.length > 0 && (
                                 <Card className="bg-white border-slate-200 shadow-sm">
@@ -631,8 +669,17 @@ export default function FlaggedAccountDetailsPage() {
                 </div>
 
                 {/* Right Column - Workflow with AI Integration */}
-                <div className="lg:col-span-1">
-                    <ReviewWorkflow 
+                <div className="lg:col-span-1 space-y-6">
+                    {/* Human-in-the-loop: agent paused awaiting analyst approval */}
+                    {investigation.status === 'awaiting_confirmation' && investigation.pendingAction && (
+                        <ActionApprovalCard
+                            pendingAction={investigation.pendingAction}
+                            onApprove={() => investigation.approveAction(true)}
+                            onReject={() => investigation.approveAction(false)}
+                        />
+                    )}
+
+                    <ReviewWorkflow
                         currentStep={currentStep}
                         onStepChange={setCurrentStep}
                         investigationStatus={investigation.status}

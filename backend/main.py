@@ -72,7 +72,10 @@ async def lifespan(app: FastAPI):
     
     # Bind ADK investigation tools to the live Aerospike + Graph services
     from workflow.tools.investigation_tools_adk import init_tools
+    from workflow.action_tools import init_action_tools
     init_tools(aerospike_service, graph_service)
+    # Bind action tools (freeze/escalate/etc.) used by the human-in-the-loop flow
+    init_action_tools(flagged_account_service, aerospike_service)
 
     # Initialize investigation service (Google ADK, Aerospike-backed)
     adk_model = os.environ.get("ADK_MODEL", "gemini-3.5-flash")
@@ -1487,6 +1490,37 @@ async def stream_investigation(
                 "data": json.dumps({"error": str(e)})
             }
     
+    return EventSourceResponse(event_generator())
+
+
+@app.get("/investigation/{investigation_id}/resume")
+async def resume_investigation_action(
+    investigation_id: str = Path(..., description="Investigation ID paused for action approval"),
+    approved: bool = Query(..., description="Whether the analyst approves the proposed action"),
+):
+    """SSE endpoint that resumes a paused investigation after the analyst
+    approves or rejects the agent's proposed action (human-in-the-loop)."""
+    if not investigation_service:
+        raise HTTPException(status_code=503, detail="Investigation service not initialized")
+    if not investigation_service.has_pending_action(investigation_id):
+        raise HTTPException(status_code=404, detail="No pending action for this investigation")
+
+    def json_serializer(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    async def event_generator():
+        try:
+            async for event in investigation_service.resume_investigation_action(investigation_id, approved):
+                yield {
+                    "event": event.get("event", "message"),
+                    "data": json.dumps(event.get("data", event), default=json_serializer),
+                }
+        except Exception as e:
+            logger.error(f"Investigation resume stream error: {e}")
+            yield {"event": "error", "data": json.dumps({"error": str(e)})}
+
     return EventSourceResponse(event_generator())
 
 
