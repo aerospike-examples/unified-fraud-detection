@@ -683,6 +683,7 @@ export default function FlaggedAccountDetailsPage() {
                         currentStep={currentStep}
                         onStepChange={setCurrentStep}
                         investigationStatus={investigation.status}
+                        aiDecision={investigation.enactedActions[0]?.action || investigation.finalAssessment?.decision || ''}
                         investigationSteps={investigation.steps}
                         completedInvestigationSteps={investigation.completedSteps}
                         currentNode={investigation.currentNode}

@@ -1,7 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Network, Smartphone, Activity, Loader2, CheckCircle2, Layers } from "lucide-react";
+import { Network, Smartphone, Activity, Loader2, CheckCircle2, Layers, Wrench, ChevronDown, ChevronUp } from "lucide-react";
 import { SPECIALISTS, type SpecialistName, type ToolCall } from "@/hooks/useInvestigation";
 
 const ICONS: Record<SpecialistName, React.ReactNode> = {
@@ -24,6 +25,10 @@ interface EvidenceSpecialistsProps {
 }
 
 export function EvidenceSpecialists({ specialistFindings, toolCalls, active }: EvidenceSpecialistsProps) {
+  // Which specialists' tool-call lists are expanded.
+  const [expanded, setExpanded] = useState<Partial<Record<SpecialistName, boolean>>>({});
+  const toggle = (id: SpecialistName) => setExpanded((e) => ({ ...e, [id]: !e[id] }));
+
   const anyActivity =
     toolCalls.some((t) => t.agent && t.agent !== "investigator") ||
     Object.keys(specialistFindings).length > 0;
@@ -73,9 +78,34 @@ export function EvidenceSpecialists({ specialistFindings, toolCalls, active }: E
                 </div>
                 <p className="mt-0.5 text-xs text-slate-500">{BLURB[id]}</p>
 
-                <div className="mt-2 text-xs text-slate-400">
-                  {calls.length} tool {calls.length === 1 ? "call" : "calls"}
-                </div>
+                {calls.length > 0 ? (
+                  <div className="mt-2">
+                    <button
+                      onClick={() => toggle(id)}
+                      className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700"
+                    >
+                      <Wrench className="h-3 w-3" />
+                      <span>{calls.length} tool {calls.length === 1 ? "call" : "calls"}</span>
+                      {expanded[id] ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                    </button>
+                    {expanded[id] && (
+                      <ol className="mt-1.5 space-y-1">
+                        {calls.map((c, i) => {
+                          const arg = Object.values(c.params || {}).find((v) => typeof v === "string");
+                          return (
+                            <li key={i} className="flex items-start gap-2 rounded bg-white/70 px-2 py-1 text-xs">
+                              <span className="w-3 font-mono text-slate-400">{i + 1}.</span>
+                              <span className="font-mono text-slate-700">{c.tool}</span>
+                              {arg ? <span className="truncate font-mono text-slate-400">{String(arg)}</span> : null}
+                            </li>
+                          );
+                        })}
+                      </ol>
+                    )}
+                  </div>
+                ) : (
+                  <div className="mt-2 text-xs text-slate-400">0 tool calls</div>
+                )}
 
                 {finding ? (
                   <p className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-slate-700 line-clamp-[12]">

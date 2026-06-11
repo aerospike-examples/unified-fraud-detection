@@ -78,13 +78,21 @@ def _execute_action(decision: str, account_id: str, reason: str) -> Dict[str, An
                 "effect": "case escalated to compliance (under_investigation)", "ok": ok}
 
     if decision == "step_up_auth":
-        # Non-destructive: record the step-up requirement, no state change.
+        # Non-destructive: require step-up auth; move the account to monitoring so
+        # it leaves the pending queue (reviewed, allowed with extra verification).
+        result = _flagged_account_service.mark_monitoring(
+            account_id, f"{note} (step-up authentication required on next login)")
+        ok = bool(result.get("success", True)) if isinstance(result, dict) else True
         return {"status": "executed", "action": decision, "account_id": account_id,
-                "effect": "step-up authentication requested on next login"}
+                "effect": "step-up authentication required; account allowed under active monitoring",
+                "ok": ok}
 
-    # allow_monitor or anything else: no enforcement.
+    # allow_monitor (or anything else): no fraud action, but record the decision —
+    # move the account to monitoring so it leaves the pending-review queue.
+    result = _flagged_account_service.mark_monitoring(account_id, note)
+    ok = bool(result.get("success", True)) if isinstance(result, dict) else True
     return {"status": "executed", "action": decision, "account_id": account_id,
-            "effect": "no action taken; account left active under monitoring"}
+            "effect": "account allowed and moved to active monitoring (not fraud)", "ok": ok}
 
 
 def enact_decision(decision: str, account_id: str, reason: str, tool_context: ToolContext) -> dict:

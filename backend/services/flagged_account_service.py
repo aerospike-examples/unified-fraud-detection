@@ -1168,6 +1168,35 @@ class FlaggedAccountService:
 
         return result
 
+    def mark_monitoring(self, account_id: str, notes: str = "") -> Dict[str, Any]:
+        """Move a flagged account to ``monitoring`` — allowed to stay active but kept
+        under watch. Used for the agent's non-destructive decisions (allow_monitor,
+        step_up_auth): the account is NOT fraud and NOT frozen, but it has been
+        reviewed and decided on, so it leaves the pending-review queue.
+        """
+        result = {"account_id": account_id, "action": "monitoring", "success": False, "errors": []}
+        if not self._use_aerospike():
+            result["errors"].append("Aerospike unavailable")
+            return result
+        try:
+            user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else account_id
+            if self._aerospike.get_flagged_account(user_id):
+                self._aerospike.update_flagged_account(user_id, {
+                    "status": "monitoring",
+                    "resolution": "monitoring",
+                    "resolution_date": datetime.now().isoformat(),
+                    "resolution_notes": notes or "Allowed under active monitoring by analyst",
+                })
+                result["success"] = True
+                result["flagged_account_updated"] = True
+                logger.info(f"Account {account_id} (user {user_id}) set to monitoring.")
+            else:
+                result["errors"].append(f"No flagged record for user {user_id}")
+        except Exception as e:
+            result["errors"].append(f"Monitoring update error: {e}")
+            logger.error(f"Error setting monitoring on {account_id}: {e}")
+        return result
+
     def get_flagged_stats(self) -> Dict[str, Any]:
         """Get statistics for flagged accounts."""
         if self._use_aerospike():
@@ -1178,6 +1207,7 @@ class FlaggedAccountService:
                 "pending_review": 0,
                 "under_investigation": 0,
                 "temporarily_frozen": 0,
+                "monitoring": 0,
                 "confirmed_fraud": 0,
                 "cleared": 0,
                 "avg_risk_score": 0,
@@ -1189,6 +1219,7 @@ class FlaggedAccountService:
             "pending_review": len([a for a in accounts if a.get("status") == "pending_review"]),
             "under_investigation": len([a for a in accounts if a.get("status") == "under_investigation"]),
             "temporarily_frozen": len([a for a in accounts if a.get("status") == "temporarily_frozen"]),
+            "monitoring": len([a for a in accounts if a.get("status") == "monitoring"]),
             "confirmed_fraud": len([a for a in accounts if a.get("status") == "confirmed_fraud"]),
             "cleared": len([a for a in accounts if a.get("status") == "cleared"]),
             "avg_risk_score": sum(a.get("risk_score", 0) for a in accounts) / len(accounts) if accounts else 0,

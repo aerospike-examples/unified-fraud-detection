@@ -57,6 +57,18 @@ interface Props {
     highestRiskAccountId?: string
     // Existing resolutions from KV store (pre-populate decisions)
     existingResolutions?: Record<string, 'fraud' | 'safe' | null>
+    // The decision the AI agent enacted (e.g. allow_monitor, temporary_freeze).
+    // When set, the AI has reached and enacted a decision (completes the Decision step).
+    aiDecision?: string
+}
+
+// Human-readable labels for the agent's enacted decisions.
+const decisionLabels: Record<string, string> = {
+    allow_monitor: 'Allow & Monitor',
+    step_up_auth: 'Step-up Authentication',
+    temporary_freeze: 'Temporary Freeze',
+    full_block: 'Full Block',
+    escalate_compliance: 'Escalate to Compliance',
 }
 
 const workflowSteps = [
@@ -108,7 +120,8 @@ const ReviewWorkflow = ({
     getStepStatus,
     accountPredictions = [],
     highestRiskAccountId = '',
-    existingResolutions = {}
+    existingResolutions = {},
+    aiDecision = ''
 }: Props) => {
     const [notes, setNotes] = useState('')
     // Per-account decisions: { account_id: 'fraud' | 'safe' | null }
@@ -227,7 +240,9 @@ const ReviewWorkflow = ({
         // and show Human Decision step (3) as current
         if (investigationStatus === 'completed') {
             if (stepIndex < 3) return 'completed' // Steps 0, 1, 2 (AI steps) are done
-            if (stepIndex === 3) return 'current'  // Step 3 (Human Decision) is current
+            // Step 3 (Decision): the AI reached and enacted a decision → complete.
+            // If somehow no decision was enacted, leave it as the current (human) step.
+            if (stepIndex === 3) return aiDecision ? 'completed' : 'current'
             return 'upcoming'
         }
         
@@ -348,6 +363,14 @@ const ReviewWorkflow = ({
                                             {step.title}
                                         </h4>
                                         <p className="text-sm text-slate-500 mt-1">{step.description}</p>
+
+                                        {/* AI's enacted decision satisfies the Decision step */}
+                                        {index === 3 && isAIComplete && aiDecision && (
+                                            <div className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-emerald-50 border border-emerald-200 px-2 py-1 text-xs font-medium text-emerald-700">
+                                                <CheckCircle className="w-3.5 h-3.5" />
+                                                AI decision: {decisionLabels[aiDecision] || aiDecision}
+                                            </div>
+                                        )}
 
                                         {/* AI Sub-steps */}
                                         {hasAISteps && showSubSteps && (
