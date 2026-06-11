@@ -2,7 +2,7 @@
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { ShieldAlert, Check, X, Loader2 } from "lucide-react";
+import { ShieldAlert, Check, X, Loader2, FileText } from "lucide-react";
 import type { PendingAction } from "@/hooks/useInvestigation";
 
 // Maps the agent's decision codes to analyst-facing labels.
@@ -18,6 +18,8 @@ interface ActionApprovalCardProps {
   pendingAction: PendingAction;
   onApprove: () => void;
   onReject: () => void;
+  /** Open the full report + decide dialog. */
+  onReview?: () => void;
   /** True while the resume stream is in flight (buttons disabled). */
   submitting?: boolean;
 }
@@ -26,6 +28,7 @@ export function ActionApprovalCard({
   pendingAction,
   onApprove,
   onReject,
+  onReview,
   submitting = false,
 }: ActionApprovalCardProps) {
   const decisionLabel =
@@ -72,6 +75,17 @@ export function ActionApprovalCard({
             </div>
           )}
         </div>
+
+        {onReview && (
+          <Button
+            onClick={onReview}
+            variant="outline"
+            className="w-full border-amber-300 bg-white text-amber-800 hover:bg-amber-100"
+          >
+            <FileText className="h-4 w-4" />
+            Review full report &amp; decide
+          </Button>
+        )}
 
         <div className="flex gap-3">
           <Button

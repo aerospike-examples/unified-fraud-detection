@@ -23,9 +23,6 @@ import {
     Shield,
     Smartphone,
     Globe,
-    Brain,
-    PlayCircle,
-    StopCircle,
     RefreshCw
 } from 'lucide-react'
 import ReviewWorkflow from '@/components/Flagged/Details/ReviewWorkflow'
@@ -33,6 +30,7 @@ import GraphVisualization from '@/components/Flagged/Details/GraphVisualization'
 import { InvestigationReport } from '@/components/Flagged/Details/InvestigationReport'
 import PerformanceMetricsPanel from '@/components/Flagged/Details/PerformanceMetricsPanel'
 import { ActionApprovalCard } from '@/components/Flagged/Details/ActionApprovalCard'
+import { DecisionReviewDialog } from '@/components/Flagged/Details/DecisionReviewDialog'
 import { EvidenceSpecialists } from '@/components/Flagged/Details/EvidenceSpecialists'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useAccountData } from '@/hooks/useAccountData'
@@ -111,6 +109,8 @@ export default function FlaggedAccountDetailsPage() {
     const [currentStep, setCurrentStep] = useState(0)
     const [activeTab, setActiveTab] = useState('overview')
     const [loadedExisting, setLoadedExisting] = useState(false)
+    // Review-report-and-decide dialog (opens when the agent pauses for approval)
+    const [reviewOpen, setReviewOpen] = useState(false)
     
     // Fetch real account data
     const { data: account, loading, error, refetch } = useAccountData(accountId)
@@ -131,6 +131,17 @@ export default function FlaggedAccountDetailsPage() {
         }
         loadExisting()
     }, [account?.user_id, investigation.status, loadedExisting])
+
+    // When the agent pauses for approval, open the review-and-decide dialog so the
+    // analyst reads the full report before approving/rejecting.
+    useEffect(() => {
+        if (investigation.status === 'awaiting_confirmation') {
+            setActiveTab('investigation')
+            setReviewOpen(true)
+        } else {
+            setReviewOpen(false)
+        }
+    }, [investigation.status])
 
     const handleStartInvestigation = () => {
         if (account) {
@@ -187,24 +198,7 @@ export default function FlaggedAccountDetailsPage() {
                     <Button variant="outline" size="icon" onClick={refetch} title="Refresh data" className="border-slate-300">
                         <RefreshCw className="h-4 w-4" />
                     </Button>
-                    {/* Investigation Button */}
-                    {investigation.status === 'idle' || investigation.status === 'completed' || investigation.status === 'error' ? (
-                        <Button 
-                            onClick={handleStartInvestigation}
-                            className="bg-indigo-600 hover:bg-indigo-700 text-white"
-                        >
-                            <Brain className="h-4 w-4 mr-2" />
-                            Start AI Investigation
-                        </Button>
-                    ) : (
-                        <Button 
-                            onClick={handleStopInvestigation}
-                            variant="destructive"
-                        >
-                            <StopCircle className="h-4 w-4 mr-2" />
-                            Stop Investigation
-                        </Button>
-                    )}
+                    {/* AI Investigation start/stop now lives in the Review Workflow panel */}
                     <Link href={`/users/${account.user_id}`}>
                         <Button variant="outline" className="border-slate-300 text-slate-700 hover:bg-slate-50">
                             <User className="h-4 w-4 mr-2" />
@@ -676,6 +670,7 @@ export default function FlaggedAccountDetailsPage() {
                             pendingAction={investigation.pendingAction}
                             onApprove={() => investigation.approveAction(true)}
                             onReject={() => investigation.approveAction(false)}
+                            onReview={() => setReviewOpen(true)}
                         />
                     )}
 
@@ -690,6 +685,8 @@ export default function FlaggedAccountDetailsPage() {
                         toolCalls={investigation.toolCalls}
                         traceEvents={investigation.traceEvents}
                         getStepStatus={investigation.getStepStatus}
+                        onStart={handleStartInvestigation}
+                        onStop={handleStopInvestigation}
                     />
                     
                     {/* Performance Metrics - shown after investigation runs */}
@@ -698,6 +695,18 @@ export default function FlaggedAccountDetailsPage() {
                     )}
                 </div>
             </div>
+
+            {/* Review the full report, then approve/reject — opens at the approval pause */}
+            {investigation.status === 'awaiting_confirmation' && investigation.pendingAction && (
+                <DecisionReviewDialog
+                    open={reviewOpen}
+                    onOpenChange={setReviewOpen}
+                    pendingAction={investigation.pendingAction}
+                    report={investigation.report}
+                    onApprove={() => { setReviewOpen(false); investigation.approveAction(true) }}
+                    onReject={() => { setReviewOpen(false); investigation.approveAction(false) }}
+                />
+            )}
         </div>
     )
 }

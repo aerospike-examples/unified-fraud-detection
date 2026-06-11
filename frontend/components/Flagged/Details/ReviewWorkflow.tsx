@@ -16,7 +16,8 @@ import {
     ShieldAlert,
     Wrench,
     ChevronDown,
-    ChevronUp
+    ChevronUp,
+    StopCircle
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { WorkflowStep as InvestigationStep, TraceEvent, ToolCall } from '@/hooks/useInvestigation'
@@ -44,6 +45,9 @@ interface Props {
     // The decision the AI agent enacted (e.g. allow_monitor, temporary_freeze).
     // When set, the AI has reached and enacted a decision (completes the Decision step).
     aiDecision?: string
+    // Start/stop the investigation — this panel hosts the only control.
+    onStart?: () => void
+    onStop?: () => void
 }
 
 // Human-readable labels for the agent's enacted decisions.
@@ -102,7 +106,9 @@ const ReviewWorkflow = ({
     toolCalls = [],
     traceEvents = [],
     getStepStatus,
-    aiDecision = ''
+    aiDecision = '',
+    onStart,
+    onStop
 }: Props) => {
     const [showToolCalls, setShowToolCalls] = useState(false)
 
@@ -347,23 +353,28 @@ const ReviewWorkflow = ({
                         })}
                     </div>
 
-                    {/* Step Navigation */}
-                    <div className="flex justify-between mt-6 pt-4 border-t border-slate-200">
-                        <Button
-                            variant="outline"
-                            onClick={() => onStepChange(Math.max(0, currentStep - 1))}
-                            disabled={currentStep === 0}
-                            className="border-slate-300 text-slate-700 hover:bg-slate-50"
-                        >
-                            Previous Step
-                        </Button>
-                        {currentStep < workflowSteps.length - 1 && (
+                    {/* Investigation control — the single action for this panel */}
+                    <div className="mt-6 pt-4 border-t border-slate-200">
+                        {(investigationStatus === 'idle' || investigationStatus === 'completed' || investigationStatus === 'error') && onStart && (
                             <Button
-                                onClick={() => onStepChange(currentStep + 1)}
-                                className="bg-indigo-600 hover:bg-indigo-700 text-white"
+                                onClick={onStart}
+                                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white"
                             >
-                                Continue to Next Step
+                                <Brain className="h-4 w-4 mr-2" />
+                                {investigationStatus === 'completed' ? 'Re-run AI Investigation' : 'Start AI Investigation'}
                             </Button>
+                        )}
+                        {(investigationStatus === 'running' || investigationStatus === 'connecting') && onStop && (
+                            <Button onClick={onStop} variant="destructive" className="w-full">
+                                <StopCircle className="h-4 w-4 mr-2" />
+                                Stop Investigation
+                            </Button>
+                        )}
+                        {investigationStatus === 'awaiting_confirmation' && (
+                            <p className="flex items-center justify-center gap-2 text-sm font-medium text-amber-700">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                Awaiting your approval — see the decision above
+                            </p>
                         )}
                     </div>
                 </CardContent>
