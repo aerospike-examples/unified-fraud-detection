@@ -96,7 +96,7 @@ SequentialAgent  "fraud_investigation"
         before the analyst approves) — see the spotlight below
 ```
 
-Each specialist writes a findings summary to session state via its `output_key`; the investigator reads all three and reaches a decision in 0–3 tool calls instead of gathering everything itself. The **report is written before the decision is enacted** so the analyst reviews the full report before approving. Two deterministic pre-steps (`alert_validation`, `data_collection`) seed the ADK session state from fast KV reads before the agent starts, so the model begins with baseline context instead of spending tool calls on it. The `Runner` and services are built once in `InvestigationRunner` (`backend/workflow/runner.py`).
+Each specialist writes a findings summary to session state via its `output_key`; the investigator reads all three and reaches a decision in 0–3 tool calls instead of gathering everything itself. The **report is written before the decision is enacted** so the analyst reviews the full report before approving. Deterministic pre-steps (`alert_validation`, `data_collection`, then a **memory recall** of related prior cases) seed the ADK session state from fast KV reads before the agent starts, so the model begins with baseline context + relevant history instead of spending tool calls on it. The `Runner` and services are built once in `InvestigationRunner` (`backend/workflow/runner.py`).
 
 ### Aerospike ⇄ ADK integration
 
@@ -124,7 +124,7 @@ self.runner = Runner(
 | ADK service | Aerospike role | Used in the demo for |
 |-------------|----------------|----------------------|
 | **SessionService** | Sessions + per-app/user/session state | The live investigation's evidence, parallel specialist findings, tool log, assessment, and enacted actions |
-| **MemoryService** | Durable, searchable memory | Recalling similar past investigations across cases (`recall_similar_investigations`) |
+| **MemoryService** | Durable, searchable memory | Cross-case recall — every investigation is stored and related prior cases are recalled by entity (see the spotlight) |
 | **ArtifactService** | Binary/text artifacts | Persisting the final markdown report (`investigation_report.md`) |
 
 This means the agent's entire footprint — its working state, its long-term memory, and its output artifacts — lives in the **same Aerospike cluster** that powers the fraud graph. One datastore, one client, one operational surface.
@@ -139,7 +139,7 @@ This means the agent's entire footprint — its working state, its long-term mem
 | **Sequential pipeline** | `SequentialAgent` chains `evidence_collection → investigator → report_writer → action_taker` (assess → report → enact, in that order) | `agent.py` |
 | **Parallel multi-agent** | `ParallelAgent` runs three evidence specialists (network / device / velocity) concurrently, each writing findings via `output_key` — see below | `agent.py`, `runner.py` |
 | **Session + state** | Deterministic pre-steps seed state; tools and agents read/write it (specialists write per-agent keys to stay race-free under fan-out) | `runner.py`, `plugins.py`, `nodes/` |
-| **Long-term memory** | `recall_similar_investigations` calls `tool_context.search_memory(...)` to surface prior cases | `tools/investigation_tools_adk.py` |
+| **Long-term memory** | Every completed investigation is stored to ADK memory; a new one recalls **related prior cases by entity** (account / device / counterparty) before the agent runs — see below | `case_memory.py`, `runner.py` |
 | **Artifacts** | The report is saved with `artifact_service.save_artifact(...)` and the session is added to memory on completion | `runner.py` |
 | **Plugins & callbacks** | `MetricsPlugin` (a `BasePlugin`) collects timing/DB/LLM/token metrics via callbacks and enforces a per-run tool-call budget in `before_tool_callback` | `plugins.py` |
 | **Human-in-the-loop tool confirmation** | The `action_taker` stage pauses for analyst approval on destructive actions via ADK's native `request_confirmation`; the analyst can approve or override with a different disposition — see below | `action_tools.py`, `runner.py` |
@@ -170,6 +170,25 @@ Two correctness details worth noting, since fan-out shares one session:
  (ParallelAgent,    │  device_analyst   ─┼─▶ findings ─▶    │ investigator ─▶ report_writer ─▶ action_taker
   concurrent)       │  velocity_analyst ─┘   (state)        │ (synthesis)      (report)        (enact)
                     └──────────────────────────────────────┘
+```
+
+### Feature spotlight: Cross-case memory
+
+ADK long-term memory (`AerospikeMemoryService`) is used as a **fraud-intelligence layer that spans investigations**. Every completed investigation is written to memory as a compact, entity-indexed case record (the account, its devices, the counterparties it touched, the typology, and the decision). When a new account is investigated, a **memory-recall pre-step** (before the agent runs) surfaces prior cases that referenced any of the suspect's entities — most usefully, cases where **this account appeared as a counterparty**:
+
+> *"John Garcia was a counterparty in 2 prior confirmed-fraud investigations (Timothy Jones, Christopher Martinez — fraud_ring)."*
+
+The recalled cases are shown in the **Related Prior Cases** panel and injected into the investigator's prompt, so the agent reasons with relevant history. Memory lives in Aerospike (the `adk_memory` set) and **persists across data resets**, so it accumulates as a real case history.
+
+One implementation detail worth calling out: the `adk-aerospike` memory index tokenizes on `[A-Za-z]+` (it drops digits), so raw ids like `U0007387` collapse to `u` and match everything. We encode each id's digits to letters so every entity becomes a **unique alphabetic token** that survives the tokenizer and matches precisely — and pool all cases under one shared memory scope (ADK memory is keyed by `app_name + user_id`) so recall works across accounts.
+
+```
+investigate account B ──▶ memory recall (entities of B)
+                                 │  search ADK memory (AerospikeMemoryService)
+                                 ▼
+                    prior cases referencing B's account/devices,
+                    or where B was a counterparty  ──▶ Related Prior Cases panel
+                                                       + investigator prompt
 ```
 
 ### Feature spotlight: Human-in-the-loop remediation actions
@@ -218,7 +237,7 @@ This keeps the agent useful (it closes the loop on its own findings) while ensur
 
 ## 🧭 ADK Roadmap / Ideas to Showcase
 
-This demo is intended to grow into a showcase of what ADK can do as a fraud-investigation agentic layer. Already shipped: **parallel multi-agent evidence collection** and **human-in-the-loop tool confirmation** (see the spotlights above). Candidate additions (not yet implemented):
+This demo is intended to grow into a showcase of what ADK can do as a fraud-investigation agentic layer. Already shipped: **parallel multi-agent evidence collection**, **cross-case long-term memory**, and **human-in-the-loop tool confirmation** (see the spotlights above). Candidate additions (not yet implemented):
 
 - **Escalation sub-agents** — specialist agents (e.g. AML, sanctions) the investigator can *transfer to* dynamically, showcasing ADK's hierarchical/agent-transfer routing (vs the current static sequence).
 - **Guardrail callbacks** — input/output guardrails via plugin callbacks (PII redaction, action-policy enforcement beyond the budget).
