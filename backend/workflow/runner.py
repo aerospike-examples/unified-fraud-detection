@@ -145,15 +145,23 @@ def _holder_name(ie: Optional[Dict[str, Any]]) -> str:
 
 
 def _counterparties(tool_calls: list) -> list:
-    """Counterparty user_ids the investigation looked at (so future investigations
-    of those accounts recall this case)."""
-    out = []
+    """All counterparty user_ids this investigation touched, so future
+    investigations of any of those accounts recall this case. Pulled from the
+    full transaction results (not just the 2-3 the agent drilled into), so recall
+    is complete regardless of which counterparties the agent chose."""
+    out = set()
     for tc in tool_calls or []:
-        if tc.get("tool") in ("get_counterparty_profile", "get_counterparty_transactions"):
+        tool = tc.get("tool")
+        if tool in ("get_counterparty_profile", "get_counterparty_transactions"):
             uid = (tc.get("params") or {}).get("user_id")
             if uid:
-                out.append(uid)
-    return out
+                out.add(uid)
+        elif tool == "get_account_transactions":
+            for txn in ((tc.get("result") or {}).get("transactions") or []):
+                cp = txn.get("counterparty_user_id")
+                if cp:
+                    out.add(cp)
+    return list(out)
 
 
 async def _read_state(inv_runner: InvestigationRunner, user_id: str, investigation_id: str) -> Dict[str, Any]:
