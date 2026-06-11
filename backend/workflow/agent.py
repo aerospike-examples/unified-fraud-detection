@@ -200,12 +200,28 @@ def _format_specialist_findings(state) -> str:
     return "\n\n".join(blocks)
 
 
+def _format_prior_cases(state) -> str:
+    """Render related prior investigations recalled from long-term memory."""
+    cases = state.get("prior_cases") or []
+    if not cases:
+        return ""
+    lines = ["\n## RELATED PRIOR CASES (recalled from long-term memory)",
+             "These past investigations referenced this account or its connections — weigh them:"]
+    for c in cases[:5]:
+        who = c.get("holder") or c.get("user_id") or "?"
+        matched = ", ".join(c.get("matched_on") or [])
+        lines.append(
+            f"- {who} (acct {c.get('account_id')}): typology={c.get('typology')}, "
+            f"prior decision={c.get('decision')} — shared entity: {matched}")
+    return "\n".join(lines) + "\n"
+
+
 def _investigator_instruction(ctx: ReadonlyContext) -> str:
     """Build the investigator instruction from seeded session state + parallel findings."""
     state = ctx.state
     initial = state.get("initial_evidence") or {}
     alert = state.get("alert_evidence") or {}
-    evidence = build_evidence_summary(initial, alert)
+    evidence = build_evidence_summary(initial, alert) + _format_prior_cases(state)
     findings = _format_specialist_findings(state)
     return _INVESTIGATOR_SYSTEM.format(evidence=evidence, findings=findings)
 

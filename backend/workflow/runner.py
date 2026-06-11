@@ -31,6 +31,7 @@ from workflow.agent import (
     build_investigation_agent, APP_NAME, INVESTIGATOR_NAME, REPORT_WRITER_NAME,
     SPECIALIST_NAMES, SPECIALIST_OUTPUT_KEYS,
 )
+from workflow.case_memory import recall_cases, store_case
 from workflow.plugins import MetricsPlugin
 from workflow.assessment import deterministic_assessment
 from workflow.nodes.report_generation import generate_fallback_report
@@ -128,6 +129,31 @@ def _trace(node: str, type_: str, data: Dict[str, Any]) -> Dict[str, Any]:
             "data": data,
         },
     }
+
+
+def _evidence_entities(user_id: str, ie: Optional[Dict[str, Any]]) -> list:
+    """The suspect's own entity ids — user, accounts, devices — for memory recall."""
+    ie = ie or {}
+    ids = [user_id, *(ie.get("accounts") or {}).keys(), *(ie.get("devices") or {}).keys()]
+    return [i for i in ids if i]
+
+
+def _holder_name(ie: Optional[Dict[str, Any]]) -> str:
+    p = (ie or {}).get("profile") or {}
+    return (p.get("name") or p.get("account_holder")
+            or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip())
+
+
+def _counterparties(tool_calls: list) -> list:
+    """Counterparty user_ids the investigation looked at (so future investigations
+    of those accounts recall this case)."""
+    out = []
+    for tc in tool_calls or []:
+        if tc.get("tool") in ("get_counterparty_profile", "get_counterparty_transactions"):
+            uid = (tc.get("params") or {}).get("user_id")
+            if uid:
+                out.append(uid)
+    return out
 
 
 async def _read_state(inv_runner: InvestigationRunner, user_id: str, investigation_id: str) -> Dict[str, Any]:
@@ -349,6 +375,19 @@ async def _finalize(
     except Exception as e:
         logger.warning(f"[{investigation_id}] Failed to add session to memory: {e}")
 
+    # Store a compact, entity-indexed case record for cross-case recall.
+    decision = enacted_actions[0].get("action") if enacted_actions else (assessment or {}).get("decision")
+    await store_case(inv_runner.memory_service, APP_NAME, {
+        "investigation_id": investigation_id,
+        "user_id": user_id,
+        "account_id": (assessment or {}).get("account_id") or next(iter((initial.get("accounts") or {})), None),
+        "holder": _holder_name(initial),
+        "typology": (assessment or {}).get("typology"),
+        "decision": decision,
+        "entities": list(dict.fromkeys(
+            _evidence_entities(user_id, initial) + _counterparties(tool_calls))),
+    })
+
     yield {
         "type": "state_update",
         "data": {
@@ -359,6 +398,7 @@ async def _finalize(
             "agent_iterations": agent_iterations,
             "report_markdown": report_markdown,
             "initial_evidence": initial,
+            "prior_cases": final_state.get("prior_cases", []),
             "current_phase": "report",
             "workflow_status": "completed",
         },
@@ -420,11 +460,25 @@ async def run_investigation(
             yield {"type": "trace", "event": ev}
         metrics.end_node("data_collection")
 
+        # ── Cross-case memory recall (ADK MemoryService) ─────────────────────
+        # Search long-term memory for PRIOR investigations that referenced this
+        # account, its devices, or where it appeared as a counterparty.
+        prior_cases = await recall_cases(
+            inv_runner.memory_service, APP_NAME,
+            _evidence_entities(user_id, seed_state["initial_evidence"]),
+            exclude_investigation_id=investigation_id, exclude_user_id=user_id,
+        )
+        seed_state["prior_cases"] = prior_cases
+        if prior_cases:
+            yield _trace("data_collection", "memory_recall", {"prior_cases": prior_cases})
+            logger.info(f"[{investigation_id}] memory recall: {len(prior_cases)} related prior case(s)")
+
         yield {
             "type": "state_update",
             "data": {
                 "alert_evidence": seed_state["alert_evidence"],
                 "initial_evidence": seed_state["initial_evidence"],
+                "prior_cases": prior_cases,
                 "current_phase": "llm_reasoning",
             },
         }

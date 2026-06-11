@@ -176,6 +176,7 @@ class InvestigationService:
                         # MUST stay short ("specialist_findings" would collide as
                         # "specialist_find"). Remapped back on read below.
                         "spec_findings": final_state.get("specialist_findings", {}),
+                        "prior_cases": final_state.get("prior_cases", []),
                         "enacted_actions": final_state.get("enacted_actions", []),
                         "agent_iterations": final_state.get("agent_iterations", 0),
                         "report_markdown": final_state.get("report_markdown", ""),

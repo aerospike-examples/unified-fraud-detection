@@ -122,6 +122,17 @@ export const DISPOSITIONS: { id: string; label: string }[] = [
   { id: "escalate_compliance", label: "Escalate to Compliance" },
 ];
 
+// A related prior investigation recalled from ADK long-term memory.
+export interface PriorCase {
+  investigation_id: string;
+  account_id?: string;
+  user_id?: string;
+  holder?: string;
+  typology?: string;
+  decision?: string;
+  matched_on?: string[];
+}
+
 // An action the agent actually enacted (after approval, or immediately for
 // non-destructive decisions).
 export interface EnactedAction {
@@ -178,6 +189,9 @@ export interface InvestigationState {
   // Parallel evidence-collection specialist findings (keyed by specialist id)
   specialistFindings: Partial<Record<SpecialistName, string>>;
 
+  // Related prior cases recalled from long-term memory
+  priorCases: PriorCase[];
+
   // Human-in-the-loop action approval
   pendingAction?: PendingAction;
   enactedActions: EnactedAction[];
@@ -221,6 +235,7 @@ const initialState: InvestigationState = {
   agentIterations: 0,
   enactedActions: [],
   specialistFindings: {},
+  priorCases: [],
 };
 
 export function useInvestigation() {
@@ -309,6 +324,12 @@ export function useInvestigation() {
                 [trace.data.agent as SpecialistName]: trace.data.finding || "",
               };
             }
+
+            // Cross-case memory recall surfaced related prior cases
+            let newPriorCases = prev.priorCases;
+            if (trace.type === "memory_recall" && Array.isArray(trace.data?.prior_cases)) {
+              newPriorCases = trace.data.prior_cases as PriorCase[];
+            }
             
             // Track agent iterations
             if (trace.type === "agent_iteration" && trace.data?.iteration) {
@@ -337,6 +358,7 @@ export function useInvestigation() {
               agentIterations: newIterations,
               finalAssessment: newAssessment,
               specialistFindings: newFindings,
+              priorCases: newPriorCases,
             };
           });
         });
@@ -395,6 +417,9 @@ export function useInvestigation() {
             }
             if (data.specialist_findings) {
               updates.specialistFindings = data.specialist_findings;
+            }
+            if (data.prior_cases) {
+              updates.priorCases = data.prior_cases;
             }
 
             return { ...prev, ...updates };
@@ -598,6 +623,7 @@ export function useInvestigation() {
         agentIterations: inv.agent_iterations || 0,
         enactedActions: inv.enacted_actions || [],
         specialistFindings: inv.specialist_findings || {},
+        priorCases: inv.prior_cases || [],
       });
       
       console.log("[Investigation] Restored existing investigation state");

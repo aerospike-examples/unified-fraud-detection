@@ -32,6 +32,7 @@ import PerformanceMetricsPanel from '@/components/Flagged/Details/PerformanceMet
 import { ActionApprovalCard } from '@/components/Flagged/Details/ActionApprovalCard'
 import { DecisionReviewDialog } from '@/components/Flagged/Details/DecisionReviewDialog'
 import { EvidenceSpecialists } from '@/components/Flagged/Details/EvidenceSpecialists'
+import { PriorCasesPanel } from '@/components/Flagged/Details/PriorCasesPanel'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useAccountData } from '@/hooks/useAccountData'
 import { formatCurrency } from '@/lib/utils'
@@ -414,6 +415,8 @@ export default function FlaggedAccountDetailsPage() {
 
                         {/* Investigation Tab - Shows report (progress is in Review Workflow on the right) */}
                         <TabsContent value="investigation" className="mt-6 space-y-6">
+                            <PriorCasesPanel priorCases={investigation.priorCases} />
+
                             <EvidenceSpecialists
                                 specialistFindings={investigation.specialistFindings}
                                 toolCalls={investigation.toolCalls}
