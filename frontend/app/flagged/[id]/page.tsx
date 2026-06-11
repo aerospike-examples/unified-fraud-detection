@@ -690,9 +690,6 @@ export default function FlaggedAccountDetailsPage() {
                         toolCalls={investigation.toolCalls}
                         traceEvents={investigation.traceEvents}
                         getStepStatus={investigation.getStepStatus}
-                        accountPredictions={account.account_predictions || []}
-                        highestRiskAccountId={account.highest_risk_account_id || ''}
-                        existingResolutions={account.account_resolutions || {}}
                     />
                     
                     {/* Performance Metrics - shown after investigation runs */}
