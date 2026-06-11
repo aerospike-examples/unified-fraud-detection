@@ -1,20 +1,17 @@
 """
 Investigation Service
 
-Manages fraud investigations using the LangGraph workflow.
-Provides SSE streaming for real-time investigation progress.
+Manages fraud investigations using the Google ADK agent (Aerospike-backed
+sessions, memory, and artifacts). Provides SSE streaming for real-time progress.
 """
 
-import asyncio
+import os
 import uuid
 import logging
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, Optional
 
-import httpx
-
-from workflow.graph import create_investigation_workflow, run_investigation, get_workflow_steps
-from workflow.state import InvestigationState
+from workflow.runner import build_runner, run_investigation, get_workflow_steps
 
 logger = logging.getLogger('investigation.service')
 
@@ -23,71 +20,43 @@ class InvestigationService:
     """
     Service for managing fraud investigations.
     """
-    
+
     def __init__(
         self,
         aerospike_service: Any,
         graph_service: Any,
-        ollama_base_url: str = "http://localhost:11434",
-        ollama_model: str = "mistral"
+        model: Optional[str] = None,
     ):
         self.aerospike_service = aerospike_service
         self.graph_service = graph_service
-        self.ollama_base_url = ollama_base_url
-        self.ollama_model = ollama_model
-        
-        # HTTP client for Ollama - 5 minute timeout for model loading
-        self.ollama_client = httpx.AsyncClient(timeout=300.0)
-        
-        # Workflow instance
-        self.workflow = None
-        
+        self.model = model or os.environ.get("ADK_MODEL", "gemini-3.5-flash")
+
+        # ADK runner (built in initialize())
+        self.inv_runner = None
+
         # Active investigations cache
         self._active_investigations: Dict[str, Dict[str, Any]] = {}
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
-        
-        logger.info(f"Investigation service initialized with Ollama at {ollama_base_url}")
-    
+
+        logger.info(f"Investigation service initialized (ADK model={self.model})")
+
     async def initialize(self):
-        """Initialize the investigation workflow."""
+        """Build the ADK runner backed by Aerospike."""
         try:
-            self.workflow = create_investigation_workflow(
+            self.inv_runner = build_runner(
                 self.aerospike_service,
                 self.graph_service,
-                self.ollama_client
+                self.model,
             )
-            logger.info("Investigation workflow initialized")
-            
-            # Check Ollama connectivity
-            await self._check_ollama()
-            
+            logger.info("ADK investigation runner initialized")
         except Exception as e:
             logger.error(f"Failed to initialize investigation service: {e}")
             raise
-    
-    async def _check_ollama(self):
-        """Check if Ollama is available and pull model if needed."""
-        try:
-            response = await self.ollama_client.get(f"{self.ollama_base_url}/api/tags")
-            if response.status_code == 200:
-                models = response.json().get("models", [])
-                model_names = [m.get("name", "").split(":")[0] for m in models]
-                
-                if self.ollama_model not in model_names:
-                    logger.info(f"Model {self.ollama_model} not found, pulling...")
-                    # Note: Model pull happens automatically on first use
-                else:
-                    logger.info(f"Ollama connected, model {self.ollama_model} available")
-            else:
-                logger.warning(f"Ollama health check returned {response.status_code}")
-                
-        except Exception as e:
-            logger.warning(f"Could not connect to Ollama: {e}")
-            logger.warning("Investigations will use fallback logic without LLM")
-    
+
     async def close(self):
         """Clean up resources."""
-        await self.ollama_client.aclose()
+        if self.inv_runner:
+            self.inv_runner.close()
         logger.info("Investigation service closed")
     
     def get_workflow_steps(self) -> list[Dict[str, str]]:
@@ -143,7 +112,7 @@ class InvestigationService:
         if not investigation_id:
             investigation_id = await self.start_investigation(user_id)
         
-        if not self.workflow:
+        if not self.inv_runner:
             await self.initialize()
         
         # Yield initial event
@@ -160,7 +129,7 @@ class InvestigationService:
             # Run the workflow and stream events
             final_state = None
             
-            async for event in run_investigation(self.workflow, user_id, investigation_id):
+            async for event in run_investigation(self.inv_runner, user_id, investigation_id):
                 event_type = event.get("type", "unknown")
                 
                 if event_type == "trace":

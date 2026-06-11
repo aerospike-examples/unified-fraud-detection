@@ -84,14 +84,10 @@ services:
     environment:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
-      # LLM Provider: "gemini" or "ollama"
-      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
-      # Ollama settings (used when LLM_PROVIDER=ollama)
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=mistral
-      # Gemini settings (used when LLM_PROVIDER=gemini)
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      # Google ADK / Gemini settings
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+      - ADK_MODEL=${ADK_MODEL:-gemini-3.5-flash}
     volumes:
       - ./data:/data
     healthcheck:
@@ -117,7 +113,7 @@ services:
     networks:
       - asgraph_net
     ports:
-      - "8080:8080"
+      - "8081:8080"
   generator:
     build:
       context: .

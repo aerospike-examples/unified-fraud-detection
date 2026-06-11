@@ -1,19 +1,23 @@
 """
-Report Generation Node
+Report Generation helpers.
 
-Uses LLM to generate a comprehensive markdown report of the investigation.
-Updated for agentic workflow - uses FinalAssessment from LLM agent.
+Under ADK, the markdown report is produced by the ``report_writer`` LlmAgent.
+This module provides:
 
-Data Source: Ollama (Mistral)
+- ``REPORT_PROMPT_TEMPLATE`` + ``build_report_instruction`` — the instruction the
+  report agent reasons over, formatted from session state.
+- ``finalize_report`` — deterministic post-processing applied to the agent's
+  markdown (appends the fraud-ring Mermaid section and a metadata footer).
+- ``generate_fallback_report`` — a fully deterministic report used when the LLM
+  is unavailable.
+
+These run as plain Python (no LLM calls) so the rendered report is identical to
+the previous implementation.
 """
 
 from datetime import datetime
 from typing import Dict, Any
 import logging
-import os
-import httpx
-
-from workflow.state import InvestigationState, TraceEvent
 
 logger = logging.getLogger('investigation.report_generation')
 
@@ -72,202 +76,56 @@ Do NOT include an investigation timeline or tool call log. Use clear, profession
 """
 
 
-async def report_generation_node(
-    state: InvestigationState,
-    ollama_client: Any = None  # Not used, we create our own client
-) -> Dict[str, Any]:
-    """
-    Generate investigation report using LLM.
-    
-    Args:
-        state: Current investigation state with FinalAssessment
-        ollama_client: (Deprecated) HTTP client for Ollama
-        
-    Returns:
-        Updated state with report markdown
-    """
-    user_id = state["user_id"]
-    node_name = "report_generation"
-    
-    logger.info(f"[{node_name}] Starting report generation for user {user_id}")
-    
-    trace_events = []
-    
-    # Emit start event
-    trace_events.append(TraceEvent(
-        type="node_start",
-        node=node_name,
-        timestamp=datetime.now().isoformat(),
-        data={"user_id": user_id, "llm_powered": True}
-    ))
-    
-    try:
-        # Extract evidence from new state structure
-        alert = state.get("alert_evidence") or {}
-        initial = state.get("initial_evidence") or {}
-        assessment = state.get("final_assessment") or {}
-        tool_calls = state.get("tool_calls") or []
-        
-        profile = initial.get("profile", {})
-        metrics = initial.get("account_metrics", {})
-        accounts = initial.get("accounts", {})    # dict: account_id -> {...}
-        devices = initial.get("devices", {})      # dict: device_id -> {...}
-        
-        prompt = REPORT_PROMPT_TEMPLATE.format(
-            investigation_id=state.get("investigation_id", "N/A"),
-            user_id=user_id,
-            started_at=state.get("started_at", ""),
-            trigger_rule=alert.get("trigger_rule", alert.get("trigger_type", "ML Detection")),
-            flag_reason=alert.get("flag_reason", "N/A"),
-            original_score=alert.get("original_score", 0),
-            user_name=profile.get("name", "Unknown"),
-            location=profile.get("location", "Unknown"),
-            account_age_days=metrics.get("account_age_days", 0),
-            kyc_completeness=metrics.get("kyc_completeness", "unknown"),
-            account_count=len(accounts),
-            total_balance=metrics.get("total_balance", 0),
-            flagged_account_count=metrics.get("flagged_account_count", 0),
-            device_count=len(devices),
-            flagged_device_count=metrics.get("flagged_device_count", 0),
-            max_velocity_zscore=metrics.get("max_velocity_zscore", 0),
-            max_amount_zscore=metrics.get("max_amount_zscore", 0),
-            max_new_recipient_ratio=metrics.get("max_new_recipient_ratio", 0),
-            max_shared_accounts=metrics.get("max_shared_accounts_on_device", 0),
-            iterations=state.get("agent_iterations", 0),
-            tool_calls=len(tool_calls),
-            typology=assessment.get("typology", "unknown"),
-            risk_level=assessment.get("risk_level", "unknown"),
-            risk_score=assessment.get("risk_score", 0),
-            decision=assessment.get("decision", "pending"),
-            reasoning=assessment.get("reasoning", "No reasoning provided"),
-        )
-        
-        # Call LLM (supports both Gemini and Ollama via env config)
-        response = await _call_llm(prompt)
-        
-        # Clean up the response
-        report_markdown = _clean_report(response, state)
-        
-        # Emit complete event
-        trace_events.append(TraceEvent(
-            type="node_complete",
-            node=node_name,
-            timestamp=datetime.now().isoformat(),
-            data={"status": "success", "report_length": len(report_markdown)}
-        ))
-        
-        logger.info(f"[{node_name}] Report generation complete - {len(report_markdown)} characters")
-        
-        return {
-            "report_markdown": report_markdown,
-            "current_phase": "report",
-            "current_node": "complete",
-            "workflow_status": "completed",
-            "trace_events": trace_events
-        }
-        
-    except Exception as e:
-        logger.error(f"[{node_name}] Error during report generation: {e}")
-        
-        trace_events.append(TraceEvent(
-            type="error",
-            node=node_name,
-            timestamp=datetime.now().isoformat(),
-            data={"error": str(e)}
-        ))
-        
-        # Generate fallback report
-        fallback_report = _generate_fallback_report(state)
-        
-        return {
-            "report_markdown": fallback_report,
-            "current_phase": "report",
-            "current_node": "complete",
-            "workflow_status": "completed",
-            "error_message": str(e),
-            "trace_events": trace_events
-        }
+def build_report_instruction(state: Dict[str, Any]) -> str:
+    """Format the report-writer instruction from session state."""
+    alert = state.get("alert_evidence") or {}
+    initial = state.get("initial_evidence") or {}
+    assessment = state.get("final_assessment") or {}
+    tool_calls = state.get("tool_calls") or []
+
+    profile = initial.get("profile", {})
+    metrics = initial.get("account_metrics", {})
+    accounts = initial.get("accounts", {})
+    devices = initial.get("devices", {})
+
+    return REPORT_PROMPT_TEMPLATE.format(
+        investigation_id=state.get("investigation_id", "N/A"),
+        user_id=state.get("user_id", "N/A"),
+        started_at=state.get("started_at", ""),
+        trigger_rule=alert.get("trigger_rule", alert.get("trigger_type", "ML Detection")),
+        flag_reason=alert.get("flag_reason", "N/A"),
+        original_score=alert.get("original_score", 0),
+        user_name=profile.get("name", "Unknown"),
+        location=profile.get("location", "Unknown"),
+        account_age_days=metrics.get("account_age_days", 0),
+        kyc_completeness=metrics.get("kyc_completeness", "unknown"),
+        account_count=len(accounts),
+        total_balance=metrics.get("total_balance", 0),
+        flagged_account_count=metrics.get("flagged_account_count", 0),
+        device_count=len(devices),
+        flagged_device_count=metrics.get("flagged_device_count", 0),
+        max_velocity_zscore=metrics.get("max_velocity_zscore", 0),
+        max_amount_zscore=metrics.get("max_amount_zscore", 0),
+        max_new_recipient_ratio=metrics.get("max_new_recipient_ratio", 0),
+        max_shared_accounts=metrics.get("max_shared_accounts_on_device", 0),
+        iterations=state.get("agent_iterations", 0),
+        tool_calls=len(tool_calls),
+        typology=assessment.get("typology", "unknown"),
+        risk_level=assessment.get("risk_level", "unknown"),
+        risk_score=assessment.get("risk_score", 0),
+        decision=assessment.get("decision", "pending"),
+        reasoning=assessment.get("reasoning", "No reasoning provided"),
+    )
 
 
-async def _call_ollama(prompt: str) -> str:
-    """Call Ollama API with the prompt."""
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    model = os.environ.get("OLLAMA_MODEL", "mistral")
-    
-    logger.info(f"[Report] Calling Ollama at {base_url} with model {model}")
-    
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            f"{base_url}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.4,
-                    "num_predict": 1500
-                }
-            }
-        )
-        response.raise_for_status()
-        result = response.json()
-        return result.get("response", "")
+def finalize_report(response: str, state: Dict[str, Any]) -> str:
+    """Public entry point: apply deterministic post-processing to LLM markdown."""
+    return _clean_report(response, state)
 
 
-async def _call_gemini(prompt: str) -> str:
-    """Call Google Gemini API using native generateContent endpoint."""
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
-    
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
-    
-    logger.info(f"[Report] Calling Gemini API with model {model}")
-    
-    # Use native Gemini API endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key
-            },
-            json={
-                "contents": [
-                    {
-                        "parts": [{"text": prompt}]
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.4,
-                    "maxOutputTokens": 1500
-                }
-            }
-        )
-        response.raise_for_status()
-        result = response.json()
-        
-        # Extract response text from Gemini format
-        candidates = result.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            if parts:
-                return parts[0].get("text", "")
-        
-        return ""
-
-
-async def _call_llm(prompt: str) -> str:
-    """Call the configured LLM provider (Gemini or Ollama)."""
-    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
-    
-    if provider == "gemini":
-        return await _call_gemini(prompt)
-    else:
-        return await _call_ollama(prompt)
+def generate_fallback_report(state: Dict[str, Any]) -> str:
+    """Public entry point: fully deterministic report when the LLM is unavailable."""
+    return _generate_fallback_report(state)
 
 
 def _build_fraud_ring_section(tool_calls: list, user_id: str) -> str:
@@ -420,7 +278,7 @@ def _build_tool_call_summary(tool_calls: list) -> str:
     return "\n".join(lines)
 
 
-def _clean_report(response: str, state: InvestigationState) -> str:
+def _clean_report(response: str, state: Dict[str, Any]) -> str:
     """Clean and format the generated report."""
     initial = state.get("initial_evidence") or {}
     profile = initial.get("profile", {})
@@ -451,7 +309,7 @@ def _clean_report(response: str, state: InvestigationState) -> str:
     return response.strip() + footer
 
 
-def _generate_fallback_report(state: InvestigationState) -> str:
+def _generate_fallback_report(state: Dict[str, Any]) -> str:
     """Generate a structured report when LLM fails (uses KV-sourced evidence)."""
     alert = state.get("alert_evidence") or {}
     initial = state.get("initial_evidence") or {}

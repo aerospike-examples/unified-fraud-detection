@@ -58,7 +58,7 @@ class FlaggedAccountService:
             "schedule_enabled": True,
             "schedule_time": "21:30",
             "cooldown_days": 7,
-            "risk_threshold": 50  # Lowered from 70 for demo data
+            "risk_threshold": 50  # Demo data: fraud bursts are injected within the recent feature window so they score >=50
         }
         
         # Ensure data directory exists

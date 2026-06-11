@@ -1,15 +1,14 @@
 """
 Investigation Workflow Package
 
-LangGraph-based fraud investigation workflow that orchestrates
-multi-dimensional evidence gathering and LLM-powered analysis.
+Google ADK-based fraud investigation: a SequentialAgent (investigator +
+report_writer) backed by Aerospike for sessions, memory, and artifacts.
 """
 
-from workflow.state import InvestigationState, create_initial_state
-from workflow.graph import create_investigation_workflow
+from workflow.runner import build_runner, run_investigation, get_workflow_steps
 
 __all__ = [
-    "InvestigationState",
-    "create_initial_state", 
-    "create_investigation_workflow"
+    "build_runner",
+    "run_investigation",
+    "get_workflow_steps",
 ]

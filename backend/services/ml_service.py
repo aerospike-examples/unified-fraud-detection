@@ -219,10 +219,13 @@ class MLModelService:
             category_scores['lifecycle'] += 5
             risk_factors.append(f"Immediate transaction after creation ({first_txn_dly}d delay)")
         
-        # Calculate total score (normalize from max 115 to 100)
+        # Total score = absolute accumulated fraud signal (capped at 100).
+        # NOTE: previously normalized against the theoretical all-category max (115),
+        # which capped realistic 2-3 category fraud (~55 raw) at ~48 — permanently
+        # below the flag threshold of 50, so clear fraud never flagged. Scoring on the
+        # raw point total makes the threshold meaningful: 50 = "50+ pts of fraud signal".
         raw_score = sum(category_scores.values())
-        max_possible = sum(self.max_points.values())  # 115
-        risk_score = min(100, (raw_score / max_possible) * 100)
+        risk_score = min(100, raw_score)
         
         # Generate reason string
         if risk_factors:

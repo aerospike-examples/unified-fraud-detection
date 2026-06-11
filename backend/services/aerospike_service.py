@@ -2018,10 +2018,12 @@ class AerospikeService:
             "evaluations": self.truncate_set(SET_EVALUATIONS),
             "history": self.truncate_set(SET_HISTORY),
             "investigations": self.truncate_set(SET_INVESTIGATIONS),
-            # LangGraph checkpoint sets
-            "lg_checkpoints": self.truncate_set("lg_cp"),
-            "lg_checkpoint_writes": self.truncate_set("lg_cp_w"),
-            "lg_checkpoint_meta": self.truncate_set("lg_cp_meta"),
+            # Google ADK (adk-aerospike) sets — sessions, state, memory, artifacts
+            "adk_sessions": self.truncate_set("adk_sessions"),
+            "adk_app_state": self.truncate_set("adk_app_state"),
+            "adk_user_state": self.truncate_set("adk_user_state"),
+            "adk_memory": self.truncate_set("adk_memory"),
+            "adk_artifacts": self.truncate_set("adk_artifacts"),
         }
     
     # ----------------------------------------------------------------------------------------------------------
