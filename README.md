@@ -37,8 +37,10 @@ This project is a reference for two things:
                      │   ┌─────────────────────┐   │     └────────────────────┘     └───────▲───────┘
                      │   │  ADK Agentic Layer  │   │                                         │
                      │   │  (Google ADK)       │   │     ADK Session / Memory / Artifact     │
-                     │   │  investigator ─▶    │   │     services persisted to Aerospike ────┘
-                     │   │  report_writer      │   │            (adk-aerospike)
+                     │   │  parallel evidence  │   │     services persisted to Aerospike ────┘
+                     │   │   (3 specialists)   │   │            (adk-aerospike)
+                     │   │  ─▶ investigator    │   │
+                     │   │  ─▶ report_writer   │   │
                      │   └──────────┬──────────┘   │
                      └──────────────┼──────────────┘
                                     │
@@ -77,15 +79,20 @@ The **[Agent Development Kit (ADK)](https://google.github.io/adk-docs/)** is Goo
 
 When a flagged account is investigated, the request streams (SSE) from the frontend into the backend, which runs an ADK agent over the account's graph + KV data and translates ADK's `Event` stream back into the UI's progress contract.
 
-The agent is a two-stage **`SequentialAgent`** (`backend/workflow/agent.py`):
+The agent is a three-stage **`SequentialAgent`** whose first stage is itself a **`ParallelAgent`** (`backend/workflow/agent.py`):
 
 ```
 SequentialAgent  "fraud_investigation"
-  ├─ investigator   — tool-using LlmAgent (ReAct): gathers evidence, decides, enacts
+  ├─ evidence_collection  (ParallelAgent) — three specialists run CONCURRENTLY:
+  │     ├─ network_analyst    → fraud rings, counterparties, mule chains
+  │     ├─ device_analyst     → device sharing, spoofing, infra risk
+  │     └─ velocity_analyst   → velocity, bursts, amount anomalies
+  ├─ investigator   — tool-using LlmAgent (ReAct): SYNTHESIZES the specialist
+  │     findings, drills into gaps, decides, and enacts a remediation action
   └─ report_writer  — LlmAgent: drafts the markdown investigation report
 ```
 
-Two deterministic pre-steps (`alert_validation`, `data_collection`) seed the ADK session state from fast KV reads before the LLM agent starts, so the model begins with baseline context instead of spending tool calls on it. The `Runner` and services are built once in `InvestigationRunner` (`backend/workflow/runner.py`).
+Each specialist writes a findings summary to session state via its `output_key`; the investigator reads all three and reaches a decision in 0–3 tool calls instead of gathering everything itself. Two deterministic pre-steps (`alert_validation`, `data_collection`) seed the ADK session state from fast KV reads before the agent starts, so the model begins with baseline context instead of spending tool calls on it. The `Runner` and services are built once in `InvestigationRunner` (`backend/workflow/runner.py`).
 
 ### Aerospike ⇄ ADK integration
 
@@ -112,7 +119,7 @@ self.runner = Runner(
 
 | ADK service | Aerospike role | Used in the demo for |
 |-------------|----------------|----------------------|
-| **SessionService** | Sessions + per-app/user/session state | The live investigation's evidence, tool log, assessment, and enacted actions |
+| **SessionService** | Sessions + per-app/user/session state | The live investigation's evidence, parallel specialist findings, tool log, assessment, and enacted actions |
 | **MemoryService** | Durable, searchable memory | Recalling similar past investigations across cases (`recall_similar_investigations`) |
 | **ArtifactService** | Binary/text artifacts | Persisting the final markdown report (`investigation_report.md`) |
 
@@ -125,8 +132,9 @@ This means the agent's entire footprint — its working state, its long-term mem
 | ADK capability | How the demo uses it | Where |
 |----------------|----------------------|-------|
 | **Tool-using ReAct agent** | The `investigator` LlmAgent calls evidence tools one step at a time and reasons over each result | `agent.py`, `tools/investigation_tools_adk.py` |
-| **Multi-agent pipeline** | `SequentialAgent` chains `investigator → report_writer` | `agent.py` |
-| **Session + state** | Deterministic pre-steps seed state; tools and the agent read/write it | `runner.py`, `nodes/` |
+| **Sequential pipeline** | `SequentialAgent` chains `evidence_collection → investigator → report_writer` | `agent.py` |
+| **Parallel multi-agent** | `ParallelAgent` runs three evidence specialists (network / device / velocity) concurrently, each writing findings via `output_key` — see below | `agent.py`, `runner.py` |
+| **Session + state** | Deterministic pre-steps seed state; tools and agents read/write it (specialists write per-agent keys to stay race-free under fan-out) | `runner.py`, `plugins.py`, `nodes/` |
 | **Long-term memory** | `recall_similar_investigations` calls `tool_context.search_memory(...)` to surface prior cases | `tools/investigation_tools_adk.py` |
 | **Artifacts** | The report is saved with `artifact_service.save_artifact(...)` and the session is added to memory on completion | `runner.py` |
 | **Plugins & callbacks** | `MetricsPlugin` (a `BasePlugin`) collects timing/DB/LLM/token metrics via callbacks and enforces a per-run tool-call budget in `before_tool_callback` | `plugins.py` |
@@ -136,6 +144,30 @@ This means the agent's entire footprint — its working state, its long-term mem
 The investigator's tool belt (`INVESTIGATION_TOOLS`) wraps the same Gremlin/KV engine the rest of the app uses:
 `get_account_transactions`, `get_counterparty_profile`, `get_counterparty_transactions`, `get_account_risk_features`, `get_device_risk_features`, `detect_fraud_ring`, `get_transaction_network`, `recall_similar_investigations`, and the exit tool `submit_assessment`.
 
+### Feature spotlight: Parallel evidence collection
+
+The investigation opens with an ADK **`ParallelAgent`** stage: three specialist agents investigate the flagged account **concurrently**, each scoped to one domain and one slice of the tool belt:
+
+| Specialist | Looks at | Tools |
+|------------|----------|-------|
+| `network_analyst` | counterparties, fan-out/fan-in, fraud rings, mule chains | `detect_fraud_ring`, `get_transaction_network`, `get_counterparty_*` |
+| `device_analyst` | device sharing, spoofing, infrastructure risk | `get_device_risk_features`, `get_account_risk_features` |
+| `velocity_analyst` | velocity, bursts, amount anomalies, new-recipient ratio | `get_account_transactions`, `get_account_risk_features` |
+
+Each writes a findings summary to session state via its `output_key`; the `investigator` then **synthesizes** all three rather than re-gathering, typically deciding in 0–3 tool calls. The UI shows the three lanes lighting up live (Investigation tab → *Parallel Evidence Collection*).
+
+Two correctness details worth noting, since fan-out shares one session:
+- The tool-call **budget is enforced only on the investigator** — specialists are bounded by their own prompts; a shared counter would race.
+- Specialist tool calls accumulate into **per-agent state keys** (merged at finalize), because ADK merges state deltas per key and concurrent appends to one shared list would drop entries.
+
+```
+                    ┌──────────────────────────────────────┐
+ evidence_collection│  network_analyst  ─┐                  │
+ (ParallelAgent,    │  device_analyst   ─┼─▶ findings ─▶    │ investigator ─▶ report_writer
+  concurrent)       │  velocity_analyst ─┘   (state)        │ (synthesis)
+                    └──────────────────────────────────────┘
+```
+
 ### Feature spotlight: Human-in-the-loop remediation actions
 
 The agent doesn't just *recommend* a decision — it can **take action** on the flagged account, with destructive actions gated behind a human. This uses ADK's native tool-confirmation primitive (`tool_context.request_confirmation` / the `adk_request_confirmation` flow).
@@ -144,8 +176,16 @@ After `submit_assessment`, the agent calls **`enact_decision(decision, account_i
 
 - **Non-destructive** (`allow_monitor`, `step_up_auth`) → executes immediately.
 - **Destructive** (`temporary_freeze`, `full_block`, `escalate_compliance`) → the tool calls `request_confirmation(...)` and the run **pauses**. The backend emits an `action_confirmation_required` event; the analyst sees an inline approve/reject card.
-  - **Approve** → the run resumes (`GET /investigation/{id}/resume?approved=true`), the agent's confirmation is answered, and the action is enforced through the existing `flagged_account_service.resolve_account` path — the account is marked fraudulent and its devices flagged. The enacted action is recorded in session state and shown in the UI.
+  - **Approve** → the run resumes (`GET /investigation/{id}/resume?approved=true`), the agent's confirmation is answered, and the action is enforced. The enacted action is recorded in session state and shown in the UI.
   - **Reject** → no enforcement; the investigation still completes with a full report.
+
+Each destructive decision maps to a **distinct** outcome (`backend/workflow/action_tools.py`):
+
+| Decision | Outcome | Reversible? |
+|----------|---------|-------------|
+| `temporary_freeze` | reversible hold — sets a `frozen` flag + status `temporarily_frozen`; **does not** mark fraud or flag devices (`freeze_account`) | ✅ yes |
+| `full_block` | confirmed fraud — sets `fraud_flag`, flags the account's devices (`resolve_account`) | ✗ no |
+| `escalate_compliance` | case moved to compliance review (`under_investigation`) | — |
 
 ```
 investigator ─▶ submit_assessment ─▶ enact_decision
@@ -164,14 +204,13 @@ This keeps the agent useful (it closes the loop on its own findings) while ensur
 
 ## 🧭 ADK Roadmap / Ideas to Showcase
 
-This demo is intended to grow into a showcase of what ADK can do as a fraud-investigation agentic layer. Candidate additions (not yet implemented):
+This demo is intended to grow into a showcase of what ADK can do as a fraud-investigation agentic layer. Already shipped: **parallel multi-agent evidence collection** and **human-in-the-loop tool confirmation** (see the spotlights above). Candidate additions (not yet implemented):
 
-- **Parallel evidence gathering** — a `ParallelAgent` fan-out for independent evidence pulls (network, device, velocity) before synthesis.
+- **Escalation sub-agents** — specialist agents (e.g. AML, sanctions) the investigator can *transfer to* dynamically, showcasing ADK's hierarchical/agent-transfer routing (vs the current static sequence).
 - **Guardrail callbacks** — input/output guardrails via plugin callbacks (PII redaction, action-policy enforcement beyond the budget).
 - **Streaming partial reasoning** — surface the agent's intermediate thoughts/tokens live in the UI.
 - **Evaluation harness** — ADK eval sets to score investigation quality/consistency across known cases.
 - **Richer artifacts** — attach evidence graphs/exports alongside the markdown report.
-- **Escalation sub-agents** — specialist agents (e.g. AML, sanctions) the investigator can transfer to.
 
 > Adding a capability? Wire it in `backend/workflow/`, then add a row to the **ADK capabilities showcased** table above (and a spotlight section if it's user-facing).
 
