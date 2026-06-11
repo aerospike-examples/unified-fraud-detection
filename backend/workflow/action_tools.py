@@ -39,20 +39,40 @@ def init_action_tools(flagged_account_service: Any, aerospike_service: Any) -> N
     logger.info("Agent action tools bound to flagged-account + Aerospike services")
 
 
+def _user_id_for(account_id: str) -> str:
+    """Derive the owning user_id from an account_id (A000396803 -> U0003968).
+    Flagged-account records are keyed by user_id."""
+    return f"U{account_id[1:-2]}" if account_id.startswith("A") else account_id
+
+
 def _execute_action(decision: str, account_id: str, reason: str) -> Dict[str, Any]:
-    """Enforce the decision via the existing resolution path."""
+    """Enforce the decision via the existing resolution path. Each destructive
+    decision maps to a DISTINCT outcome:
+      - temporary_freeze   -> reversible hold (frozen flag), NOT fraud
+      - full_block         -> confirmed fraud + devices flagged (irreversible)
+      - escalate_compliance-> case moved to compliance review (under_investigation)
+    """
     note = f"[AI agent action: {decision}] {reason}"[:480]
 
-    if decision in ("temporary_freeze", "full_block"):
-        # Mark the account fraudulent (freezes it + flags its devices).
+    if decision == "temporary_freeze":
+        # Reversible hold: set the `frozen` flag; do NOT mark fraud or flag devices.
+        result = _flagged_account_service.freeze_account(account_id, note, frozen=True)
+        ok = bool(result.get("success", True)) if isinstance(result, dict) else True
+        return {"status": "executed", "action": decision, "account_id": account_id,
+                "effect": "account temporarily frozen pending review (reversible) — not marked fraudulent",
+                "ok": ok}
+
+    if decision == "full_block":
+        # Irreversible: mark the account fraudulent and flag its devices.
         result = _flagged_account_service.resolve_account(account_id, "confirmed_fraud", note)
         ok = bool(result.get("success", True)) if isinstance(result, dict) else True
         return {"status": "executed", "action": decision, "account_id": account_id,
-                "effect": "account marked fraudulent and devices flagged", "ok": ok}
+                "effect": "account blocked: marked fraudulent and devices flagged", "ok": ok}
 
     if decision == "escalate_compliance":
-        # Move the flagged case to compliance review.
-        result = _flagged_account_service.resolve_flagged_account(account_id, "under_investigation", note)
+        # Move the flagged case to compliance review (flagged record is keyed by user_id).
+        result = _flagged_account_service.resolve_flagged_account(
+            _user_id_for(account_id), "under_investigation", note)
         ok = result is not None
         return {"status": "executed", "action": decision, "account_id": account_id,
                 "effect": "case escalated to compliance (under_investigation)", "ok": ok}
