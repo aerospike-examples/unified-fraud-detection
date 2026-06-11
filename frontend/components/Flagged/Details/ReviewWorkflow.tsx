@@ -245,6 +245,14 @@ const ReviewWorkflow = ({
             if (stepIndex === 3) return aiDecision ? 'completed' : 'current'
             return 'upcoming'
         }
+
+        // Paused for analyst approval: analysis + report are done (steps 1-3),
+        // and the Decision step (4) is the approval that's in progress.
+        if (investigationStatus === 'awaiting_confirmation') {
+            if (stepIndex < 3) return 'completed'
+            if (stepIndex === 3) return 'ai_running'
+            return 'upcoming'
+        }
         
         // Check if AI steps for this workflow step are running
         if (investigationStatus === 'running') {
@@ -274,7 +282,8 @@ const ReviewWorkflow = ({
         return 'pending'
     }
 
-    const isAIActive = investigationStatus === 'running' || investigationStatus === 'connecting'
+    const isAwaitingApproval = investigationStatus === 'awaiting_confirmation'
+    const isAIActive = investigationStatus === 'running' || investigationStatus === 'connecting' || isAwaitingApproval
     const isAIComplete = investigationStatus === 'completed'
 
     return (
@@ -364,7 +373,13 @@ const ReviewWorkflow = ({
                                         </h4>
                                         <p className="text-sm text-slate-500 mt-1">{step.description}</p>
 
-                                        {/* AI's enacted decision satisfies the Decision step */}
+                                        {/* Decision step reflects the agent's decision + approval */}
+                                        {index === 3 && isAwaitingApproval && aiDecision && (
+                                            <div className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-amber-50 border border-amber-200 px-2 py-1 text-xs font-medium text-amber-700">
+                                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                                Awaiting your approval: {decisionLabels[aiDecision] || aiDecision}
+                                            </div>
+                                        )}
                                         {index === 3 && isAIComplete && aiDecision && (
                                             <div className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-emerald-50 border border-emerald-200 px-2 py-1 text-xs font-medium text-emerald-700">
                                                 <CheckCircle className="w-3.5 h-3.5" />
@@ -472,8 +487,10 @@ const ReviewWorkflow = ({
                 </CardContent>
             </Card>
 
-            {/* Current Step Content - Decision Panel - Shows when AI is complete or at step 4 */}
-            {(isAIComplete || currentStep === 3) && (
+            {/* Manual "Final Decision" (Mark as Fraud/Safe) panel removed — the
+                agent's enacted decision + HITL approval is now the single decision
+                mechanism, so this legacy manual panel is no longer rendered. */}
+            {false && (isAIComplete || currentStep === 3) && (
                 <Card className="bg-white border-slate-200 shadow-sm">
                     <CardHeader>
                         <CardTitle className="flex items-center gap-2 text-slate-900">

@@ -193,6 +193,7 @@ def submit_assessment(
     risk_level: str,
     risk_score: int,
     decision: str,
+    account_id: str,
     reasoning: str,
     tool_context: ToolContext,
 ) -> dict:
@@ -208,6 +209,8 @@ def submit_assessment(
         risk_score: Integer risk score 0-100.
         decision: Recommended action — one of allow_monitor, step_up_auth,
             temporary_freeze, full_block, escalate_compliance.
+        account_id: The PRIMARY flagged account your decision should act on
+            (e.g. A000885901) — taken from the evidence.
         reasoning: Detailed reasoning citing specific evidence from your
             investigation.
     """
@@ -226,6 +229,7 @@ def submit_assessment(
         "risk_level": risk_level,
         "risk_score": risk_score,
         "decision": decision,
+        "account_id": (account_id or "").strip(),
         "reasoning": reasoning,
         "iteration": int(state.get("agent_iterations", 0)),
         "tool_calls_made": tool_calls_made,

@@ -187,6 +187,27 @@ async def _drive_agent(
                     "reason": payload.get("reason"),
                     "current_step": current_step,
                 }
+                # The report has ALREADY been written by this point (action_taker
+                # runs after report_writer). Close the analysis/report step (so it
+                # shows complete) — we're now in the decision phase.
+                if current_step:
+                    yield _trace(current_step, "node_complete", {"status": "success"})
+                    metrics.end_node(current_step)
+                    current_step = None
+                # Push the report + assessment + findings so the analyst can review
+                # the full report BEFORE approving the action.
+                snap = await _read_state(inv_runner, user_id, investigation_id)
+                spec_calls = []
+                for nm in SPECIALIST_NAMES:
+                    spec_calls.extend(snap.get(f"specialist_tool_calls_{nm}", []))
+                yield {"type": "state_update", "data": {
+                    "final_assessment": snap.get("final_assessment"),
+                    "report_markdown": snap.get("report_markdown", ""),
+                    "specialist_findings": {nm: (snap.get(SPECIALIST_OUTPUT_KEYS[nm]) or "") for nm in SPECIALIST_NAMES},
+                    "tool_calls": spec_calls + snap.get("tool_calls", []),
+                    "initial_evidence": snap.get("initial_evidence"),
+                    "current_phase": "awaiting_decision",
+                }}
                 yield _trace("llm_agent", "action_confirmation_required", paused)
                 yield {"type": "action_confirmation_required", "data": paused}
                 break

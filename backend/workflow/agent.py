@@ -59,6 +59,7 @@ APP_NAME = "fraud_investigation"
 
 INVESTIGATOR_NAME = "investigator"
 REPORT_WRITER_NAME = "report_writer"
+ACTION_TAKER_NAME = "action_taker"
 
 # Parallel evidence-collection specialists (ADK ParallelAgent stage).
 EVIDENCE_COLLECTION_NAME = "evidence_collection"
@@ -166,13 +167,11 @@ Three specialists (network, device, and velocity analysts) have ALREADY investig
 Because the specialists did the broad gathering, you should reach a confident conclusion in 0-3 tool calls — often zero. Going straight from the specialist findings to submit_assessment is the expected path. Quality of reasoning over the combined evidence matters far more than volume of tool calls.
 
 Call tools one logical step at a time and reason over each result before the next.
-When you are confident:
-1. Call submit_assessment exactly once with a typology, risk level, risk score, recommended
-   decision, and detailed reasoning citing specific evidence.
-2. THEN call enact_decision once with that same decision and the primary flagged account_id to
-   enforce it. Destructive actions (temporary_freeze, full_block, escalate_compliance) will require
-   a human analyst's approval before they take effect; non-destructive ones apply immediately.
-After enact_decision returns, stop.
+When you are confident, call submit_assessment exactly once with a typology, risk level, risk score,
+recommended decision, the PRIMARY flagged account_id your decision should act on, and detailed
+reasoning citing specific evidence. After submit_assessment returns, STOP — a later step drafts the
+report and then enacts your decision (destructive actions require analyst approval; you do NOT enact
+the action yourself).
 
 Valid values:
 - typology: account_takeover, money_mule, synthetic_identity, promo_abuse, friendly_fraud, card_testing, fraud_ring, suspicious_activity, legitimate
@@ -209,6 +208,36 @@ def _investigator_instruction(ctx: ReadonlyContext) -> str:
     evidence = build_evidence_summary(initial, alert)
     findings = _format_specialist_findings(state)
     return _INVESTIGATOR_SYSTEM.format(evidence=evidence, findings=findings)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Action taker: enacts the decision AFTER the report is written. Destructive
+# actions pause here for analyst approval (ADK tool-confirmation).
+# ─────────────────────────────────────────────────────────────────────────────
+_ACTION_TAKER_SYSTEM = """You enforce a fraud decision that a senior analyst has ALREADY made and documented. Do NOT re-investigate, second-guess, or change the decision.
+
+Call enact_decision EXACTLY ONCE with:
+- decision: {decision}
+- account_id: {account_id}  (if this is blank, use the PRIMARY flagged account from the evidence below)
+- reason: one concise sentence justifying the action (you may summarize this: {reason})
+
+Do not call any other tool. Destructive actions (temporary_freeze, full_block, escalate_compliance) will pause for a human analyst's approval before they take effect; non-destructive ones apply immediately. After enact_decision returns, stop.
+
+## EVIDENCE (for the primary flagged account id, if needed)
+{evidence}
+"""
+
+
+def _action_taker_instruction(ctx: ReadonlyContext) -> str:
+    state = ctx.state
+    final = state.get("final_assessment") or {}
+    evidence = build_evidence_summary(state.get("initial_evidence") or {}, state.get("alert_evidence") or {})
+    return _ACTION_TAKER_SYSTEM.format(
+        decision=final.get("decision", "allow_monitor"),
+        account_id=final.get("account_id", "") or "",
+        reason=(final.get("reasoning", "") or "")[:300],
+        evidence=evidence,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -270,7 +299,7 @@ def build_investigation_agent(model: str = None) -> SequentialAgent:
         name=INVESTIGATOR_NAME,
         model=model,
         instruction=_investigator_instruction,
-        tools=INVESTIGATION_TOOLS + [enact_decision],
+        tools=INVESTIGATION_TOOLS,  # assesses only; enacting happens later
         generate_content_config=types.GenerateContentConfig(temperature=0.3),
         # The investigator owns its turn; no transfer to peers/parent.
         disallow_transfer_to_parent=True,
@@ -288,10 +317,22 @@ def build_investigation_agent(model: str = None) -> SequentialAgent:
         disallow_transfer_to_peers=True,
     )
 
+    # Stage 4: enact the decision AFTER the report exists. Destructive actions
+    # pause here for analyst approval (so the analyst reviews the report first).
+    action_taker = LlmAgent(
+        name=ACTION_TAKER_NAME,
+        model=model,
+        instruction=_action_taker_instruction,
+        tools=[enact_decision],
+        generate_content_config=types.GenerateContentConfig(temperature=0.0),
+        disallow_transfer_to_parent=True,
+        disallow_transfer_to_peers=True,
+    )
+
     agent = SequentialAgent(
         name=APP_NAME,
-        sub_agents=[evidence_collection, investigator, report_writer],
-        description="Gather evidence in parallel, synthesize an assessment, then write the fraud report.",
+        sub_agents=[evidence_collection, investigator, report_writer, action_taker],
+        description="Gather evidence in parallel, assess, write the report, then enact the decision.",
     )
-    logger.info(f"Built ADK investigation agent (model={model}, parallel evidence collection)")
+    logger.info(f"Built ADK investigation agent (model={model}, parallel evidence + post-report action)")
     return agent
