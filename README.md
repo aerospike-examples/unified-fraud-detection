@@ -41,6 +41,7 @@ This project is a reference for two things:
                      │   │   (3 specialists)   │   │            (adk-aerospike)
                      │   │  ─▶ investigator    │   │
                      │   │  ─▶ report_writer   │   │
+                     │   │  ─▶ action_taker    │   │
                      │   └──────────┬──────────┘   │
                      └──────────────┼──────────────┘
                                     │
@@ -79,7 +80,7 @@ The **[Agent Development Kit (ADK)](https://google.github.io/adk-docs/)** is Goo
 
 When a flagged account is investigated, the request streams (SSE) from the frontend into the backend, which runs an ADK agent over the account's graph + KV data and translates ADK's `Event` stream back into the UI's progress contract.
 
-The agent is a three-stage **`SequentialAgent`** whose first stage is itself a **`ParallelAgent`** (`backend/workflow/agent.py`):
+The agent is a four-stage **`SequentialAgent`** whose first stage is itself a **`ParallelAgent`** (`backend/workflow/agent.py`):
 
 ```
 SequentialAgent  "fraud_investigation"
@@ -88,11 +89,14 @@ SequentialAgent  "fraud_investigation"
   │     ├─ device_analyst     → device sharing, spoofing, infra risk
   │     └─ velocity_analyst   → velocity, bursts, amount anomalies
   ├─ investigator   — tool-using LlmAgent (ReAct): SYNTHESIZES the specialist
-  │     findings, drills into gaps, decides, and enacts a remediation action
-  └─ report_writer  — LlmAgent: drafts the markdown investigation report
+  │     findings, drills into gaps, and submits the assessment (does NOT enact)
+  ├─ report_writer  — LlmAgent: drafts the markdown investigation report
+  └─ action_taker   — LlmAgent: enacts the decision; destructive actions PAUSE
+        here for analyst approval (so the report is already written and on screen
+        before the analyst approves) — see the spotlight below
 ```
 
-Each specialist writes a findings summary to session state via its `output_key`; the investigator reads all three and reaches a decision in 0–3 tool calls instead of gathering everything itself. Two deterministic pre-steps (`alert_validation`, `data_collection`) seed the ADK session state from fast KV reads before the agent starts, so the model begins with baseline context instead of spending tool calls on it. The `Runner` and services are built once in `InvestigationRunner` (`backend/workflow/runner.py`).
+Each specialist writes a findings summary to session state via its `output_key`; the investigator reads all three and reaches a decision in 0–3 tool calls instead of gathering everything itself. The **report is written before the decision is enacted** so the analyst reviews the full report before approving. Two deterministic pre-steps (`alert_validation`, `data_collection`) seed the ADK session state from fast KV reads before the agent starts, so the model begins with baseline context instead of spending tool calls on it. The `Runner` and services are built once in `InvestigationRunner` (`backend/workflow/runner.py`).
 
 ### Aerospike ⇄ ADK integration
 
@@ -132,17 +136,17 @@ This means the agent's entire footprint — its working state, its long-term mem
 | ADK capability | How the demo uses it | Where |
 |----------------|----------------------|-------|
 | **Tool-using ReAct agent** | The `investigator` LlmAgent calls evidence tools one step at a time and reasons over each result | `agent.py`, `tools/investigation_tools_adk.py` |
-| **Sequential pipeline** | `SequentialAgent` chains `evidence_collection → investigator → report_writer` | `agent.py` |
+| **Sequential pipeline** | `SequentialAgent` chains `evidence_collection → investigator → report_writer → action_taker` (assess → report → enact, in that order) | `agent.py` |
 | **Parallel multi-agent** | `ParallelAgent` runs three evidence specialists (network / device / velocity) concurrently, each writing findings via `output_key` — see below | `agent.py`, `runner.py` |
 | **Session + state** | Deterministic pre-steps seed state; tools and agents read/write it (specialists write per-agent keys to stay race-free under fan-out) | `runner.py`, `plugins.py`, `nodes/` |
 | **Long-term memory** | `recall_similar_investigations` calls `tool_context.search_memory(...)` to surface prior cases | `tools/investigation_tools_adk.py` |
 | **Artifacts** | The report is saved with `artifact_service.save_artifact(...)` and the session is added to memory on completion | `runner.py` |
 | **Plugins & callbacks** | `MetricsPlugin` (a `BasePlugin`) collects timing/DB/LLM/token metrics via callbacks and enforces a per-run tool-call budget in `before_tool_callback` | `plugins.py` |
-| **Human-in-the-loop tool confirmation** | Destructive remediation actions pause the agent for analyst approval via ADK's native `request_confirmation` — see below | `action_tools.py`, `runner.py` |
+| **Human-in-the-loop tool confirmation** | The `action_taker` stage pauses for analyst approval on destructive actions via ADK's native `request_confirmation`; the analyst can approve or override with a different disposition — see below | `action_tools.py`, `runner.py` |
 | **Event-stream → SSE** | The runner translates ADK's `Event` stream (function calls, partials, completions) into the frontend's existing SSE progress contract | `runner.py` |
 
 The investigator's tool belt (`INVESTIGATION_TOOLS`) wraps the same Gremlin/KV engine the rest of the app uses:
-`get_account_transactions`, `get_counterparty_profile`, `get_counterparty_transactions`, `get_account_risk_features`, `get_device_risk_features`, `detect_fraud_ring`, `get_transaction_network`, `recall_similar_investigations`, and the exit tool `submit_assessment`.
+`get_account_transactions`, `get_counterparty_profile`, `get_counterparty_transactions`, `get_account_risk_features`, `get_device_risk_features`, `detect_fraud_ring`, `get_transaction_network`, `recall_similar_investigations`, and the exit tool `submit_assessment` (which records the typology, risk, decision, and the primary `account_id`). Enacting the decision is a separate tool, `enact_decision`, owned by the `action_taker` stage.
 
 ### Feature spotlight: Parallel evidence collection
 
@@ -163,8 +167,8 @@ Two correctness details worth noting, since fan-out shares one session:
 ```
                     ┌──────────────────────────────────────┐
  evidence_collection│  network_analyst  ─┐                  │
- (ParallelAgent,    │  device_analyst   ─┼─▶ findings ─▶    │ investigator ─▶ report_writer
-  concurrent)       │  velocity_analyst ─┘   (state)        │ (synthesis)
+ (ParallelAgent,    │  device_analyst   ─┼─▶ findings ─▶    │ investigator ─▶ report_writer ─▶ action_taker
+  concurrent)       │  velocity_analyst ─┘   (state)        │ (synthesis)      (report)        (enact)
                     └──────────────────────────────────────┘
 ```
 
@@ -172,35 +176,45 @@ Two correctness details worth noting, since fan-out shares one session:
 
 The agent doesn't just *recommend* a decision — it can **take action** on the flagged account, with destructive actions gated behind a human. This uses ADK's native tool-confirmation primitive (`tool_context.request_confirmation` / the `adk_request_confirmation` flow).
 
-After `submit_assessment`, the agent calls **`enact_decision(decision, account_id, reason)`**:
+The decision is enacted by the **`action_taker`** stage, which runs **after** `report_writer` — so the full report exists before anyone is asked to approve. `action_taker` calls **`enact_decision(decision, account_id, reason)`**:
 
-- **Non-destructive** (`allow_monitor`, `step_up_auth`) → executes immediately.
-- **Destructive** (`temporary_freeze`, `full_block`, `escalate_compliance`) → the tool calls `request_confirmation(...)` and the run **pauses**. The backend emits an `action_confirmation_required` event; the analyst sees an inline approve/reject card.
-  - **Approve** → the run resumes (`GET /investigation/{id}/resume?approved=true`), the agent's confirmation is answered, and the action is enforced. The enacted action is recorded in session state and shown in the UI.
-  - **Reject** → no enforcement; the investigation still completes with a full report.
+- **Non-destructive** (`allow_monitor`, `step_up_auth`) → enforced immediately (the account moves to `monitoring`, leaving the pending queue).
+- **Destructive** (`temporary_freeze`, `full_block`, `escalate_compliance`) → the tool calls `request_confirmation(...)` and the run **pauses**. The backend pushes the finished report + assessment, then emits `action_confirmation_required`. The UI opens a **"Review report & decide" modal** (the full report, scrollable, with the controls pinned at the bottom):
+  - **Approve & Enact** → the run resumes (`GET /investigation/{id}/resume?approved=true`) and the agent's recommended action is enforced.
+  - **Set a different disposition** (override) → resumes with `?approved=false&override=<disposition>`; `action_taker` declines its own recommendation and the analyst's chosen disposition is enacted instead. So a rejected alert is never left dead-ended — the analyst always resolves it.
 
-Each destructive decision maps to a **distinct** outcome (`backend/workflow/action_tools.py`):
+The enacted action is recorded in session state and shown in the UI ("Actions Taken"), and the flagged account's status updates accordingly.
 
-| Decision | Outcome | Reversible? |
-|----------|---------|-------------|
-| `temporary_freeze` | reversible hold — sets a `frozen` flag + status `temporarily_frozen`; **does not** mark fraud or flag devices (`freeze_account`) | ✅ yes |
-| `full_block` | confirmed fraud — sets `fraud_flag`, flags the account's devices (`resolve_account`) | ✗ no |
-| `escalate_compliance` | case moved to compliance review (`under_investigation`) | — |
+**Dispositions** (`backend/workflow/action_tools.py`). Note **Full Block *is* "confirm fraud"** — one outcome, not two:
+
+| Disposition | Status | Effect | Who can choose it |
+|-------------|--------|--------|-------------------|
+| `allow_monitor` / `step_up_auth` | `monitoring` | allowed, kept under watch (not fraud) — `mark_monitoring` | agent or analyst |
+| `temporary_freeze` | `temporarily_frozen` | reversible hold — `frozen` flag, **not** fraud, no devices flagged — `freeze_account` | agent or analyst |
+| `full_block` (= confirm fraud) | `confirmed_fraud` | `fraud_flag` set + devices flagged — `resolve_account` | agent or analyst |
+| `escalate_compliance` | `under_investigation` | case moved to compliance review | agent or analyst |
+| `clear` | `cleared` | alert dismissed — account marked safe (not fraud) | **analyst only** (the agent never clears) |
 
 ```
-investigator ─▶ submit_assessment ─▶ enact_decision
-                                          │
-                          destructive? ───┴─── non-destructive
-                              │                      │
-                     request_confirmation       execute now
-                       (run PAUSES)                  │
-                              │                      │
-                   analyst approves / rejects        │
-                              │                      │
-                       enforce / skip ───────────────┴─▶ report_writer ─▶ done
+investigator ─▶ submit_assessment ──▶ report_writer ──▶ action_taker ─▶ enact_decision
+ (assess only)   (report written first)                                       │
+                                                       destructive? ──────────┴────── non-destructive
+                                                            │                              │
+                                                  request_confirmation                enforce now
+                                                    (run PAUSES,                    (→ monitoring)
+                                                 report on screen)
+                                                            │
+                                            ┌───── analyst decides ──────┐
+                                            │                            │
+                                   Approve & Enact          Set a different disposition
+                                   (agent's action)         (override: clear / monitor /
+                                            │                 freeze / escalate)
+                                            └────────────┬───────────────┘
+                                                         ▼
+                                                  enforce + resolve
 ```
 
-This keeps the agent useful (it closes the loop on its own findings) while ensuring a human authorizes anything with real consequences.
+This keeps the agent useful (it closes the loop on its own findings) while ensuring a human authorizes anything with real consequences — and always reaches a resolution.
 
 ## 🧭 ADK Roadmap / Ideas to Showcase
 
