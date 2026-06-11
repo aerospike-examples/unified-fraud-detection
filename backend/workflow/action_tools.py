@@ -54,6 +54,14 @@ def _execute_action(decision: str, account_id: str, reason: str) -> Dict[str, An
     """
     note = f"[AI agent action: {decision}] {reason}"[:480]
 
+    if decision == "clear":
+        # Analyst override only: alert is legitimate — clear the account (not fraud).
+        # The agent itself never produces this decision.
+        result = _flagged_account_service.resolve_account(account_id, "cleared", note)
+        ok = bool(result.get("success", True)) if isinstance(result, dict) else True
+        return {"status": "executed", "action": decision, "account_id": account_id,
+                "effect": "alert cleared — account marked safe (not fraud)", "ok": ok}
+
     if decision == "temporary_freeze":
         # Reversible hold: set the `frozen` flag; do NOT mark fraud or flag devices.
         result = _flagged_account_service.freeze_account(account_id, note, frozen=True)

@@ -57,6 +57,7 @@ const decisionLabels: Record<string, string> = {
     temporary_freeze: 'Temporary Freeze',
     full_block: 'Full Block',
     escalate_compliance: 'Escalate to Compliance',
+    clear: 'Clear (not fraud)',
 }
 
 const workflowSteps = [

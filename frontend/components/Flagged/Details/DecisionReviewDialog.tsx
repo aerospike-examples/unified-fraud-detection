@@ -7,8 +7,8 @@ import {
   Dialog, DialogHeader, DialogTitle, DialogDescription, DialogContent, DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { ShieldAlert, Check, X } from "lucide-react";
-import type { PendingAction } from "@/hooks/useInvestigation";
+import { ShieldAlert, Check } from "lucide-react";
+import { DISPOSITIONS, type PendingAction } from "@/hooks/useInvestigation";
 
 const MermaidDiagram = dynamic(() => import("@/components/MermaidDiagram"), { ssr: false });
 
@@ -26,15 +26,17 @@ interface DecisionReviewDialogProps {
   pendingAction: PendingAction;
   report?: string;
   onApprove: () => void;
-  onReject: () => void;
+  /** Reject the agent's action and enact a different disposition instead. */
+  onOverride: (decision: string) => void;
 }
 
-// Read the full investigation report and approve/reject the agent's proposed
-// action in one focused view (opens when the agent pauses for approval).
+// Read the full investigation report and decide the agent's proposed action in
+// one focused view (opens when the agent pauses for approval).
 export function DecisionReviewDialog({
-  open, onOpenChange, pendingAction, report, onApprove, onReject,
+  open, onOpenChange, pendingAction, report, onApprove, onOverride,
 }: DecisionReviewDialogProps) {
   const decisionLabel = DECISION_LABELS[pendingAction.decision] || pendingAction.decision;
+  const alternatives = DISPOSITIONS.filter((d) => d.id !== pendingAction.decision);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -93,15 +95,28 @@ export function DecisionReviewDialog({
         </div>
       </DialogContent>
 
-      <DialogFooter>
-        <Button variant="outline" onClick={onReject} className="border-slate-300 text-slate-700 hover:bg-slate-100">
-          <X className="h-4 w-4 mr-1" />
-          Reject
-        </Button>
-        <Button onClick={onApprove} className="bg-red-600 hover:bg-red-700 text-white">
+      <DialogFooter className="flex-col items-stretch gap-3 sm:flex-col sm:items-stretch sm:space-x-0">
+        <Button onClick={onApprove} className="w-full bg-red-600 hover:bg-red-700 text-white">
           <Check className="h-4 w-4 mr-1" />
-          Approve &amp; Enact
+          Approve &amp; Enact: {decisionLabel}
         </Button>
+        <div>
+          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-slate-500">
+            Or set a different disposition
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            {alternatives.map((d) => (
+              <Button
+                key={d.id}
+                variant="outline"
+                onClick={() => onOverride(d.id)}
+                className="justify-start border-slate-300 text-slate-700 hover:bg-slate-100"
+              >
+                {d.label}
+              </Button>
+            ))}
+          </div>
+        </div>
       </DialogFooter>
     </Dialog>
   );

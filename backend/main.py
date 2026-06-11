@@ -1497,9 +1497,10 @@ async def stream_investigation(
 async def resume_investigation_action(
     investigation_id: str = Path(..., description="Investigation ID paused for action approval"),
     approved: bool = Query(..., description="Whether the analyst approves the proposed action"),
+    override: Optional[str] = Query(None, description="If rejecting, the disposition to enact instead (clear, allow_monitor, temporary_freeze, escalate_compliance, full_block)"),
 ):
-    """SSE endpoint that resumes a paused investigation after the analyst
-    approves or rejects the agent's proposed action (human-in-the-loop)."""
+    """SSE endpoint that resumes a paused investigation after the analyst approves
+    the proposed action, or rejects it and picks a different disposition."""
     if not investigation_service:
         raise HTTPException(status_code=503, detail="Investigation service not initialized")
     if not investigation_service.has_pending_action(investigation_id):
@@ -1512,7 +1513,7 @@ async def resume_investigation_action(
 
     async def event_generator():
         try:
-            async for event in investigation_service.resume_investigation_action(investigation_id, approved):
+            async for event in investigation_service.resume_investigation_action(investigation_id, approved, override):
                 yield {
                     "event": event.get("event", "message"),
                     "data": json.dumps(event.get("data", event), default=json_serializer),

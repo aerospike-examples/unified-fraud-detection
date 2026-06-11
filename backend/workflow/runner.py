@@ -146,6 +146,7 @@ async def _drive_agent(
     new_message: Any,
     metrics: Any,
     start_step: Optional[str],
+    manual_override: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Drive runner.run_async and translate the ADK event stream into SSE dicts.
 
@@ -263,7 +264,27 @@ async def _drive_agent(
         yield {"type": "_paused", "data": paused}
         return
 
-    async for ev in _finalize(inv_runner, user_id, investigation_id, metrics, current_step):
+    # Analyst rejected the agent's action and chose a different disposition — enact
+    # it now (same enforcement path the agent uses) and fold it into the result.
+    extra_actions = []
+    if manual_override:
+        from workflow.action_tools import _execute_action
+        try:
+            res = _execute_action(
+                manual_override["decision"], manual_override["account_id"],
+                manual_override.get("reason", "Analyst override of the agent's recommendation"),
+            )
+            extra_actions.append(res)
+            yield _trace("llm_agent", "action_proposed", {
+                "decision": manual_override["decision"],
+                "account_id": manual_override["account_id"],
+                "reason": "Analyst override",
+            })
+        except Exception as e:
+            logger.error(f"[{investigation_id}] manual override failed: {e}")
+
+    async for ev in _finalize(inv_runner, user_id, investigation_id, metrics, current_step,
+                              extra_actions=extra_actions):
         yield ev
 
 
@@ -273,6 +294,7 @@ async def _finalize(
     investigation_id: str,
     metrics: Any,
     current_step: Optional[str],
+    extra_actions: Optional[list] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Close the run: read final state, persist report artifact + memory, emit
     final state_update / metrics / complete."""
@@ -310,7 +332,7 @@ async def _finalize(
         name: (final_state.get(SPECIALIST_OUTPUT_KEYS[name]) or "")
         for name in SPECIALIST_NAMES
     }
-    enacted_actions = final_state.get("enacted_actions", [])
+    enacted_actions = final_state.get("enacted_actions", []) + (extra_actions or [])
     agent_iterations = final_state.get("agent_iterations", 0)
 
     try:
@@ -438,16 +460,19 @@ async def resume_investigation(
     approved: bool,
     hint: str = "",
     payload: Optional[Dict[str, Any]] = None,
+    override: Optional[str] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
-    """Resume a paused investigation after the analyst approves/rejects the action."""
+    """Resume a paused investigation after the analyst approves the action, or
+    rejects it and (optionally) picks a different disposition via ``override``."""
     metrics = get_collector(investigation_id)  # continue the same run's metrics
-    logger.info(f"Resuming investigation {investigation_id}: approved={approved} fc={fc_id}")
+    logger.info(f"Resuming investigation {investigation_id}: approved={approved} override={override} fc={fc_id}")
 
     try:
         yield _trace("llm_agent", "action_decision", {
             "approved": bool(approved),
             "decision": (payload or {}).get("decision"),
             "account_id": (payload or {}).get("account_id"),
+            "override": override,
         })
 
         # Reply to the adk_request_confirmation call with the analyst's decision.
@@ -456,7 +481,18 @@ async def resume_investigation(
             id=fc_id, name="adk_request_confirmation", response=confirmation_response,
         ))])
 
-        async for ev in _drive_agent(inv_runner, user_id, investigation_id, new_message, metrics, start_step="llm_agent"):
+        # On reject + chosen disposition, enact the analyst's override after the
+        # agent declines its own recommendation.
+        manual_override = None
+        if not approved and override:
+            manual_override = {
+                "decision": override,
+                "account_id": (payload or {}).get("account_id"),
+                "reason": "Analyst override of the agent's recommendation",
+            }
+
+        async for ev in _drive_agent(inv_runner, user_id, investigation_id, new_message, metrics,
+                                     start_step="llm_agent", manual_override=manual_override):
             yield ev
 
     except Exception as e:

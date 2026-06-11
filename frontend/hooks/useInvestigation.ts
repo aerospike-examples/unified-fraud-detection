@@ -112,6 +112,16 @@ export interface PendingAction {
   reason: string;
 }
 
+// Analyst dispositions for the "reject the agent → pick a different outcome" flow.
+// (full_block === confirm fraud; "clear" is analyst-only — the agent never clears.)
+export const DISPOSITIONS: { id: string; label: string }[] = [
+  { id: "clear", label: "Clear (not fraud)" },
+  { id: "allow_monitor", label: "Allow & Monitor" },
+  { id: "temporary_freeze", label: "Temporary Freeze" },
+  { id: "full_block", label: "Full Block (Confirm Fraud)" },
+  { id: "escalate_compliance", label: "Escalate to Compliance" },
+];
+
 // An action the agent actually enacted (after approval, or immediately for
 // non-destructive decisions).
 export interface EnactedAction {
@@ -500,17 +510,18 @@ export function useInvestigation() {
     [cleanup, attachStreamListeners]
   );
 
-  // Approve or reject the agent's pending destructive action (human-in-the-loop).
-  // Opens the resume SSE stream so the agent continues with the analyst's decision.
+  // Approve the agent's pending action, or reject it and (optionally) enact a
+  // different disposition (override). Opens the resume SSE stream.
   const approveAction = useCallback(
-    (approved: boolean) => {
+    (approved: boolean, override?: string) => {
       const pending = pendingActionRef.current;
       if (!pending) return;
 
       cleanup();
       pendingActionRef.current = null;
-      const url = `${BACKEND_URL}/investigation/${pending.investigation_id}/resume?approved=${approved}`;
-      console.log("[Investigation] Resuming with decision:", { approved, url });
+      let url = `${BACKEND_URL}/investigation/${pending.investigation_id}/resume?approved=${approved}`;
+      if (!approved && override) url += `&override=${encodeURIComponent(override)}`;
+      console.log("[Investigation] Resuming with decision:", { approved, override, url });
 
       try {
         const eventSource = new EventSource(url);

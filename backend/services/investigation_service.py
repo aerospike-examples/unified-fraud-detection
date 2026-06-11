@@ -226,8 +226,10 @@ class InvestigationService:
         self,
         investigation_id: str,
         approved: bool,
+        override: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Resume a paused investigation after the analyst approves/rejects the action."""
+        """Resume a paused investigation after the analyst approves the action, or
+        rejects it and (optionally) picks a different disposition via ``override``."""
         pending = self._pending_confirmations.get(investigation_id)
         if not pending:
             yield {"event": "error", "data": {"error": "No pending action to confirm", "investigation_id": investigation_id}}
@@ -254,6 +256,7 @@ class InvestigationService:
                 hint=pending.get("hint", ""),
                 payload={"decision": pending.get("decision"), "account_id": pending.get("account_id"),
                          "reason": pending.get("reason")},
+                override=override,
             )
             async for ev in self._consume(investigation_id, user_id, agen):
                 yield ev

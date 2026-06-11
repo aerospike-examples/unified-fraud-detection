@@ -2,8 +2,8 @@
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { ShieldAlert, Check, X, Loader2, FileText } from "lucide-react";
-import type { PendingAction } from "@/hooks/useInvestigation";
+import { ShieldAlert, Check, Loader2, FileText } from "lucide-react";
+import { DISPOSITIONS, type PendingAction } from "@/hooks/useInvestigation";
 
 // Maps the agent's decision codes to analyst-facing labels.
 const DECISION_LABELS: Record<string, string> = {
@@ -17,7 +17,8 @@ const DECISION_LABELS: Record<string, string> = {
 interface ActionApprovalCardProps {
   pendingAction: PendingAction;
   onApprove: () => void;
-  onReject: () => void;
+  /** Reject the agent's action and enact a different disposition instead. */
+  onOverride: (decision: string) => void;
   /** Open the full report + decide dialog. */
   onReview?: () => void;
   /** True while the resume stream is in flight (buttons disabled). */
@@ -27,12 +28,14 @@ interface ActionApprovalCardProps {
 export function ActionApprovalCard({
   pendingAction,
   onApprove,
-  onReject,
+  onOverride,
   onReview,
   submitting = false,
 }: ActionApprovalCardProps) {
   const decisionLabel =
     DECISION_LABELS[pendingAction.decision] || pendingAction.decision;
+  // Alternatives = every disposition except the one the agent recommended.
+  const alternatives = DISPOSITIONS.filter((d) => d.id !== pendingAction.decision);
 
   return (
     <Card className="border-2 border-amber-400 bg-amber-50 shadow-md animate-in fade-in">
@@ -87,28 +90,32 @@ export function ActionApprovalCard({
           </Button>
         )}
 
-        <div className="flex gap-3">
-          <Button
-            onClick={onApprove}
-            disabled={submitting}
-            className="flex-1 bg-red-600 hover:bg-red-700 text-white"
-          >
-            {submitting ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Check className="h-4 w-4" />
-            )}
-            Approve & Enact
-          </Button>
-          <Button
-            onClick={onReject}
-            disabled={submitting}
-            variant="outline"
-            className="flex-1 border-slate-300 text-slate-700 hover:bg-slate-100"
-          >
-            <X className="h-4 w-4" />
-            Reject
-          </Button>
+        <Button
+          onClick={onApprove}
+          disabled={submitting}
+          className="w-full bg-red-600 hover:bg-red-700 text-white"
+        >
+          {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+          Approve &amp; Enact: {decisionLabel}
+        </Button>
+
+        <div className="pt-1">
+          <p className="mb-1.5 text-xs font-medium uppercase tracking-wide text-slate-500">
+            Or set a different disposition
+          </p>
+          <div className="grid grid-cols-1 gap-2">
+            {alternatives.map((d) => (
+              <Button
+                key={d.id}
+                onClick={() => onOverride(d.id)}
+                disabled={submitting}
+                variant="outline"
+                className="justify-start border-slate-300 text-slate-700 hover:bg-slate-100"
+              >
+                {d.label}
+              </Button>
+            ))}
+          </div>
         </div>
       </CardContent>
     </Card>

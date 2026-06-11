@@ -143,6 +143,12 @@ export default function FlaggedAccountDetailsPage() {
         }
     }, [investigation.status])
 
+    // Refresh the account once the run completes so the flagged status reflects
+    // whatever disposition was enacted (approve or override).
+    useEffect(() => {
+        if (investigation.status === 'completed') refetch()
+    }, [investigation.status, refetch])
+
     const handleStartInvestigation = () => {
         if (account) {
             investigation.startInvestigation(account.user_id)
@@ -669,7 +675,7 @@ export default function FlaggedAccountDetailsPage() {
                         <ActionApprovalCard
                             pendingAction={investigation.pendingAction}
                             onApprove={() => investigation.approveAction(true)}
-                            onReject={() => investigation.approveAction(false)}
+                            onOverride={(d) => investigation.approveAction(false, d)}
                             onReview={() => setReviewOpen(true)}
                         />
                     )}
@@ -704,7 +710,7 @@ export default function FlaggedAccountDetailsPage() {
                     pendingAction={investigation.pendingAction}
                     report={investigation.report}
                     onApprove={() => { setReviewOpen(false); investigation.approveAction(true) }}
-                    onReject={() => { setReviewOpen(false); investigation.approveAction(false) }}
+                    onOverride={(d) => { setReviewOpen(false); investigation.approveAction(false, d) }}
                 />
             )}
         </div>
