@@ -17,6 +17,8 @@ from workflow.state import InvestigationState, TraceEvent
 
 logger = logging.getLogger('investigation.report_generation')
 
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+
 REPORT_PROMPT_TEMPLATE = """You are a fraud analyst AI. Generate a comprehensive investigation report in Markdown format.
 
 ## Investigation Details
@@ -217,47 +219,61 @@ async def _call_ollama(prompt: str) -> str:
 async def _call_gemini(prompt: str) -> str:
     """Call Google Gemini API using native generateContent endpoint."""
     api_key = os.environ.get("GEMINI_API_KEY", "")
-    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+    model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    api_version = os.environ.get("GEMINI_API_VERSION", "v1").strip() or "v1"
+    model_name = model.strip()
+    if model_name.startswith("models/"):
+        model_name = model_name[len("models/"):]
     
     if not api_key:
         raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
     
-    logger.info(f"[Report] Calling Gemini API with model {model}")
+    logger.info(f"[Report] Calling Gemini API with model {model_name} on {api_version}")
     
     # Use native Gemini API endpoint
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model_name}:generateContent"
     
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key
-            },
-            json={
-                "contents": [
-                    {
-                        "parts": [{"text": prompt}]
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": api_key
+                },
+                json={
+                    "contents": [
+                        {
+                            "parts": [{"text": prompt}]
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": 0.4,
+                        "maxOutputTokens": 1500
                     }
-                ],
-                "generationConfig": {
-                    "temperature": 0.4,
-                    "maxOutputTokens": 1500
                 }
-            }
-        )
-        response.raise_for_status()
-        result = response.json()
-        
-        # Extract response text from Gemini format
-        candidates = result.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            if parts:
-                return parts[0].get("text", "")
-        
-        return ""
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            # Extract response text from Gemini format
+            candidates = result.get("candidates", [])
+            if candidates:
+                content = candidates[0].get("content", {})
+                parts = content.get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+            
+            return ""
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            logger.error(
+                "[Report] Gemini model '%s' was not found for API version '%s'. "
+                "Set GEMINI_MODEL to a supported model returned by the Gemini models API.",
+                model_name,
+                api_version,
+            )
+        raise
 
 
 async def _call_llm(prompt: str) -> str:

@@ -27,6 +27,7 @@ logger = logging.getLogger('investigation.llm_agent')
 MAX_ITERATIONS = 50
 MAX_TOOL_CALLS = 40
 TIMEOUT_SECONDS = 600
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 
 def llm_agent_node(
@@ -531,12 +532,17 @@ def _call_gemini(api_key: str, model: str, prompt: str) -> str:
     """Call Google Gemini API using native generateContent endpoint."""
     import time
     
-    logger.info(f"[LLM] Calling Gemini API with model {model}")
+    api_version = os.environ.get("GEMINI_API_VERSION", "v1").strip() or "v1"
+    model_name = model.strip()
+    if model_name.startswith("models/"):
+        model_name = model_name[len("models/"):]
+    
+    logger.info(f"[LLM] Calling Gemini API with model {model_name} on {api_version}")
     start = time.time()
     
     try:
         # Use native Gemini API endpoint
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        url = f"https://generativelanguage.googleapis.com/{api_version}/models/{model_name}:generateContent"
         
         with httpx.Client(timeout=300.0) as client:
             response = client.post(
@@ -573,6 +579,16 @@ def _call_gemini(api_key: str, model: str, prompt: str) -> str:
             
             return ""
             
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            logger.error(
+                "[LLM] Gemini model '%s' was not found for API version '%s'. "
+                "Set GEMINI_MODEL to a supported model returned by the Gemini models API.",
+                model_name,
+                api_version,
+            )
+        logger.error(f"[LLM] Gemini error: {e}")
+        raise
     except Exception as e:
         logger.error(f"[LLM] Gemini error: {e}")
         raise
@@ -584,7 +600,7 @@ def _call_llm(prompt: str) -> str:
     
     if provider == "gemini":
         api_key = os.environ.get("GEMINI_API_KEY", "")
-        model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+        model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
         
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
