@@ -77,13 +77,13 @@ async def lifespan(app: FastAPI):
     # Bind action tools (freeze/escalate/etc.) used by the human-in-the-loop flow
     init_action_tools(flagged_account_service, aerospike_service)
 
-    # Initialize investigation service (Google ADK, Aerospike-backed)
-    adk_model = os.environ.get("ADK_MODEL", "gemini-3.5-flash")
+    # Initialize investigation service (ADK or LangGraph, selectable via env)
+    investigation_engine = os.environ.get("INVESTIGATION_ENGINE", "adk")
 
     investigation_service = InvestigationService(
         aerospike_service=aerospike_service,
         graph_service=graph_service,
-        model=adk_model,
+        engine_name=investigation_engine,
     )
 
     try:
@@ -92,10 +92,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Investigation service initialization warning: {e}")
 
-    # Verify the Gemini API key + model are reachable (non-fatal)
+    # Verify the Gemini API key + model are reachable when using Gemini (non-fatal)
     try:
         from workflow.health import log_gemini_health
-        await log_gemini_health(adk_model)
+        from workflow.llm import LLMConfig
+
+        llm_cfg = LLMConfig.from_env()
+        if llm_cfg.provider == "gemini":
+            await log_gemini_health(llm_cfg.model)
     except Exception as e:
         logger.warning(f"Gemini health check could not run: {e}")
     
@@ -1426,7 +1430,7 @@ def get_detection_history(
 
 
 # ----------------------------------------------------------------------------------------------------------
-# Investigation endpoints (Google ADK-powered fraud investigation)
+# Investigation endpoints (ADK or LangGraph — INVESTIGATION_ENGINE)
 # ----------------------------------------------------------------------------------------------------------
 
 

@@ -70,7 +70,27 @@ This project is a reference for two things:
 | **Prometheus** | 9091 | Metrics collection and storage |
 | **Grafana** | 3030 | Monitoring dashboards (default login `admin`/`admin`) |
 
-## 🤖 Agentic Layer — Google ADK
+## 🤖 Agentic Layer — ADK or LangGraph
+
+The investigation backend exposes **two interchangeable engines** behind a common interface (`backend/workflow/engines/`). Both emit the same SSE event contract, so the frontend works unchanged.
+
+| Setting | Values | Default |
+|---------|--------|---------|
+| `INVESTIGATION_ENGINE` | `adk`, `langgraph` | `adk` |
+| `LLM_PROVIDER` | `gemini`, `ollama` | `gemini` |
+
+- **`adk`** — Google ADK `SequentialAgent` + `Runner` (`backend/workflow/runner.py`, `agent.py`). Uses Aerospike for ADK session/memory/artifact services.
+- **`langgraph`** — LangGraph `StateGraph` with the same pipeline (parallel specialists → investigator → report → gated action) and feature parity: cross-case memory, HITL approval, disposition overrides, specialist findings, and enacted actions (`backend/workflow/graph.py`).
+
+Set in `.env` before starting the backend:
+
+```bash
+INVESTIGATION_ENGINE=adk          # or langgraph
+LLM_PROVIDER=gemini               # or ollama (OLLAMA_BASE_URL, OLLAMA_MODEL)
+ADK_MODEL=gemini-3.5-flash
+```
+
+## 🤖 Agentic Layer — Google ADK (default engine)
 
 ### What is ADK?
 

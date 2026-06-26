@@ -20,10 +20,6 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from google.adk.sessions import Session
-from google.adk.events import Event
-from google.genai import types
-
 logger = logging.getLogger('investigation.case_memory')
 
 # Shared memory scope so cases are searchable ACROSS the (per-user) investigated
@@ -52,6 +48,10 @@ async def store_case(memory_service: Any, app_name: str, case: Dict[str, Any]) -
     its own accounts/devices plus the counterparties it investigated).
     """
     try:
+        from google.adk.sessions import Session
+        from google.adk.events import Event
+        from google.genai import types
+
         entities = case.get("entities") or []
         text = f"{_encode(entities)} {_SEP} {json.dumps(case, default=str)}"
         ev = Event(author="case_summary",

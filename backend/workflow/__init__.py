@@ -1,14 +1,21 @@
 """
 Investigation Workflow Package
 
-Google ADK-based fraud investigation: a SequentialAgent (investigator +
-report_writer) backed by Aerospike for sessions, memory, and artifacts.
+Polymorphic fraud-investigation backends:
+
+- ``adk`` — Google ADK SequentialAgent (Aerospike sessions/memory/artifacts)
+- ``langgraph`` — LangGraph StateGraph with ADK feature parity
+
+Select via ``INVESTIGATION_ENGINE`` (default ``adk``).
 """
 
-from workflow.runner import build_runner, run_investigation, get_workflow_steps
+from workflow.engines import get_engine, SUPPORTED_ENGINES, BaseInvestigationEngine
+from workflow.state import InvestigationState, create_initial_state
 
 __all__ = [
-    "build_runner",
-    "run_investigation",
-    "get_workflow_steps",
+    "BaseInvestigationEngine",
+    "get_engine",
+    "SUPPORTED_ENGINES",
+    "InvestigationState",
+    "create_initial_state",
 ]

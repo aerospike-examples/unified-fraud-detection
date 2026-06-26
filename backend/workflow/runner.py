@@ -302,9 +302,9 @@ async def _drive_agent(
     # it now (same enforcement path the agent uses) and fold it into the result.
     extra_actions = []
     if manual_override:
-        from workflow.action_tools import _execute_action
+        from workflow.action_core import execute_action
         try:
-            res = _execute_action(
+            res = execute_action(
                 manual_override["decision"], manual_override["account_id"],
                 manual_override.get("reason", "Analyst override of the agent's recommendation"),
             )

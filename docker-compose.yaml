@@ -87,7 +87,11 @@ services:
       # Google ADK / Gemini settings
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+      - INVESTIGATION_ENGINE=${INVESTIGATION_ENGINE:-adk}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       - ADK_MODEL=${ADK_MODEL:-gemini-3.5-flash}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
     volumes:
       - ./data:/data
     healthcheck:

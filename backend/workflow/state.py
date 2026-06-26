@@ -51,12 +51,13 @@ class ToolCall(TypedDict):
     iteration: int
 
 
-class FinalAssessment(TypedDict):
+class FinalAssessment(TypedDict, total=False):
     """Final assessment from LLM agent."""
     typology: str  # account_takeover, money_mule, synthetic_identity, fraud_ring, etc.
     risk_level: str  # low, medium, high, critical
     risk_score: int  # 0-100
     decision: str  # allow_monitor, step_up_auth, temporary_freeze, full_block, escalate_compliance
+    account_id: str  # primary flagged account for action enforcement
     reasoning: str
     iteration: int
     tool_calls_made: int
@@ -184,9 +185,27 @@ class InvestigationState(TypedDict):
     
     # Phase 3: LLM Agent state
     agent_messages: List[AgentMessage]  # Conversation history
-    tool_calls: List[ToolCall]  # All tool invocations
+    tool_calls: List[ToolCall]  # Investigator tool invocations
     tool_results: Dict[str, Any]  # Accumulated tool results
     agent_iterations: int  # Loop counter
+    tool_calls_count: int
+
+    # Parallel specialist outputs (ADK parity)
+    network_findings: str
+    device_findings: str
+    velocity_findings: str
+    specialist_tool_calls_network_analyst: List[ToolCall]
+    specialist_tool_calls_device_analyst: List[ToolCall]
+    specialist_tool_calls_velocity_analyst: List[ToolCall]
+
+    # Cross-case memory
+    prior_cases: List[Dict[str, Any]]
+
+    # Enacted fraud-mitigation actions
+    enacted_actions: List[Dict[str, Any]]
+
+    # HITL pause metadata (LangGraph interrupt)
+    pending_confirmation: Optional[Dict[str, Any]]
     
     # Phase 4: Final assessment
     final_assessment: Optional[FinalAssessment]
@@ -226,6 +245,16 @@ def create_initial_state(
         tool_calls=[],
         tool_results={},
         agent_iterations=0,
+        tool_calls_count=0,
+        network_findings="",
+        device_findings="",
+        velocity_findings="",
+        specialist_tool_calls_network_analyst=[],
+        specialist_tool_calls_device_analyst=[],
+        specialist_tool_calls_velocity_analyst=[],
+        prior_cases=[],
+        enacted_actions=[],
+        pending_confirmation=None,
         
         # Phase 4: Final assessment
         final_assessment=None,
