@@ -51,25 +51,6 @@ services:
       interval: 5s
       timeout: 10s
       retries: 4
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   container_name: asgraph-ollama
-  #   volumes:
-  #     - ollama_data:/root/.ollama
-  #   networks:
-  #     - asgraph_net
-  #   ports:
-  #     - "11434:11434"
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "ollama list || exit 0"]
-  #     interval: 10s
-  #     timeout: 30s
-  #     retries: 5
-  #     start_period: 30s
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         memory: 4G
   backend:
     build:
       context: .
@@ -80,19 +61,18 @@ services:
         condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
-      # Using host's Ollama instead of Docker container for GPU support
     environment:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
-      # LLM Provider: "gemini" or "ollama"
+      # Google ADK / Gemini settings
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+      - INVESTIGATION_ENGINE=${INVESTIGATION_ENGINE:-adk}
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
-      # Ollama settings (used when LLM_PROVIDER=ollama)
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=mistral
-      # Gemini settings (used when LLM_PROVIDER=gemini)
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_API_VERSION=${GEMINI_API_VERSION:-v1}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.1-flash-lite}
+      - ADK_MODEL=${ADK_MODEL:-gemini-3.1-flash-lite}
+      # Optional: host Ollama when LLM_PROVIDER=ollama (not part of compose)
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
     volumes:
       - ./data:/data
     healthcheck:
@@ -118,7 +98,7 @@ services:
     networks:
       - asgraph_net
     ports:
-      - "8080:8080"
+      - "8081:8080"
   generator:
     build:
       context: .
@@ -187,6 +167,5 @@ networks:
     name: asgraph_net
 
 volumes:
-  ollama_data:
   prometheus_data:
   grafana_data:

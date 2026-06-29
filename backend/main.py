@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 import urllib.parse
 import tempfile
@@ -70,22 +70,38 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Aerospike KV service not available, using file-based storage")
     
-    # Initialize investigation service
-    ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    ollama_model = os.environ.get("OLLAMA_MODEL", "mistral")
-    
+    # Bind ADK investigation tools to the live Aerospike + Graph services
+    from workflow.tools.investigation_tools_adk import init_tools
+    from workflow.action_tools import init_action_tools
+    init_tools(aerospike_service, graph_service)
+    # Bind action tools (freeze/escalate/etc.) used by the human-in-the-loop flow
+    init_action_tools(flagged_account_service, aerospike_service)
+
+    # Initialize investigation service (ADK or LangGraph, selectable via env)
+    investigation_engine = os.environ.get("INVESTIGATION_ENGINE", "adk")
+
     investigation_service = InvestigationService(
         aerospike_service=aerospike_service,
         graph_service=graph_service,
-        ollama_base_url=ollama_base_url,
-        ollama_model=ollama_model
+        engine_name=investigation_engine,
     )
-    
+
     try:
         await investigation_service.initialize()
         logger.info("Investigation service initialized")
     except Exception as e:
         logger.warning(f"Investigation service initialization warning: {e}")
+
+    # Verify the Gemini API key + model are reachable when using Gemini (non-fatal)
+    try:
+        from workflow.health import log_gemini_health
+        from workflow.llm import LLMConfig
+
+        llm_cfg = LLMConfig.from_env()
+        if llm_cfg.provider == "gemini" and investigation_engine != "mock":
+            await log_gemini_health(llm_cfg.model)
+    except Exception as e:
+        logger.warning(f"Gemini health check could not run: {e}")
     
     # Setup scheduler with detection callback
     scheduler_service.set_detection_callback(flagged_account_service.run_detection)
@@ -377,13 +393,27 @@ def get_transactions(
     page_size: int = Query(12, ge=1, le=100, description="Number of transactions per page"),
     day: str | None = Query(None, description="Date filter (YYYY-MM-DD), defaults to today")
 ):
-    """Get paginated list of transactions for today (or specified day) from KV store"""
+    """Get paginated list of transactions for the most recent day with data (or a specified day) from KV store"""
     try:
-        # Default to today's date if not specified
-        if not day:
-            day = datetime.now().strftime('%Y-%m-%d')
-        results = aerospike_service.get_transactions_by_day(day, page, page_size)
-        return results
+        # Explicit day requested → return it as-is.
+        if day:
+            return aerospike_service.get_transactions_by_day(day, page, page_size)
+
+        # Default view: start at today and walk back to the most recent day that
+        # actually has transactions. This is robust to the container running in a
+        # different timezone than the data (e.g. UTC container, local-day data) and
+        # to the day boundary, where "today" can otherwise be empty.
+        base = datetime.now()
+        results = None
+        for i in range(0, 35):
+            candidate = (base - timedelta(days=i)).strftime('%Y-%m-%d')
+            results = aerospike_service.get_transactions_by_day(candidate, page, page_size)
+            if results.get("total", 0) > 0:
+                return results
+        # No data in the last 35 days — return today's (empty) result.
+        return results if results is not None else aerospike_service.get_transactions_by_day(
+            base.strftime('%Y-%m-%d'), page, page_size
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get transactions: {str(e)}")
 
@@ -1400,7 +1430,7 @@ def get_detection_history(
 
 
 # ----------------------------------------------------------------------------------------------------------
-# Investigation endpoints (LangGraph-powered fraud investigation)
+# Investigation endpoints (ADK or LangGraph — INVESTIGATION_ENGINE)
 # ----------------------------------------------------------------------------------------------------------
 
 
@@ -1464,6 +1494,38 @@ async def stream_investigation(
                 "data": json.dumps({"error": str(e)})
             }
     
+    return EventSourceResponse(event_generator())
+
+
+@app.get("/investigation/{investigation_id}/resume")
+async def resume_investigation_action(
+    investigation_id: str = Path(..., description="Investigation ID paused for action approval"),
+    approved: bool = Query(..., description="Whether the analyst approves the proposed action"),
+    override: Optional[str] = Query(None, description="If rejecting, the disposition to enact instead (clear, allow_monitor, temporary_freeze, escalate_compliance, full_block)"),
+):
+    """SSE endpoint that resumes a paused investigation after the analyst approves
+    the proposed action, or rejects it and picks a different disposition."""
+    if not investigation_service:
+        raise HTTPException(status_code=503, detail="Investigation service not initialized")
+    if not investigation_service.has_pending_action(investigation_id):
+        raise HTTPException(status_code=404, detail="No pending action for this investigation")
+
+    def json_serializer(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+    async def event_generator():
+        try:
+            async for event in investigation_service.resume_investigation_action(investigation_id, approved, override):
+                yield {
+                    "event": event.get("event", "message"),
+                    "data": json.dumps(event.get("data", event), default=json_serializer),
+                }
+        except Exception as e:
+            logger.error(f"Investigation resume stream error: {e}")
+            yield {"event": "error", "data": json.dumps({"error": str(e)})}
+
     return EventSourceResponse(event_generator())
 
 

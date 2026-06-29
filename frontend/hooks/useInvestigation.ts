@@ -89,6 +89,58 @@ export interface ToolCall {
   result?: Record<string, any>;
   timestamp: string;
   iteration: number;
+  agent?: string;
+}
+
+// The three parallel evidence-collection specialists (ADK ParallelAgent stage).
+export type SpecialistName = "network_analyst" | "device_analyst" | "velocity_analyst";
+export const SPECIALISTS: { id: SpecialistName; label: string }[] = [
+  { id: "network_analyst", label: "Network Analyst" },
+  { id: "device_analyst", label: "Device Analyst" },
+  { id: "velocity_analyst", label: "Velocity Analyst" },
+];
+
+// Human-in-the-loop: a destructive action the agent has paused on, awaiting
+// analyst approval before it is enforced.
+export interface PendingAction {
+  investigation_id: string;
+  user_id: string;
+  fc_id: string;
+  hint: string;
+  decision: string;
+  account_id: string;
+  reason: string;
+}
+
+// Analyst dispositions for the "reject the agent → pick a different outcome" flow.
+// (full_block === confirm fraud; "clear" is analyst-only — the agent never clears.)
+export const DISPOSITIONS: { id: string; label: string }[] = [
+  { id: "clear", label: "Clear (not fraud)" },
+  { id: "allow_monitor", label: "Allow & Monitor" },
+  { id: "temporary_freeze", label: "Temporary Freeze" },
+  { id: "full_block", label: "Full Block (Confirm Fraud)" },
+  { id: "escalate_compliance", label: "Escalate to Compliance" },
+];
+
+// A related prior investigation recalled from ADK long-term memory.
+export interface PriorCase {
+  investigation_id: string;
+  account_id?: string;
+  user_id?: string;
+  holder?: string;
+  typology?: string;
+  decision?: string;
+  matched_on?: string[];
+}
+
+// An action the agent actually enacted (after approval, or immediately for
+// non-destructive decisions).
+export interface EnactedAction {
+  status: string;
+  action: string;
+  account_id: string;
+  effect: string;
+  ok?: boolean;
 }
 
 export interface PerformanceMetrics {
@@ -121,7 +173,7 @@ export interface PerformanceMetrics {
 export interface InvestigationState {
   investigation_id?: string;
   user_id?: string;
-  status: "idle" | "connecting" | "running" | "completed" | "error";
+  status: "idle" | "connecting" | "running" | "awaiting_confirmation" | "completed" | "error";
   currentNode: string;
   currentPhase: string;
   steps: WorkflowStep[];
@@ -133,7 +185,17 @@ export interface InvestigationState {
   toolCalls: ToolCall[];
   agentIterations: number;
   finalAssessment?: FinalAssessment;
-  
+
+  // Parallel evidence-collection specialist findings (keyed by specialist id)
+  specialistFindings: Partial<Record<SpecialistName, string>>;
+
+  // Related prior cases recalled from long-term memory
+  priorCases: PriorCase[];
+
+  // Human-in-the-loop action approval
+  pendingAction?: PendingAction;
+  enactedActions: EnactedAction[];
+
   // Legacy evidence (for backwards compatibility)
   alertEvidence?: Record<string, any>;
   accountProfile?: Record<string, any>;
@@ -171,12 +233,18 @@ const initialState: InvestigationState = {
   traceEvents: [],
   toolCalls: [],
   agentIterations: 0,
+  enactedActions: [],
+  specialistFindings: {},
+  priorCases: [],
 };
 
 export function useInvestigation() {
   const [state, setState] = useState<InvestigationState>(initialState);
   const eventSourceRef = useRef<EventSource | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Latest pending action, kept in a ref so approveAction reads it without
+  // stale-closure or in-updater side effects.
+  const pendingActionRef = useRef<PendingAction | null>(null);
 
   // Cleanup function
   const cleanup = useCallback(() => {
@@ -195,31 +263,9 @@ export function useInvestigation() {
     return cleanup;
   }, [cleanup]);
 
-  // Start investigation
-  const startInvestigation = useCallback(
-    async (userId: string, investigationId?: string) => {
-      cleanup();
-
-      setState((prev) => ({
-        ...initialState,
-        status: "connecting",
-        user_id: userId,
-        investigation_id: investigationId,
-      }));
-
-      try {
-        // Build SSE URL - connect directly to backend
-        let url = `${BACKEND_URL}/investigation/${userId}/stream`;
-        if (investigationId) {
-          url += `?investigation_id=${investigationId}`;
-        }
-
-        console.log("[Investigation] Connecting to:", url);
-
-        // Create EventSource for SSE
-        const eventSource = new EventSource(url);
-        eventSourceRef.current = eventSource;
-
+  // Attach all SSE listeners to an EventSource. Shared by the initial run and
+  // the human-in-the-loop resume stream so both react to the same events.
+  const attachStreamListeners = useCallback((eventSource: EventSource) => {
         eventSource.onopen = () => {
           console.log("[Investigation] SSE connection opened");
           setState((prev) => ({
@@ -264,9 +310,25 @@ export function useInvestigation() {
                 params: trace.data.params || {},
                 timestamp: trace.timestamp || trace.data.timestamp,
                 iteration: trace.data.iteration || newIterations,
+                agent: trace.data.agent,
               };
               newToolCalls.push(toolCall);
-              console.log(`[Investigation] Tool call: ${toolCall.tool}`);
+              console.log(`[Investigation] Tool call: ${toolCall.tool} [${toolCall.agent || "?"}]`);
+            }
+
+            // A parallel specialist finished and reported its findings
+            let newFindings = prev.specialistFindings;
+            if (trace.type === "specialist_finding" && trace.data?.agent) {
+              newFindings = {
+                ...prev.specialistFindings,
+                [trace.data.agent as SpecialistName]: trace.data.finding || "",
+              };
+            }
+
+            // Cross-case memory recall surfaced related prior cases
+            let newPriorCases = prev.priorCases;
+            if (trace.type === "memory_recall" && Array.isArray(trace.data?.prior_cases)) {
+              newPriorCases = trace.data.prior_cases as PriorCase[];
             }
             
             // Track agent iterations
@@ -295,6 +357,8 @@ export function useInvestigation() {
               toolCalls: newToolCalls,
               agentIterations: newIterations,
               finalAssessment: newAssessment,
+              specialistFindings: newFindings,
+              priorCases: newPriorCases,
             };
           });
         });
@@ -348,9 +412,32 @@ export function useInvestigation() {
             if (data.agent_iterations !== undefined) {
               updates.agentIterations = data.agent_iterations;
             }
+            if (data.enacted_actions) {
+              updates.enactedActions = data.enacted_actions;
+            }
+            if (data.specialist_findings) {
+              updates.specialistFindings = data.specialist_findings;
+            }
+            if (data.prior_cases) {
+              updates.priorCases = data.prior_cases;
+            }
 
             return { ...prev, ...updates };
           });
+        });
+
+        // Handle 'action_confirmation_required' event (human-in-the-loop).
+        // The agent has paused on a destructive action; surface it for approval.
+        eventSource.addEventListener("action_confirmation_required", (event) => {
+          const data = JSON.parse(event.data) as PendingAction;
+          console.log("[Investigation] Action confirmation required:", data);
+          eventSource.close();
+          pendingActionRef.current = data;
+          setState((prev) => ({
+            ...prev,
+            status: "awaiting_confirmation",
+            pendingAction: data,
+          }));
         });
 
         // Handle 'metrics' event
@@ -370,6 +457,7 @@ export function useInvestigation() {
             ...prev,
             status: "completed",
             investigation_id: data.investigation_id,
+            pendingAction: undefined,
           }));
           eventSource.close();
         });
@@ -395,11 +483,14 @@ export function useInvestigation() {
         eventSource.onerror = (error) => {
           console.error("[Investigation] SSE error:", error, "readyState:", eventSource.readyState);
           if (eventSource.readyState === EventSource.CLOSED) {
-            setState((prev) => ({
-              ...prev,
-              status: prev.status === "completed" ? "completed" : "error",
-              error: prev.status === "completed" ? undefined : "Connection lost",
-            }));
+            setState((prev) => {
+              // Don't clobber a clean stop: completed runs and HITL pauses both
+              // close the stream on purpose.
+              if (prev.status === "completed" || prev.status === "awaiting_confirmation") {
+                return prev;
+              }
+              return { ...prev, status: "error", error: "Connection lost" };
+            });
           }
         };
 
@@ -407,6 +498,32 @@ export function useInvestigation() {
         eventSource.onmessage = (event) => {
           console.log("[Investigation] Generic message:", event.data);
         };
+  }, []);
+
+  // Start investigation
+  const startInvestigation = useCallback(
+    async (userId: string, investigationId?: string) => {
+      cleanup();
+
+      setState((prev) => ({
+        ...initialState,
+        status: "connecting",
+        user_id: userId,
+        investigation_id: investigationId,
+      }));
+
+      try {
+        // Build SSE URL - connect directly to backend
+        let url = `${BACKEND_URL}/investigation/${userId}/stream`;
+        if (investigationId) {
+          url += `?investigation_id=${investigationId}`;
+        }
+
+        console.log("[Investigation] Connecting to:", url);
+
+        const eventSource = new EventSource(url);
+        eventSourceRef.current = eventSource;
+        attachStreamListeners(eventSource);
       } catch (error) {
         setState((prev) => ({
           ...prev,
@@ -415,7 +532,36 @@ export function useInvestigation() {
         }));
       }
     },
-    [cleanup]
+    [cleanup, attachStreamListeners]
+  );
+
+  // Approve the agent's pending action, or reject it and (optionally) enact a
+  // different disposition (override). Opens the resume SSE stream.
+  const approveAction = useCallback(
+    (approved: boolean, override?: string) => {
+      const pending = pendingActionRef.current;
+      if (!pending) return;
+
+      cleanup();
+      pendingActionRef.current = null;
+      let url = `${BACKEND_URL}/investigation/${pending.investigation_id}/resume?approved=${approved}`;
+      if (!approved && override) url += `&override=${encodeURIComponent(override)}`;
+      console.log("[Investigation] Resuming with decision:", { approved, override, url });
+
+      try {
+        const eventSource = new EventSource(url);
+        eventSourceRef.current = eventSource;
+        attachStreamListeners(eventSource);
+        setState((prev) => ({ ...prev, status: "running", pendingAction: undefined }));
+      } catch (error) {
+        setState((prev) => ({
+          ...prev,
+          status: "error",
+          error: error instanceof Error ? error.message : "Failed to resume investigation",
+        }));
+      }
+    },
+    [cleanup, attachStreamListeners]
   );
 
   // Stop investigation
@@ -430,6 +576,7 @@ export function useInvestigation() {
   // Reset state
   const reset = useCallback(() => {
     cleanup();
+    pendingActionRef.current = null;
     setState(initialState);
   }, [cleanup]);
 
@@ -474,6 +621,9 @@ export function useInvestigation() {
         traceEvents: [],
         report: inv.report_markdown,
         agentIterations: inv.agent_iterations || 0,
+        enactedActions: inv.enacted_actions || [],
+        specialistFindings: inv.specialist_findings || {},
+        priorCases: inv.prior_cases || [],
       });
       
       console.log("[Investigation] Restored existing investigation state");
@@ -509,6 +659,7 @@ export function useInvestigation() {
     progress,
     startInvestigation,
     stopInvestigation,
+    approveAction,
     reset,
     getStepStatus,
     loadExistingInvestigation,

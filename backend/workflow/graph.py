@@ -1,47 +1,78 @@
 """
-LangGraph Workflow Definition
+LangGraph investigation workflow (ADK feature parity).
 
-Agentic 4-node workflow:
-1. Alert Validation - Get flag context
-2. Data Collection - Gather baseline evidence
-3. LLM Agent - Tool-calling agent that gathers more data as needed
-4. Report Generation - Generate final report
-
-The LLM Agent handles all the reasoning and tool calling internally.
+Pipeline:
+  alert_validation → data_collection → memory_recall → evidence_collection
+  (parallel specialists) → investigator → report_generation → action (HITL)
 """
 
-from typing import Dict, Any, AsyncGenerator, Sequence, Optional
+from __future__ import annotations
+
+import asyncio
 import logging
 import traceback
-import re
-import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.aerospike import AerospikeSaver
 from langgraph.checkpoint.base import ChannelVersions, Checkpoint, CheckpointMetadata
+from langgraph.graph import END, StateGraph
+from langgraph.types import interrupt
 from langchain_core.runnables import RunnableConfig
 
-from workflow.state import InvestigationState, create_initial_state
+from workflow.action_core import ALL_DECISIONS, DESTRUCTIVE_DECISIONS, execute_action
+from workflow.specialists import (
+    NETWORK_ANALYST_NAME,
+    DEVICE_ANALYST_NAME,
+    VELOCITY_ANALYST_NAME,
+    _SPECIALIST_SPECS,
+    _SPECIALIST_SYSTEM,
+    _SPECIALIST_TOOLS,
+)
+from workflow.assessment import build_evidence_summary
+from workflow.case_memory import recall_cases, store_case
+from workflow.llm import LLMConfig
+from workflow.nodes.langgraph_agent import call_llm
+from workflow.memory_service import get_memory_service
+from workflow.metrics import get_collector, remove_collector
 from workflow.nodes.alert_validation import alert_validation_node
 from workflow.nodes.data_collection import data_collection_node
-from workflow.nodes.llm_agent import llm_agent_node
-from workflow.nodes.report_generation import report_generation_node
-from workflow.metrics import get_collector, remove_collector
+from workflow.nodes.langgraph_agent import (
+    format_prior_cases,
+    format_specialist_findings,
+    run_tool_loop,
+)
+from workflow.nodes.report_generation import (
+    build_report_instruction,
+    finalize_report,
+    generate_fallback_report,
+)
+from workflow.state import InvestigationState, create_initial_state
+from workflow.tools.investigation_tools import InvestigationTools
 
-logger = logging.getLogger('investigation.workflow')
+logger = logging.getLogger("investigation.graph")
+
+APP_NAME = "fraud_investigation"
+
+_SPECIALIST_TOOL_NAMES = _SPECIALIST_TOOLS
+
+_TOOL_CALL_KEYS = {
+    NETWORK_ANALYST_NAME: "specialist_tool_calls_network_analyst",
+    DEVICE_ANALYST_NAME: "specialist_tool_calls_device_analyst",
+    VELOCITY_ANALYST_NAME: "specialist_tool_calls_velocity_analyst",
+}
+
+_FINDING_KEYS = {
+    NETWORK_ANALYST_NAME: "network_findings",
+    DEVICE_ANALYST_NAME: "device_findings",
+    VELOCITY_ANALYST_NAME: "velocity_findings",
+}
 
 
 class InstrumentedAerospikeSaver(AerospikeSaver):
-    """
-    Wraps AerospikeSaver to track checkpoint DB calls and timing
-    in the per-investigation MetricsCollector.
-    
-    Each checkpoint operation (put, put_writes, get_tuple) is timed
-    and recorded as a checkpoint call in the metrics.
-    """
-    
-    def _get_investigation_id(self, config: Optional[RunnableConfig]) -> Optional[str]:
-        """Extract investigation_id (thread_id) from LangGraph config."""
+    """Wrap AerospikeSaver to record checkpoint metrics."""
+
+    def _inv_id(self, config: Optional[RunnableConfig]) -> Optional[str]:
         try:
             return (config or {}).get("configurable", {}).get("thread_id")
         except Exception:
@@ -54,16 +85,17 @@ class InstrumentedAerospikeSaver(AerospikeSaver):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
-        inv_id = self._get_investigation_id(config)
+        import time
+
+        inv_id = self._inv_id(config)
         start = time.time()
         try:
-            result = super().put(config, checkpoint, metadata, new_versions)
-            return result
+            return super().put(config, checkpoint, metadata, new_versions)
         finally:
-            duration_ms = (time.time() - start) * 1000
             if inv_id:
                 try:
                     collector = get_collector(inv_id)
+                    duration_ms = (time.time() - start) * 1000
                     collector.track_checkpoint("put", duration_ms)
                     collector.track_db_call("checkpoint_put", "KV", duration_ms)
                 except Exception:
@@ -72,113 +104,370 @@ class InstrumentedAerospikeSaver(AerospikeSaver):
     def put_writes(
         self,
         config: RunnableConfig,
-        writes: Sequence[tuple[str, Any]],
+        writes,
         task_id: str,
         task_path: str = "",
     ) -> None:
-        inv_id = self._get_investigation_id(config)
+        import time
+
+        inv_id = self._inv_id(config)
         start = time.time()
         try:
             super().put_writes(config, writes, task_id, task_path)
         finally:
-            duration_ms = (time.time() - start) * 1000
             if inv_id:
                 try:
                     collector = get_collector(inv_id)
+                    duration_ms = (time.time() - start) * 1000
                     collector.track_checkpoint("put_writes", duration_ms)
                     collector.track_db_call("checkpoint_put_writes", "KV", duration_ms)
                 except Exception:
                     pass
 
     def get_tuple(self, config: RunnableConfig):
-        inv_id = self._get_investigation_id(config)
+        import time
+
+        inv_id = self._inv_id(config)
         start = time.time()
         try:
-            result = super().get_tuple(config)
-            return result
+            return super().get_tuple(config)
         finally:
-            duration_ms = (time.time() - start) * 1000
             if inv_id:
                 try:
                     collector = get_collector(inv_id)
+                    duration_ms = (time.time() - start) * 1000
                     collector.track_checkpoint("get_tuple", duration_ms)
                     collector.track_db_call("checkpoint_get", "KV", duration_ms)
                 except Exception:
                     pass
 
 
+def _evidence_entities(user_id: str, initial: Optional[Dict[str, Any]]) -> List[str]:
+    initial = initial or {}
+    ids = [user_id, *(initial.get("accounts") or {}).keys(), *(initial.get("devices") or {}).keys()]
+    return [i for i in ids if i]
+
+
+def _holder_name(initial: Optional[Dict[str, Any]]) -> str:
+    profile = (initial or {}).get("profile") or {}
+    return (
+        profile.get("name")
+        or profile.get("account_holder")
+        or f"{profile.get('first_name', '')} {profile.get('last_name', '')}".strip()
+    )
+
+
+def _counterparties(tool_calls: list) -> list:
+    out = set()
+    for tc in tool_calls or []:
+        tool = tc.get("tool")
+        if tool in ("get_counterparty_profile", "get_counterparty_transactions"):
+            uid = (tc.get("params") or {}).get("user_id")
+            if uid:
+                out.add(uid)
+        elif tool == "get_account_transactions":
+            for txn in ((tc.get("result") or {}).get("transactions") or []):
+                cp = txn.get("counterparty_user_id")
+                if cp:
+                    out.add(cp)
+    return list(out)
+
+
 def create_investigation_workflow(
     aerospike_service: Any,
     graph_service: Any,
-    ollama_client: Any = None  # Kept for backwards compatibility but not used
-) -> StateGraph:
-    """
-    Create the LangGraph investigation workflow.
-    
-    New 4-node agentic workflow:
-    - alert_validation: Get flag context from KV
-    - data_collection: Gather baseline evidence from KV + Graph
-    - llm_agent: ReAct agent that uses tools to gather more data
-    - report_generation: Generate final markdown report
-    
-    Args:
-        aerospike_service: Aerospike KV service instance
-        graph_service: Aerospike Graph service instance
-        ollama_client: (Deprecated) HTTP client for Ollama - agent handles this internally
-        
-    Returns:
-        Compiled StateGraph workflow
-    """
-    
-    # Create the workflow graph
+    llm_config: Optional[LLMConfig] = None,
+) -> Any:
+    """Build the compiled LangGraph workflow."""
+    llm_config = llm_config or LLMConfig.from_env()
+    memory_service = get_memory_service(aerospike_service)
+
+    async def _memory_recall(state: InvestigationState) -> Dict[str, Any]:
+        prior = await recall_cases(
+            memory_service,
+            APP_NAME,
+            _evidence_entities(state["user_id"], state.get("initial_evidence")),
+            exclude_investigation_id=state["investigation_id"],
+            exclude_user_id=state["user_id"],
+        )
+        trace = []
+        if prior:
+            trace.append(
+                {
+                    "type": "memory_recall",
+                    "node": "data_collection",
+                    "timestamp": datetime.now().isoformat(),
+                    "data": {"prior_cases": prior},
+                }
+            )
+        return {"prior_cases": prior, "trace_events": trace}
+
+    def _run_specialist(name: str, state: InvestigationState) -> Dict[str, Any]:
+        spec = _SPECIALIST_SPECS[name]
+        initial = state.get("initial_evidence") or {}
+        alert = state.get("alert_evidence") or {}
+        evidence = build_evidence_summary(initial, alert)
+        system = _SPECIALIST_SYSTEM.format(
+            role=spec["role"],
+            focus=spec["focus"],
+            max_calls=spec["max_calls"],
+            evidence=evidence,
+        )
+        metrics = get_collector(state["investigation_id"])
+        engine = InvestigationTools(
+            aerospike_service, graph_service, state["user_id"], metrics
+        )
+        result = run_tool_loop(
+            node_name=name,
+            system_prompt=system,
+            evidence=evidence,
+            allowed_tools=_SPECIALIST_TOOL_NAMES[name],
+            tools_engine=engine,
+            metrics=metrics,
+            llm_config=llm_config,
+            max_iterations=spec["max_calls"] + 1,
+            max_tool_calls=spec["max_calls"],
+        )
+        findings = result.get("findings_text", "")
+        traces = list(result.get("trace_events", []))
+        if findings:
+            traces.append(
+                {
+                    "type": "specialist_finding",
+                    "node": "llm_agent",
+                    "timestamp": datetime.now().isoformat(),
+                    "data": {"agent": name, "finding": findings[:1500]},
+                }
+            )
+        return {
+            _FINDING_KEYS[name]: findings,
+            _TOOL_CALL_KEYS[name]: result.get("tool_calls", []),
+            "trace_events": traces,
+        }
+
+    async def _evidence_collection(state: InvestigationState) -> Dict[str, Any]:
+        loop = asyncio.get_event_loop()
+        tasks = [
+            loop.run_in_executor(None, _run_specialist, name, state)
+            for name in (NETWORK_ANALYST_NAME, DEVICE_ANALYST_NAME, VELOCITY_ANALYST_NAME)
+        ]
+        results = await asyncio.gather(*tasks)
+        merged: Dict[str, Any] = {"trace_events": []}
+        for partial in results:
+            for key, value in partial.items():
+                if key == "trace_events":
+                    merged["trace_events"].extend(value)
+                else:
+                    merged[key] = value
+        merged["current_phase"] = "llm_reasoning"
+        return merged
+
+    def _investigator(state: InvestigationState) -> Dict[str, Any]:
+        initial = state.get("initial_evidence") or {}
+        alert = state.get("alert_evidence") or {}
+        evidence = build_evidence_summary(initial, alert) + format_prior_cases(
+            state.get("prior_cases") or []
+        )
+        findings = format_specialist_findings(state)
+        system = f"""You are a SENIOR FRAUD ANALYST synthesizing parallel specialist reports.
+
+Three specialists have ALREADY investigated in parallel. Use their findings as primary evidence.
+Call tools ONLY to resolve gaps or conflicts. Reach a decision in 0-3 tool calls when possible.
+
+## SPECIALIST FINDINGS
+{findings}
+
+When confident, call submit_assessment exactly once with typology, risk_level, risk_score,
+decision, account_id (primary flagged account), and reasoning. Then STOP.
+
+Valid decisions: allow_monitor, step_up_auth, temporary_freeze, full_block, escalate_compliance.
+"""
+        metrics = get_collector(state["investigation_id"])
+        engine = InvestigationTools(
+            aerospike_service, graph_service, state["user_id"], metrics
+        )
+        result = run_tool_loop(
+            node_name="llm_agent",
+            system_prompt=system,
+            evidence=evidence,
+            allowed_tools=[
+                "get_account_transactions",
+                "get_counterparty_profile",
+                "get_counterparty_transactions",
+                "get_account_risk_features",
+                "get_device_risk_features",
+                "detect_fraud_ring",
+                "get_transaction_network",
+            ],
+            tools_engine=engine,
+            metrics=metrics,
+            llm_config=llm_config,
+            max_iterations=15,
+            max_tool_calls=10,
+            include_submit=True,
+            initial_evidence=initial,
+            alert_evidence=alert,
+        )
+        assessment = result.get("final_assessment")
+        if assessment and not assessment.get("account_id"):
+            accounts = (initial.get("accounts") or {})
+            if accounts:
+                assessment = dict(assessment)
+                assessment["account_id"] = next(iter(accounts))
+        return {
+            "final_assessment": assessment,
+            "tool_calls": result.get("tool_calls", []),
+            "agent_iterations": result.get("agent_iterations", 0),
+            "tool_calls_count": len(result.get("tool_calls", [])),
+            "agent_messages": result.get("agent_messages", []),
+            "current_phase": "report",
+            "trace_events": result.get("trace_events", []),
+        }
+
+    def _report_generation(state: InvestigationState) -> Dict[str, Any]:
+        instruction = build_report_instruction(dict(state))
+        raw = ""
+        try:
+            raw = call_llm(
+                instruction + "\n\nWrite the full markdown report now.",
+                llm_config,
+            )
+        except Exception as exc:
+            logger.warning("Report LLM failed, using fallback: %s", exc)
+        report = finalize_report(raw, dict(state)) if raw.strip() else generate_fallback_report(dict(state))
+        return {
+            "report_markdown": report,
+            "current_phase": "awaiting_decision",
+            "trace_events": [
+                {
+                    "type": "node_complete",
+                    "node": "report_generation",
+                    "timestamp": datetime.now().isoformat(),
+                    "data": {"status": "success"},
+                }
+            ],
+        }
+
+    def _action(state: InvestigationState) -> Dict[str, Any]:
+        assessment = state.get("final_assessment") or {}
+        decision = (assessment.get("decision") or "allow_monitor").strip()
+        account_id = assessment.get("account_id") or ""
+        if not account_id:
+            accounts = (state.get("initial_evidence") or {}).get("accounts") or {}
+            account_id = next(iter(accounts), "")
+        reason = (assessment.get("reasoning") or "")[:300]
+
+        trace_events = [
+            {
+                "type": "action_proposed",
+                "node": "llm_agent",
+                "timestamp": datetime.now().isoformat(),
+                "data": {"decision": decision, "account_id": account_id, "reason": reason},
+            }
+        ]
+
+        enacted: List[Dict[str, Any]] = list(state.get("enacted_actions") or [])
+        pending = state.get("pending_confirmation")
+
+        if pending is not None:
+            approved = bool(pending.get("approved"))
+            override = pending.get("override")
+            if not approved and override:
+                enacted.append(
+                    execute_action(
+                        override,
+                        account_id,
+                        "Analyst override of the agent's recommendation",
+                    )
+                )
+                trace_events.append(
+                    {
+                        "type": "action_proposed",
+                        "node": "llm_agent",
+                        "timestamp": datetime.now().isoformat(),
+                        "data": {
+                            "decision": override,
+                            "account_id": account_id,
+                            "reason": "Analyst override",
+                        },
+                    }
+                )
+            elif approved and decision in ALL_DECISIONS:
+                enacted.append(execute_action(decision, account_id, reason))
+            return {
+                "enacted_actions": enacted,
+                "pending_confirmation": None,
+                "workflow_status": "completed",
+                "current_phase": "report",
+                "trace_events": trace_events,
+            }
+
+        if decision in DESTRUCTIVE_DECISIONS:
+            payload = {
+                "investigation_id": state["investigation_id"],
+                "user_id": state["user_id"],
+                "decision": decision,
+                "account_id": account_id,
+                "reason": reason,
+                "hint": (
+                    f"The AI agent recommends **{decision.replace('_', ' ')}** on account "
+                    f"{account_id}. Reason: {reason}. Approve this action?"
+                ),
+            }
+            response = interrupt(payload)
+            approved = bool((response or {}).get("approved"))
+            override = (response or {}).get("override")
+            if not approved and override:
+                enacted.append(
+                    execute_action(
+                        override,
+                        account_id,
+                        "Analyst override of the agent's recommendation",
+                    )
+                )
+            elif approved:
+                enacted.append(execute_action(decision, account_id, reason))
+            return {
+                "enacted_actions": enacted,
+                "workflow_status": "completed",
+                "current_phase": "report",
+                "trace_events": trace_events,
+            }
+
+        if decision in ALL_DECISIONS:
+            enacted.append(execute_action(decision, account_id, reason))
+        return {
+            "enacted_actions": enacted,
+            "workflow_status": "completed",
+            "current_phase": "report",
+            "trace_events": trace_events,
+        }
+
     workflow = StateGraph(InvestigationState)
-    
-    # ------------------------------------------
-    # Node 1: Alert Validation
-    # ------------------------------------------
-    def _alert_validation(state: InvestigationState) -> Dict[str, Any]:
-        return alert_validation_node(state, aerospike_service)
-    
-    workflow.add_node("alert_validation", _alert_validation)
-    
-    # ------------------------------------------
-    # Node 2: Data Collection (KV-only: profile, accounts, devices, features)
-    # ------------------------------------------
-    def _data_collection(state: InvestigationState) -> Dict[str, Any]:
-        return data_collection_node(state, aerospike_service, graph_service)
-    
-    workflow.add_node("data_collection", _data_collection)
-    
-    # ------------------------------------------
-    # Node 3: LLM Reasoning Agent (with tools)
-    # ------------------------------------------
-    def _llm_agent(state: InvestigationState) -> Dict[str, Any]:
-        return llm_agent_node(state, aerospike_service, graph_service)
-    
-    workflow.add_node("llm_agent", _llm_agent)
-    
-    # ------------------------------------------
-    # Node 4: Report Generation
-    # ------------------------------------------
-    async def _report_generation(state: InvestigationState) -> Dict[str, Any]:
-        return await report_generation_node(state, ollama_client)
-    
+
+    workflow.add_node(
+        "alert_validation",
+        lambda s: alert_validation_node(s, aerospike_service),
+    )
+    workflow.add_node(
+        "data_collection",
+        lambda s: data_collection_node(s, aerospike_service, graph_service),
+    )
+    workflow.add_node("memory_recall", _memory_recall)
+    workflow.add_node("evidence_collection", _evidence_collection)
+    workflow.add_node("investigator", _investigator)
     workflow.add_node("report_generation", _report_generation)
-    
-    # ------------------------------------------
-    # Define Edges (Linear Flow)
-    # ------------------------------------------
-    
-    # Set entry point
+    workflow.add_node("action", _action)
+
     workflow.set_entry_point("alert_validation")
-    
-    # Linear flow through all nodes
     workflow.add_edge("alert_validation", "data_collection")
-    workflow.add_edge("data_collection", "llm_agent")
-    workflow.add_edge("llm_agent", "report_generation")
-    workflow.add_edge("report_generation", END)
-    
-    # Compile the workflow with Aerospike checkpointer when KV is connected
+    workflow.add_edge("data_collection", "memory_recall")
+    workflow.add_edge("memory_recall", "evidence_collection")
+    workflow.add_edge("evidence_collection", "investigator")
+    workflow.add_edge("investigator", "report_generation")
+    workflow.add_edge("report_generation", "action")
+    workflow.add_edge("action", END)
+
     if aerospike_service is not None and aerospike_service.is_connected():
         try:
             saver = InstrumentedAerospikeSaver(
@@ -186,224 +475,75 @@ def create_investigation_workflow(
                 namespace=aerospike_service.namespace,
             )
             compiled = workflow.compile(checkpointer=saver)
-            logger.info("Investigation workflow compiled with Aerospike checkpointer (4-node agentic architecture)")
-        except Exception as e:
-            logger.error(f"Failed to create AerospikeSaver: {e}")
-            compiled = workflow.compile()
-            logger.info("Investigation workflow compiled without checkpointer (AerospikeSaver creation failed)")
-    else:
-        compiled = workflow.compile()
-        logger.info("Investigation workflow compiled without checkpointer (Aerospike KV unavailable)")
-    
+            logger.info("LangGraph workflow compiled with Aerospike checkpointer")
+            return compiled
+        except Exception as exc:
+            logger.error("Failed to create AerospikeSaver: %s", exc)
+
+    compiled = workflow.compile()
+    logger.info("LangGraph workflow compiled without checkpointer")
     return compiled
 
 
-async def run_investigation(
-    workflow: StateGraph,
-    user_id: str,
-    investigation_id: str
-) -> AsyncGenerator[Dict[str, Any], None]:
-    """
-    Run the investigation workflow and yield trace events.
-    
-    Args:
-        workflow: Compiled LangGraph workflow
-        user_id: User ID to investigate
-        investigation_id: Unique investigation ID
-        
-    Yields:
-        Trace events for SSE streaming
-    """
-    # Initialize metrics collector for this investigation
-    metrics_collector = get_collector(investigation_id)
-    metrics_collector.reset()
-    
-    # Create initial state
-    initial_state = create_initial_state(investigation_id, user_id)
-    
-    logger.info(f"Starting investigation {investigation_id} for user {user_id}")
-    
-    # Config for LangGraph: thread_id required for checkpointing; checkpoint_ns namespaces investigation checkpoints
-    config = {
-        "configurable": {"thread_id": investigation_id, "checkpoint_ns": "investigation"},
-        "recursion_limit": 50,
-    }
-    
-    # Run the workflow with streaming
-    current_node = None
-    try:
-        async for event in workflow.astream(initial_state, config):
-            # Extract node name and state updates
-            for node_name, state_update in event.items():
-                # Track node transitions for metrics
-                if current_node != node_name:
-                    if current_node:
-                        metrics_collector.end_node(current_node)
-                    metrics_collector.start_node(node_name)
-                    current_node = node_name
-                
-                # Yield trace events from the state update
-                if "trace_events" in state_update:
-                    for trace_event in state_update["trace_events"]:
-                        yield {
-                            "type": "trace",
-                            "event": trace_event
-                        }
-                
-                # Yield tool calls if present (for real-time UI updates)
-                if "tool_calls" in state_update and state_update["tool_calls"]:
-                    for tool_call in state_update["tool_calls"]:
-                        # Track tool call in metrics
-                        metrics_collector.track_tool_call(tool_call.get("tool", "unknown"))
-                        yield {
-                            "type": "tool_call",
-                            "node": node_name,
-                            "data": {
-                                "tool": tool_call.get("tool"),
-                                "params": tool_call.get("params"),
-                                "timestamp": tool_call.get("timestamp")
-                            }
-                        }
-                
-                # Yield state update (without trace events to avoid duplication)
-                state_copy = {k: v for k, v in state_update.items() if k != "trace_events"}
-                if state_copy:
-                    yield {
-                        "type": "state_update",
-                        "node": node_name,
-                        "data": state_copy
-                    }
-        
-        # End timing for the last node
-        if current_node:
-            metrics_collector.end_node(current_node)
-        
-        # Get final metrics
-        final_metrics = metrics_collector.get_metrics()
-        logger.info(f"Investigation {investigation_id} completed. Total time: {final_metrics['total_duration_ms']:.2f}ms, "
-                   f"DB calls: {final_metrics['total_db_calls']} (KV: {final_metrics['kv_calls']}, Graph: {final_metrics['graph_calls']}), "
-                   f"LLM calls: {final_metrics['llm_calls']}")
-        
-        # Yield metrics event
-        yield {
-            "type": "metrics",
-            "investigation_id": investigation_id,
-            "data": final_metrics
-        }
-        
-        # Yield completion event
-        yield {
-            "type": "complete",
-            "investigation_id": investigation_id,
-            "user_id": user_id
-        }
-        
-        # Clean up metrics collector
-        remove_collector(investigation_id)
-        
-    except Exception as e:
-        logger.error(f"Investigation workflow error: {e}")
-        logger.error(f"Full traceback:\n{traceback.format_exc()}")
-        
-        # Debug: Log what the checkpointer might be trying to serialize
-        logger.error("=" * 60)
-        logger.error("DEBUG: Analyzing serialization failure")
-        logger.error("=" * 60)
-        
-        try:
-            error_str = str(e)
-            
-            # Identify which set failed
-            if "lg_cp_w" in error_str:
-                logger.error("❌ Error is in WRITES storage (lg_cp_w set) - put_writes() failed")
-                logger.error("   This means List[Dict] of pending writes couldn't be serialized")
-            elif "lg_cp" in error_str:
-                logger.error("❌ Error is in CHECKPOINT storage (lg_cp set) - put() failed")
-            
-            # Parse the key from error message
-            key_match = re.search(r"\('(\w+)', '(\w+)', '([^']+)'\)", error_str)
-            if key_match:
-                namespace = key_match.group(1)
-                set_name = key_match.group(2)
-                key = key_match.group(3)
-                logger.error(f"   Namespace: {namespace}")
-                logger.error(f"   Set: {set_name}")
-                logger.error(f"   Key: {key}")
-                
-                # Parse key components
-                key_parts = key.split("|")
-                if len(key_parts) >= 3:
-                    logger.error(f"   Thread ID: {key_parts[0]}")
-                    logger.error(f"   Checkpoint NS: {key_parts[1]}")
-                    logger.error(f"   Checkpoint ID: {key_parts[2]}")
-            
-            # Check for serialization specific error
-            if "SERIALIZER_NONE" in error_str:
-                logger.error("")
-                logger.error("💡 ROOT CAUSE: Aerospike client has no serializer configured")
-                logger.error("   The AerospikeSaver is trying to store List[Dict] but Aerospike")
-                logger.error("   can only store primitives (int, str, bytes) without a serializer.")
-                logger.error("")
-                logger.error("   FIX: Add serializer to Aerospike client config:")
-                logger.error("   config = {")
-                logger.error("       'hosts': [...],")
-                logger.error("       'serialization': (pickle.dumps, pickle.loads)")
-                logger.error("   }")
-                
-        except Exception as debug_err:
-            logger.error(f"Debug logging failed: {debug_err}")
-        
-        logger.error("=" * 60)
-        
-        # Still emit partial metrics on error
-        try:
-            if current_node:
-                metrics_collector.end_node(current_node)
-            partial_metrics = metrics_collector.get_metrics()
-            yield {
-                "type": "metrics",
-                "investigation_id": investigation_id,
-                "data": partial_metrics
-            }
-        except Exception:
-            pass
-        
-        yield {
-            "type": "error",
-            "investigation_id": investigation_id,
-            "user_id": user_id,
-            "error": str(e)
-        }
-        
-        # Clean up metrics collector on error
-        remove_collector(investigation_id)
-
-
-def get_workflow_steps() -> list[Dict[str, str]]:
-    """Get list of workflow steps for UI display."""
+def get_workflow_steps() -> List[Dict[str, str]]:
+    """Four-step UI contract (same ids as ADK runner)."""
     return [
         {
             "id": "alert_validation",
             "name": "Alert Validation",
             "description": "Extract alert trigger context from flagged account",
-            "phase": "context"
+            "phase": "context",
         },
         {
             "id": "data_collection",
             "name": "Data Collection",
             "description": "Gather baseline profile, accounts, devices, transactions",
-            "phase": "evidence"
+            "phase": "evidence",
         },
         {
             "id": "llm_agent",
             "name": "AI Investigation Agent",
-            "description": "LLM agent uses tools to gather additional evidence and make assessment",
-            "phase": "reasoning"
+            "description": "LangGraph agent gathers evidence and makes an assessment",
+            "phase": "reasoning",
         },
         {
             "id": "report_generation",
             "name": "Report Generation",
             "description": "Generate detailed investigation report",
-            "phase": "report"
-        }
+            "phase": "report",
+        },
     ]
+
+
+async def persist_case_memory(
+    aerospike_service: Any,
+    state: Dict[str, Any],
+    investigation_id: str,
+    user_id: str,
+) -> None:
+    """Store compact case record for cross-case recall."""
+    memory_service = get_memory_service(aerospike_service)
+    initial = state.get("initial_evidence") or {}
+    assessment = state.get("final_assessment") or {}
+    specialist_calls = []
+    for key in _TOOL_CALL_KEYS.values():
+        specialist_calls.extend(state.get(key) or [])
+    tool_calls = specialist_calls + (state.get("tool_calls") or [])
+    enacted = state.get("enacted_actions") or []
+    decision = enacted[0].get("action") if enacted else assessment.get("decision")
+    await store_case(
+        memory_service,
+        APP_NAME,
+        {
+            "investigation_id": investigation_id,
+            "user_id": user_id,
+            "account_id": assessment.get("account_id")
+            or next(iter((initial.get("accounts") or {})), None),
+            "holder": _holder_name(initial),
+            "typology": assessment.get("typology"),
+            "decision": decision,
+            "entities": list(
+                dict.fromkeys(_evidence_entities(user_id, initial) + _counterparties(tool_calls))
+            ),
+        },
+    )

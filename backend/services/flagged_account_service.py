@@ -58,7 +58,7 @@ class FlaggedAccountService:
             "schedule_enabled": True,
             "schedule_time": "21:30",
             "cooldown_days": 7,
-            "risk_threshold": 50  # Lowered from 70 for demo data
+            "risk_threshold": 50  # Demo data: fraud bursts are injected within the recent feature window so they score >=50
         }
         
         # Ensure data directory exists
@@ -1091,9 +1091,112 @@ class FlaggedAccountService:
         except Exception as e:
             result["errors"].append(f"Resolution error: {e}")
             logger.error(f"Error resolving account {account_id}: {e}")
-        
+
         return result
-    
+
+    def freeze_account(self, account_id: str, notes: str = "", frozen: bool = True) -> Dict[str, Any]:
+        """Temporarily freeze (or unfreeze) an account — a REVERSIBLE hold, distinct
+        from confirming fraud.
+
+        Unlike resolve_account(confirmed_fraud), this does NOT set the account's
+        fraud_flag and does NOT flag the account's devices. It sets a separate,
+        reversible ``frozen`` flag on the Graph vertex + account-fact and moves the
+        user's flagged-account status to ``temporarily_frozen`` (still pending a
+        final fraud/clear decision). Pass ``frozen=False`` to lift the freeze.
+
+        Args:
+            account_id: The account ID (e.g., A000396803)
+            notes: Optional reason for the freeze
+            frozen: True to freeze, False to lift the freeze
+        """
+        action = "frozen" if frozen else "unfrozen"
+        result = {
+            "account_id": account_id,
+            "action": "freeze" if frozen else "unfreeze",
+            "success": False,
+            "graph_updated": False,
+            "kv_updated": False,
+            "errors": [],
+        }
+        now = datetime.now().isoformat()
+        try:
+            # Graph DB: set a reversible `frozen` property (NOT fraud_flag).
+            if self.graph_service and self.graph_service.client:
+                try:
+                    self.graph_service.client.V(account_id) \
+                        .property("frozen", frozen) \
+                        .property("frozen_reason", notes or f"Account {action} by analyst") \
+                        .property("frozen_date", now) \
+                        .iterate()
+                    result["graph_updated"] = True
+                except Exception as e:
+                    result["errors"].append(f"Graph update error: {e}")
+
+            # KV: mirror the frozen flag on the account-fact.
+            if self._use_aerospike():
+                try:
+                    account_fact = self._aerospike.get_account_fact(account_id)
+                    if account_fact:
+                        account_fact["frozen"] = frozen
+                        account_fact["frozen_reason"] = notes or f"Account {action} by analyst"
+                        account_fact["frozen_date"] = now
+                        self._aerospike.update_account_fact(account_id, account_fact)
+                        result["kv_updated"] = True
+                except Exception as e:
+                    result["errors"].append(f"KV update error: {e}")
+
+            # Move the user's flagged-account record to a reversible hold status.
+            if self._use_aerospike():
+                try:
+                    user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else None
+                    if user_id and self._aerospike.get_flagged_account(user_id):
+                        self._aerospike.update_flagged_account(user_id, {
+                            "status": "temporarily_frozen" if frozen else "pending_review",
+                            "frozen": frozen,
+                            "frozen_date": now,
+                            "resolution_notes": notes or f"Account {action} by analyst",
+                        })
+                        result["flagged_account_updated"] = True
+                except Exception as e:
+                    result["errors"].append(f"Flagged account update error: {e}")
+
+            result["success"] = result["graph_updated"] or result["kv_updated"]
+            logger.info(f"Account {account_id} {action} (reversible hold, not fraud).")
+        except Exception as e:
+            result["errors"].append(f"Freeze error: {e}")
+            logger.error(f"Error freezing account {account_id}: {e}")
+
+        return result
+
+    def mark_monitoring(self, account_id: str, notes: str = "") -> Dict[str, Any]:
+        """Move a flagged account to ``monitoring`` — allowed to stay active but kept
+        under watch. Used for the agent's non-destructive decisions (allow_monitor,
+        step_up_auth): the account is NOT fraud and NOT frozen, but it has been
+        reviewed and decided on, so it leaves the pending-review queue.
+        """
+        result = {"account_id": account_id, "action": "monitoring", "success": False, "errors": []}
+        if not self._use_aerospike():
+            result["errors"].append("Aerospike unavailable")
+            return result
+        try:
+            user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else account_id
+            if self._aerospike.get_flagged_account(user_id):
+                self._aerospike.update_flagged_account(user_id, {
+                    "status": "monitoring",
+                    "resolution": "monitoring",
+                    "resolution_date": datetime.now().isoformat(),
+                    "resolution_notes": notes or "Allowed under active monitoring by analyst",
+                })
+                result["success"] = True
+                result["flagged_account_updated"] = True
+                logger.info(f"Account {account_id} (user {user_id}) set to monitoring.")
+            else:
+                result["errors"].append(f"No flagged record for user {user_id}")
+        except Exception as e:
+            result["errors"].append(f"Monitoring update error: {e}")
+            logger.error(f"Error setting monitoring on {account_id}: {e}")
+        return result
+
     def get_flagged_stats(self) -> Dict[str, Any]:
         """Get statistics for flagged accounts."""
         if self._use_aerospike():
@@ -1103,16 +1206,20 @@ class FlaggedAccountService:
                 "total_flagged": 0,
                 "pending_review": 0,
                 "under_investigation": 0,
+                "temporarily_frozen": 0,
+                "monitoring": 0,
                 "confirmed_fraud": 0,
                 "cleared": 0,
                 "avg_risk_score": 0,
                 "total_flagged_amount": 0
             }
-        
+
         return {
             "total_flagged": len(accounts),
             "pending_review": len([a for a in accounts if a.get("status") == "pending_review"]),
             "under_investigation": len([a for a in accounts if a.get("status") == "under_investigation"]),
+            "temporarily_frozen": len([a for a in accounts if a.get("status") == "temporarily_frozen"]),
+            "monitoring": len([a for a in accounts if a.get("status") == "monitoring"]),
             "confirmed_fraud": len([a for a in accounts if a.get("status") == "confirmed_fraud"]),
             "cleared": len([a for a in accounts if a.get("status") == "cleared"]),
             "avg_risk_score": sum(a.get("risk_score", 0) for a in accounts) / len(accounts) if accounts else 0,

@@ -43,6 +43,7 @@ SET_TRANSACTIONS = 'transactions'      # PK = {account_id}:{year_month}
 SET_ACCOUNT_FACT = 'account_fact'      # PK = account_id
 SET_DEVICE_FACT = 'device_fact'        # PK = device_id
 SET_INVESTIGATIONS = 'investigations'  # PK = investigation_id
+SET_CASE_MEMORY = 'case_memory'          # cross-engine case recall (adk-aerospike, case_ prefix)
 
 # Aerospike bin name limit is 15 characters
 # Map long bin names to short versions
@@ -2018,10 +2019,17 @@ class AerospikeService:
             "evaluations": self.truncate_set(SET_EVALUATIONS),
             "history": self.truncate_set(SET_HISTORY),
             "investigations": self.truncate_set(SET_INVESTIGATIONS),
-            # LangGraph checkpoint sets
+            # LangGraph checkpoint sets (INVESTIGATION_ENGINE=langgraph)
             "lg_checkpoints": self.truncate_set("lg_cp"),
             "lg_checkpoint_writes": self.truncate_set("lg_cp_w"),
             "lg_checkpoint_meta": self.truncate_set("lg_cp_meta"),
+            # Cross-engine case memory (ADK + LangGraph via case_memory.py)
+            "case_memory": self.truncate_set(SET_CASE_MEMORY),
+            # Google ADK session/artifact sets (INVESTIGATION_ENGINE=adk only)
+            "adk_sessions": self.truncate_set("adk_sessions"),
+            "adk_app_state": self.truncate_set("adk_app_state"),
+            "adk_user_state": self.truncate_set("adk_user_state"),
+            "adk_artifacts": self.truncate_set("adk_artifacts"),
         }
     
     # ----------------------------------------------------------------------------------------------------------

@@ -21,7 +21,8 @@ import {
     TrendingUp,
     RefreshCw,
     CheckCircle,
-    XCircle
+    XCircle,
+    Snowflake
 } from 'lucide-react'
 import useSWR from 'swr'
 
@@ -47,6 +48,8 @@ interface FlaggedStats {
     total_flagged: number
     pending_review: number
     under_investigation: number
+    monitoring: number
+    temporarily_frozen: number
     confirmed_fraud: number
     cleared: number
     avg_risk_score: number
@@ -65,12 +68,22 @@ const statusConfig = {
         color: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400',
         icon: Clock
     },
-    under_investigation: { 
-        label: 'Under Investigation', 
+    under_investigation: {
+        label: 'Under Investigation',
         color: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
         icon: Shield
     },
-    confirmed_fraud: { 
+    monitoring: {
+        label: 'Monitoring',
+        color: 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-400',
+        icon: Shield
+    },
+    temporarily_frozen: {
+        label: 'Temporarily Frozen',
+        color: 'bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400',
+        icon: Clock
+    },
+    confirmed_fraud: {
         label: 'Confirmed Fraud', 
         color: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
         icon: XCircle
@@ -144,10 +157,10 @@ export default function FlaggedAccountsPage() {
             </div>
 
             {/* Stats Section */}
-            <div className="grid gap-4 md:grid-cols-4">
+            <div className="grid gap-4 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
                 {statsLoading ? (
                     <>
-                        {[...Array(4)].map((_, i) => (
+                        {[...Array(6)].map((_, i) => (
                             <Card key={i}>
                                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                                     <Skeleton className="h-4 w-24" />
@@ -183,6 +196,26 @@ export default function FlaggedAccountsPage() {
                         </Card>
                         <Card>
                             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                                <CardTitle className="text-sm font-medium">Monitoring</CardTitle>
+                                <Eye className="h-4 w-4 text-indigo-500" />
+                            </CardHeader>
+                            <CardContent>
+                                <div className="text-2xl font-bold text-indigo-600">{(stats.monitoring ?? 0).toLocaleString()}</div>
+                                <p className="text-xs text-muted-foreground">Allowed under active monitoring</p>
+                            </CardContent>
+                        </Card>
+                        <Card>
+                            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                                <CardTitle className="text-sm font-medium">Temporarily Frozen</CardTitle>
+                                <Snowflake className="h-4 w-4 text-cyan-500" />
+                            </CardHeader>
+                            <CardContent>
+                                <div className="text-2xl font-bold text-cyan-600">{(stats.temporarily_frozen ?? 0).toLocaleString()}</div>
+                                <p className="text-xs text-muted-foreground">Reversible hold pending review</p>
+                            </CardContent>
+                        </Card>
+                        <Card>
+                            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                                 <CardTitle className="text-sm font-medium">Confirmed Fraud</CardTitle>
                                 <XCircle className="h-4 w-4 text-red-500" />
                             </CardHeader>
@@ -203,7 +236,7 @@ export default function FlaggedAccountsPage() {
                         </Card>
                     </>
                 ) : (
-                    <div className="col-span-4 text-center py-4 text-muted-foreground">
+                    <div className="col-span-full text-center py-4 text-muted-foreground">
                         No stats available. Run a detection job to populate data.
                     </div>
                 )}
