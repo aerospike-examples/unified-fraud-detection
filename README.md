@@ -128,7 +128,7 @@ client    = aerospike_service.client
 namespace = aerospike_service.namespace
 
 self.session_service  = AerospikeSessionService(client, namespace)   # conversation + state
-self.memory_service   = AerospikeMemoryService(client, namespace)    # long-term, searchable
+self.memory_service   = get_memory_service(aerospike_service)        # case_memory set (both engines)
 self.artifact_service = AerospikeArtifactService(client, namespace)  # files (reports)
 
 self.runner = Runner(
@@ -144,7 +144,7 @@ self.runner = Runner(
 | ADK service | Aerospike role | Used in the demo for |
 |-------------|----------------|----------------------|
 | **SessionService** | Sessions + per-app/user/session state | The live investigation's evidence, parallel specialist findings, tool log, assessment, and enacted actions |
-| **MemoryService** | Durable, searchable memory | Cross-case recall — every investigation is stored and related prior cases are recalled by entity (see the spotlight) |
+| **MemoryService** | Durable, searchable memory (`case_memory` set) | Cross-case recall — every investigation is stored and related prior cases are recalled by entity (see the spotlight); shared by ADK and LangGraph |
 | **ArtifactService** | Binary/text artifacts | Persisting the final markdown report (`investigation_report.md`) |
 
 This means the agent's entire footprint — its working state, its long-term memory, and its output artifacts — lives in the **same Aerospike cluster** that powers the fraud graph. One datastore, one client, one operational surface.
@@ -194,17 +194,17 @@ Two correctness details worth noting, since fan-out shares one session:
 
 ### Feature spotlight: Cross-case memory
 
-ADK long-term memory (`AerospikeMemoryService`) is used as a **fraud-intelligence layer that spans investigations**. Every completed investigation is written to memory as a compact, entity-indexed case record (the account, its devices, the counterparties it touched, the typology, and the decision). When a new account is investigated, a **memory-recall pre-step** (before the agent runs) surfaces prior cases that referenced any of the suspect's entities — most usefully, cases where **this account appeared as a counterparty**:
+Cross-case memory (`AerospikeMemoryService` in the **`case_memory`** Aerospike set) is a **fraud-intelligence layer shared by both investigation engines**. Every completed investigation is written to memory as a compact, entity-indexed case record (the account, its devices, the counterparties it touched, the typology, and the decision). When a new account is investigated, a **memory-recall pre-step** (before the agent runs) surfaces prior cases that referenced any of the suspect's entities — most usefully, cases where **this account appeared as a counterparty**:
 
 > *"John Garcia was a counterparty in 2 prior confirmed-fraud investigations (Timothy Jones, Christopher Martinez — fraud_ring)."*
 
-The recalled cases are shown in the **Related Prior Cases** panel and injected into the investigator's prompt, so the agent reasons with relevant history. Memory lives in Aerospike (the `adk_memory` set) and **persists across data resets**, so it accumulates as a real case history.
+The recalled cases are shown in the **Related Prior Cases** panel and injected into the investigator's prompt, so the agent reasons with relevant history. Case memory lives in Aerospike (`case_memory` set) and accumulates across investigations until a full **Delete all data** reset.
 
-One implementation detail worth calling out: the `adk-aerospike` memory index tokenizes on `[A-Za-z]+` (it drops digits), so raw ids like `U0007387` collapse to `u` and match everything. We encode each id's digits to letters so every entity becomes a **unique alphabetic token** that survives the tokenizer and matches precisely — and pool all cases under one shared memory scope (ADK memory is keyed by `app_name + user_id`) so recall works across accounts.
+One implementation detail worth calling out: the `adk-aerospike` memory index tokenizes on `[A-Za-z]+` (it drops digits), so raw ids like `U0007387` collapse to `u` and match everything. We encode each id's digits to letters so every entity becomes a **unique alphabetic token** that survives the tokenizer and matches precisely — and pool all cases under one shared memory scope (memory is keyed by `app_name + user_id`) so recall works across accounts.
 
 ```
 investigate account B ──▶ memory recall (entities of B)
-                                 │  search ADK memory (AerospikeMemoryService)
+                                 │  search case_memory (AerospikeMemoryService)
                                  ▼
                     prior cases referencing B's account/devices,
                     or where B was a counterparty  ──▶ Related Prior Cases panel

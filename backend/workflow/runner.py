@@ -23,7 +23,6 @@ from google.adk.runners import Runner
 from google.genai import types
 from adk_aerospike import (
     AerospikeSessionService,
-    AerospikeMemoryService,
     AerospikeArtifactService,
 )
 
@@ -32,6 +31,7 @@ from workflow.agent import (
     SPECIALIST_NAMES, SPECIALIST_OUTPUT_KEYS,
 )
 from workflow.case_memory import recall_cases, store_case
+from workflow.memory_service import get_memory_service
 from workflow.plugins import MetricsPlugin
 from workflow.assessment import deterministic_assessment
 from workflow.nodes.report_generation import generate_fallback_report
@@ -63,7 +63,7 @@ class InvestigationRunner:
 
         # Reuse the live Aerospike client — no second connection.
         self.session_service = AerospikeSessionService(client, namespace)
-        self.memory_service = AerospikeMemoryService(client, namespace)
+        self.memory_service = get_memory_service(aerospike_service)
         self.artifact_service = AerospikeArtifactService(client, namespace)
 
         self.agent = build_investigation_agent(model)
@@ -78,7 +78,8 @@ class InvestigationRunner:
         logger.info("InvestigationRunner ready (Aerospike sessions/memory/artifacts)")
 
     def close(self):
-        for svc in (self.session_service, self.memory_service, self.artifact_service):
+        # memory_service is a shared singleton — do not close it here.
+        for svc in (self.session_service, self.artifact_service):
             try:
                 svc.close()
             except Exception:

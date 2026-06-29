@@ -1,11 +1,12 @@
 """
-Cross-case memory (ADK MemoryService showcase)
+Cross-case memory (shared by ADK and LangGraph)
 
-Every completed investigation is written to ADK long-term memory
-(``AerospikeMemoryService``) as a compact *case record*. When a new account is
-investigated, we recall prior cases that referenced any of its entities (the
-account itself, its devices, or — crucially — cases where this account appeared
-as a *counterparty*). This surfaces fraud intelligence that spans investigations:
+Every completed investigation is written to long-term Aerospike memory
+(``AerospikeMemoryService`` in the ``case_memory`` set) as a compact *case
+record*. When a new account is investigated, we recall prior cases that
+referenced any of its entities (the account itself, its devices, or — crucially
+— cases where this account appeared as a *counterparty*). This surfaces fraud
+intelligence that spans investigations:
 "this account was a counterparty in a confirmed-fraud case last week."
 
 Implementation note — the adk-aerospike memory index tokenizes on ``[A-Za-z]+``
@@ -41,7 +42,7 @@ def _encode(ids: List[str]) -> str:
 
 
 async def store_case(memory_service: Any, app_name: str, case: Dict[str, Any]) -> None:
-    """Persist one completed investigation to ADK long-term memory.
+    """Persist one completed investigation to the shared case-memory store.
 
     ``case`` must include: investigation_id, user_id, account_id, holder,
     typology, decision, status, and entities (list of ids it touched —
