@@ -39,14 +39,14 @@ def _trace(node: str, type_: str, data: Dict[str, Any]) -> TraceEvent:
 
 
 def _call_ollama(base_url: str, model: str, prompt: str) -> str:
-    with httpx.Client(timeout=300.0) as client:
+    with httpx.Client(timeout=600.0) as client:
         response = client.post(
             f"{base_url}/api/generate",
             json={
                 "model": model,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"temperature": 0.3, "num_predict": 1500},
+                "options": {"temperature": 0.3, "num_predict": 800},
             },
         )
         response.raise_for_status()
