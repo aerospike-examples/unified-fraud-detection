@@ -86,7 +86,7 @@ services:
       - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
       - INVESTIGATION_ENGINE=${INVESTIGATION_ENGINE:-adk}
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
-      - ADK_MODEL=${ADK_MODEL:-gemini-3.5-flash}
+      - ADK_MODEL=${ADK_MODEL:-gemini-3.1-flash-lite}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:1b}
     volumes:
