@@ -98,7 +98,7 @@ async def lifespan(app: FastAPI):
         from workflow.llm import LLMConfig
 
         llm_cfg = LLMConfig.from_env()
-        if llm_cfg.provider == "gemini":
+        if llm_cfg.provider == "gemini" and investigation_engine != "mock":
             await log_gemini_health(llm_cfg.model)
     except Exception as e:
         logger.warning(f"Gemini health check could not run: {e}")

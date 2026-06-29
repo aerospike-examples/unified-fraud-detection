@@ -5,6 +5,7 @@ Select backend via ``INVESTIGATION_ENGINE`` environment variable:
 
 - ``adk`` (default) — Google ADK SequentialAgent
 - ``langgraph`` — LangGraph StateGraph with feature parity
+- ``mock`` — deterministic engine with no LLM calls (tests and demos)
 """
 
 import os
@@ -13,7 +14,7 @@ from typing import Any, Optional, Tuple
 from workflow.engines.base import BaseInvestigationEngine
 from workflow.llm import LLMConfig
 
-SUPPORTED_ENGINES: Tuple[str, ...] = ("adk", "langgraph")
+SUPPORTED_ENGINES: Tuple[str, ...] = ("adk", "langgraph", "mock")
 
 
 def get_engine(
@@ -34,6 +35,10 @@ def get_engine(
         from workflow.engines.adk_engine import AdkEngine
 
         return AdkEngine(aerospike_service, graph_service, llm_config)
+    if engine_name == "mock":
+        from workflow.engines.mock_engine import MockEngine
+
+        return MockEngine(aerospike_service, graph_service, llm_config)
 
     raise ValueError(
         f"Unknown INVESTIGATION_ENGINE '{engine_name}'. Supported: {', '.join(SUPPORTED_ENGINES)}"
@@ -50,6 +55,10 @@ def __getattr__(name: str):
         from workflow.engines.langgraph_engine import LangGraphEngine
 
         return LangGraphEngine
+    if name == "MockEngine":
+        from workflow.engines.mock_engine import MockEngine
+
+        return MockEngine
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -57,6 +66,7 @@ __all__ = [
     "BaseInvestigationEngine",
     "AdkEngine",
     "LangGraphEngine",
+    "MockEngine",
     "get_engine",
     "SUPPORTED_ENGINES",
 ]

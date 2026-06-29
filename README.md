@@ -72,23 +72,45 @@ This project is a reference for two things:
 
 ## 🤖 Agentic Layer — ADK or LangGraph
 
-The investigation backend exposes **two interchangeable engines** behind a common interface (`backend/workflow/engines/`). Both emit the same SSE event contract, so the frontend works unchanged.
+The investigation backend exposes **three interchangeable engines** behind a common interface (`backend/workflow/engines/`). Both emit the same SSE event contract, so the frontend works unchanged.
 
 | Setting | Values | Default |
 |---------|--------|---------|
-| `INVESTIGATION_ENGINE` | `adk`, `langgraph` | `adk` |
+| `INVESTIGATION_ENGINE` | `adk`, `langgraph`, `mock` | `adk` |
 | `LLM_PROVIDER` | `gemini`, `ollama` | `gemini` |
 
 - **`adk`** — Google ADK `SequentialAgent` + `Runner` (`backend/workflow/runner.py`, `agent.py`). Uses Aerospike for ADK session/memory/artifact services.
 - **`langgraph`** — LangGraph `StateGraph` with the same pipeline (parallel specialists → investigator → report → gated action) and feature parity: cross-case memory, HITL approval, disposition overrides, specialist findings, and enacted actions (`backend/workflow/graph.py`).
+- **`mock`** — Deterministic engine with **no LLM calls**: runs real alert-validation and data-collection against Aerospike, then synthesizes specialist traces, assessment, report, and optional HITL using rule-based helpers. Ideal for integration tests and conference demos without Gemini quota. Set `MOCK_FORCE_HITL=true` to always exercise the approval UI.
 
 Set in `.env` before starting the backend:
 
 ```bash
-INVESTIGATION_ENGINE=adk          # or langgraph
+INVESTIGATION_ENGINE=adk          # adk | langgraph | mock
 LLM_PROVIDER=gemini               # or ollama (OLLAMA_BASE_URL, OLLAMA_MODEL)
 ADK_MODEL=gemini-3.5-flash
 ```
+
+## Testing
+
+Offline tests live in `backend/tests/` and use the **mock engine** — no Docker, Gemini, or Aerospike required.
+
+```bash
+cd backend
+pip install -r requirements.txt   # includes pytest + pytest-asyncio
+pytest tests/ -v                  # 50+ unit + integration + stress tests
+pytest tests/ -m stress -v        # concurrency (25 parallel investigations by default)
+STRESS_CONCURRENCY=100 pytest tests/ -m stress -v
+```
+
+| Layer | What it covers |
+|-------|----------------|
+| Unit | Assessment rules, report generation, case-memory encoding, metrics |
+| Integration | `InvestigationService` SSE contract, HITL pause/resume, KV persistence |
+| Stress | Concurrent and sequential investigations, collector thread safety |
+| Live (optional) | `pytest tests/ -m integration` when stack is on `localhost:4000` |
+
+Set `INVESTIGATION_ENGINE=mock` in `.env` for live-stack smoke tests without LLM quota.
 
 ## 🤖 Agentic Layer — Google ADK (default engine)
 

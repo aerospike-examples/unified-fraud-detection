@@ -12,7 +12,7 @@ class TestEngineFactory(unittest.TestCase):
     def test_supported_engines(self):
         from workflow.engines import SUPPORTED_ENGINES
 
-        self.assertEqual(SUPPORTED_ENGINES, ("adk", "langgraph"))
+        self.assertEqual(SUPPORTED_ENGINES, ("adk", "langgraph", "mock"))
 
     def test_unknown_engine_raises(self):
         from workflow.engines import get_engine
@@ -48,6 +48,14 @@ class TestEngineFactory(unittest.TestCase):
         fake.is_connected.return_value = False
         eng = get_engine("langgraph", fake, fake)
         self.assertEqual(eng.engine_name, "langgraph")
+
+    def test_get_engine_mock(self):
+        from workflow.engines import get_engine
+
+        fake = MagicMock()
+        fake.is_connected.return_value = False
+        eng = get_engine("mock", fake, fake)
+        self.assertEqual(eng.engine_name, "mock")
 
 
 class TestActionCore(unittest.TestCase):
