@@ -51,21 +51,6 @@ services:
       interval: 5s
       timeout: 10s
       retries: 4
-  ollama:
-    image: ollama/ollama:latest
-    container_name: asgraph-ollama
-    volumes:
-      - ollama_data:/root/.ollama
-    networks:
-      - asgraph_net
-    ports:
-      - "11434:11434"
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list || exit 0"]
-      interval: 10s
-      timeout: 30s
-      retries: 5
-      start_period: 30s
   backend:
     build:
       context: .
@@ -76,8 +61,6 @@ services:
         condition: service_healthy
       aerospike-graph-service:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
     environment:
       - AEROSPIKE_HOST=aerospike-db
       - AEROSPIKE_KV_PORT=3000
@@ -87,8 +70,9 @@ services:
       - INVESTIGATION_ENGINE=${INVESTIGATION_ENGINE:-adk}
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
       - ADK_MODEL=${ADK_MODEL:-gemini-3.1-flash-lite}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:1b}
+      # Optional: host Ollama when LLM_PROVIDER=ollama (not part of compose)
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-mistral}
     volumes:
       - ./data:/data
     healthcheck:
@@ -183,6 +167,5 @@ networks:
     name: asgraph_net
 
 volumes:
-  ollama_data:
   prometheus_data:
   grafana_data:
