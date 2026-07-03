@@ -87,6 +87,27 @@ class FlaggedAccountService:
     def _use_aerospike(self) -> bool:
         """Check if we should use Aerospike for storage."""
         return self._aerospike is not None and self._aerospike.is_connected()
+
+    def _owner_user_id(self, account_id: str) -> Optional[str]:
+        """
+        Resolve the user who owns an account.
+
+        Authoritative source is the graph OWNS edge, which works for any id scheme
+        (including the remote-mode Account{n} -> User{n} bulk-load convention). Falls
+        back to the legacy A{user}{suffix} derivation only for that specific scheme
+        when the graph is unavailable.
+        """
+        try:
+            if self.graph_service and self.graph_service.client:
+                owners = self.graph_service.client.V(account_id).in_("OWNS").id_().limit(1).to_list()
+                if owners:
+                    return str(owners[0])
+        except Exception as e:
+            logger.debug(f"owner resolve via graph failed for {account_id}: {e}")
+        # Legacy fallback for the old A{user}{2-char-suffix} id scheme only.
+        if account_id and account_id.startswith('A') and not account_id.startswith('Account') and len(account_id) > 3:
+            return f"U{account_id[1:-2]}"
+        return None
     
     def _load_data(self):
         """Load persisted data from files."""
@@ -640,9 +661,8 @@ class FlaggedAccountService:
                             "fraud_date": datetime.now().isoformat()
                         })
                     
-                    # Also flag device in user's devices map
-                    # Get user_id from account_id (format: A{user_id}{suffix})
-                    user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else None
+                    # Also flag device in user's devices map (owner via graph OWNS)
+                    user_id = self._owner_user_id(account_id)
                     if user_id:
                         self._aerospike.flag_device_in_user(user_id, device_id, True)
                 
@@ -998,7 +1018,7 @@ class FlaggedAccountService:
                 if self._use_aerospike():
                     try:
                         # Get user_id from account_id (format: A{user_id}{suffix})
-                        user_id_for_flag = f"U{account_id[1:-2]}" if account_id.startswith('A') else None
+                        user_id_for_flag = self._owner_user_id(account_id)
                         if user_id_for_flag:
                             self._aerospike.flag_account_in_user(user_id_for_flag, account_id, True)
                     except Exception as e:
@@ -1015,7 +1035,7 @@ class FlaggedAccountService:
                     try:
                         # Get user_id from account_id (format: A{user_id}{suffix})
                         # Account A894002 belongs to user U8940
-                        user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else None
+                        user_id = self._owner_user_id(account_id)
                         if user_id:
                             flagged_account = self._aerospike.get_flagged_account(user_id)
                             if flagged_account:
@@ -1060,7 +1080,7 @@ class FlaggedAccountService:
                 # Clear fraud flag for account in user's accounts map (KV users set)
                 if self._use_aerospike():
                     try:
-                        user_id_for_flag = f"U{account_id[1:-2]}" if account_id.startswith('A') else None
+                        user_id_for_flag = self._owner_user_id(account_id)
                         if user_id_for_flag:
                             self._aerospike.flag_account_in_user(user_id_for_flag, account_id, False)
                     except Exception as e:
@@ -1070,7 +1090,7 @@ class FlaggedAccountService:
                 if self._use_aerospike():
                     try:
                         # Get user_id from account_id (format: A{user_id}{suffix})
-                        user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else None
+                        user_id = self._owner_user_id(account_id)
                         if user_id:
                             flagged_account = self._aerospike.get_flagged_account(user_id)
                             if flagged_account:

@@ -45,7 +45,7 @@ const Stat = ({
                             loading ? (
                                 <Skeleton className="h-[28px] w-[120px] rounded-2xl mb-[2px] mt-[2px]" />
                             ): (
-                                <p className="text-2xl font-bold">{typeof stat === 'number' ? stat.toLocaleString('en-US') : stat}</p>
+                                <p className="text-2xl font-bold">{stat == null ? '—' : (typeof stat === 'number' ? stat.toLocaleString('en-US') : stat)}</p>
                             )
                         )}
                         {subtitle && <p className="text-xs text-muted-foreground">{subtitle}</p>}

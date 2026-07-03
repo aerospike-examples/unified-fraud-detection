@@ -5,7 +5,9 @@ Gathers initial evidence from Aerospike KV store before the LLM agent takes over
 Collects user profile, accounts, devices, and pre-computed risk features.
 The LLM agent decides what additional data to pull via tools.
 
-Data Source: Aerospike KV only (no Graph queries)
+Data Source: Aerospike KV. In remote mode, the KV working set for the user is
+lazily materialized from the Graph on a cache miss (see _ensure_remote_hydration)
+before the KV reads run.
 """
 
 from datetime import datetime
@@ -22,7 +24,7 @@ logger = logging.getLogger('investigation.data_collection')
 def data_collection_node(
     state: InvestigationState,
     aerospike_service: Any,
-    graph_service: Any  # kept in signature for compatibility but NOT used
+    graph_service: Any  # used in remote mode for lazy KV hydration on cache miss
 ) -> Dict[str, Any]:
     """
     Collect initial evidence for LLM reasoning agent from KV store.
@@ -64,6 +66,14 @@ def data_collection_node(
     ))
     
     try:
+        # 0. Remote mode: the KV working set is populated lazily. If this user's
+        # record hasn't been materialized yet, build it from the Graph now so the
+        # KV reads below hit real data (and the cache is warm next time).
+        start = time.time()
+        hydrated = _ensure_remote_hydration(aerospike_service, graph_service, user_id)
+        if hydrated:
+            metrics.track_db_call("hydrate_from_graph", "Graph", (time.time() - start) * 1000)
+
         # 1. User Profile from KV
         start = time.time()
         user_profile = _get_user_profile(aerospike_service, user_id)
@@ -173,6 +183,29 @@ def data_collection_node(
             "error_message": str(e),
             "trace_events": trace_events
         }
+
+
+def _ensure_remote_hydration(aerospike_service: Any, graph_service: Any, user_id: str) -> bool:
+    """
+    In remote mode, lazily materialize this user's KV working set from the Graph
+    when it's missing. No-op in local mode or when a KV record already exists.
+
+    Returns True only when a hydration pass actually built the record, so callers
+    can attribute the Graph latency. Never raises: hydration is best-effort and the
+    node continues (with whatever KV data exists) on failure.
+    """
+    try:
+        import settings
+        if not settings.is_remote_mode():
+            return False
+        from services.hydration_service import HydrationService
+        # Cheap short-circuit if already present (avoids constructing the service).
+        if aerospike_service and aerospike_service.get_user(user_id):
+            return False
+        return HydrationService(graph_service, aerospike_service).ensure_user_hydrated(user_id)
+    except Exception as e:
+        logger.warning(f"Remote hydration skipped for user {user_id}: {e}")
+        return False
 
 
 def _get_user_profile(aerospike_service: Any, user_id: str) -> Dict[str, Any]:

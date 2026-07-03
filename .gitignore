@@ -58,6 +58,9 @@ data/
 .env.test.local
 .env.production.local
 
+# Maven shade plugin build artifact
+loadgen/dependency-reduced-pom.xml
+
 # Docker
 docker-compose.override.yml
 

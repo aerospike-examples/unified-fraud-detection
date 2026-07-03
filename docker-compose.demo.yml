@@ -1,0 +1,38 @@
+# Demo deployment: app only — Aerospike KV + AGS run on separate GCP VMs.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    container_name: fraud-demo-backend
+    environment:
+      - AEROSPIKE_HOST=${AEROSPIKE_HOST:-10.50.0.62}
+      - AEROSPIKE_KV_PORT=${AEROSPIKE_KV_PORT:-3000}
+      - AEROSPIKE_NAMESPACE=${AEROSPIKE_NAMESPACE:-test}
+      - GRAPH_HOST_ADDRESS=${GRAPH_HOST_ADDRESS:-10.128.0.41}
+      # local = KV-backed counts + full Admin pipeline; remote = graph-summary
+      # counts, externally-loaded data, Admin write ops disabled.
+      - DATA_SOURCE_MODE=${DATA_SOURCE_MODE:-remote}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      - DATA_DIR=/data
+    volumes:
+      - ./data:/data
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    container_name: fraud-demo-frontend
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:4000
+      - NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL:-http://localhost:4000}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

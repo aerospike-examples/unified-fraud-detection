@@ -84,7 +84,7 @@ export default function Main() {
                         <Skeleton className='w-[80px] h-[28px] rounded-full'/>
                     ) : (
                         <div className="text-2xl font-bold">
-                            {stats?.fraud_rate?.toFixed(1) || '0'}%
+                            {stats?.fraud_rate != null ? `${stats.fraud_rate.toFixed(1)}%` : '—'}
                         </div>
                     )}
                     <p className="text-sm text-muted-foreground">Accuracy of fraud detection</p>

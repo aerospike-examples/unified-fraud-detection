@@ -35,6 +35,7 @@ AEROSPIKE_NAMESPACE = os.environ.get('AEROSPIKE_NAMESPACE', 'test')
 SET_USERS = 'users'
 SET_EVALUATIONS = 'evaluations'
 SET_FLAGGED_ACCOUNTS = 'flagged_accounts'
+SET_FRAUD_FEED = 'fraud_feed'  # single record: recent-fraud update queue (remote mode)
 SET_WORKFLOW = 'workflow'
 SET_CONFIG = 'config'
 SET_HISTORY = 'detection_history'
@@ -1325,6 +1326,34 @@ class AerospikeService:
     def clear_all_flagged_accounts(self) -> bool:
         """Clear all flagged accounts."""
         return self.truncate_set(SET_FLAGGED_ACCOUNTS)
+
+    def get_fraud_feed(self) -> Optional[Dict[str, Any]]:
+        """
+        Read the fraud-update feed (remote mode): a single record the external
+        load-gen writes after injecting a fraud cohort. Lets the frontend detect
+        a new injection run and refresh the review queue without a full scan.
+
+        Returns a dict like:
+          {run_id, run_started, last_updated, total, recent: [ {user_id, account_id,
+           risk_score, reason, ts}, ... ]}
+        or None when no feed record exists yet.
+        """
+        rec = self.get(SET_FRAUD_FEED, SET_FRAUD_FEED)
+        if not rec:
+            return None
+        recent = rec.get('recent') or []
+        # Newest first for display convenience.
+        try:
+            recent = list(reversed(recent))
+        except Exception:
+            recent = recent
+        return {
+            'run_id': rec.get('run_id'),
+            'run_started': rec.get('run_started'),
+            'last_updated': rec.get('last_updated'),
+            'total': int(rec.get('total') or 0),
+            'recent': recent,
+        }
     
     # ----------------------------------------------------------------------------------------------------------
     # Workflow Operations
@@ -1939,6 +1968,54 @@ class AerospikeService:
                 "amount": 0.0, "fraud_rate": 0.0, "health": "error"
             }
     
+    def get_working_set_counts(self) -> Dict[str, int]:
+        """
+        Count only the small KV working-set sets (flagged accounts + features).
+
+        Used in remote mode where the KV `users`/`transactions` sets are empty
+        (data lives in the Graph), so we avoid the full users scan in get_stats().
+        """
+        def _count_set(set_name: str) -> int:
+            count = 0
+            try:
+                s = self.client.scan(self.namespace, set_name)
+                def inc(record):
+                    nonlocal count
+                    count += 1
+                s.foreach(inc)
+            except Exception:
+                pass
+            return count
+
+        if not self.is_connected():
+            return {
+                "flagged_accounts_count": 0,
+                "account_facts_count": 0,
+                "device_facts_count": 0,
+                "transaction_records_count": 0,
+            }
+
+        return {
+            "flagged_accounts_count": _count_set(SET_FLAGGED_ACCOUNTS),
+            "account_facts_count": _count_set(SET_ACCOUNT_FACT),
+            "device_facts_count": _count_set(SET_DEVICE_FACT),
+            "transaction_records_count": _count_set(SET_TRANSACTIONS),
+        }
+
+    def get_remote_aggregate_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        Read the optional aggregate-stats record written by the external
+        load-gen pipeline (remote mode).
+
+        Contract: key 'aggregate_stats' in the 'config' set, e.g.
+            {"total_amount": 1234567.0, "fraud_rate": 3.2,
+             "flagged": 1024, "users": 1000000000, "txns": 3000000000}
+        Any subset of fields is allowed. Returns None if not present.
+        """
+        if not self.is_connected():
+            return None
+        return self.get(SET_CONFIG, 'aggregate_stats')
+
     def get_stats(self) -> Dict[str, Any]:
         """
         Get statistics about stored data.

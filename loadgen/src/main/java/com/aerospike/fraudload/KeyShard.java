@@ -16,4 +16,5 @@ public final class KeyShard {
 
     public int firstIndex() { return firstIndex; }
     public int endIndex() { return endIndex; }
+    public int size() { return endIndex - firstIndex; }
 }

@@ -12,7 +12,15 @@ public record Transaction(
         long amountCents,
         String type,
         String location,
-        Instant timestamp) {
+        Instant timestamp,
+        boolean fraud,
+        double fraudScore) {
+
+    /** Convenience constructor for benign transactions (fraud=false, score=0). */
+    public Transaction(String txnId, String senderAccountId, String receiverAccountId,
+                       long amountCents, String type, String location, Instant timestamp) {
+        this(txnId, senderAccountId, receiverAccountId, amountCents, type, location, timestamp, false, 0.0);
+    }
 
     /** The per-entry map stored under the txs map, keyed by ISO timestamp. */
     public Map<String, Object> toEntry(String direction, String counterparty) {
@@ -23,8 +31,9 @@ public record Transaction(
         m.put("counterparty", counterparty);
         m.put("direction", direction);
         m.put("location", location);
-        m.put("status", "completed");
-        m.put("is_fraud", false);
+        m.put("status", fraud ? "flagged" : "completed");
+        m.put("is_fraud", fraud);
+        m.put("fraud_score", fraudScore);
         return m;
     }
 }

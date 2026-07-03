@@ -8,7 +8,7 @@ from gremlin_python.driver.driver_remote_connection import DriverRemoteConnectio
 from gremlin_python.driver.aiohttp.transport import AiohttpTransport
 from gremlin_python.process.anonymous_traversal import traversal
 from gremlin_python.process.graph_traversal import __
-from gremlin_python.process.traversal import T
+from gremlin_python.process.traversal import T, Order
 
 # Get logger for graph service
 logger = logging.getLogger('fraud_detection.graph')
@@ -19,6 +19,9 @@ class GraphService:
         self.port = port
         self.client = None
         self.connection = None
+        # Cached graph summary (used for billion-scale stats in remote mode)
+        self._summary_cache: Optional[Dict[str, Any]] = None
+        self._summary_cache_ts: float = 0.0
     
 
     # ----------------------------------------------------------------------------------------------------------
@@ -108,7 +111,457 @@ class GraphService:
         except Exception as e:
             logger.error(f"Error getting graph summary: {e}")
             return {}
-        
+
+    def get_graph_summary_cached(self, ttl_seconds: int = 30) -> Dict[str, Any]:
+        """
+        Cached wrapper around get_graph_summary().
+
+        At billion scale the summary API is cheap (it reads maintained metadata),
+        but dashboard polling can be frequent, so we memoize the result for a
+        short TTL to avoid hammering AGS.
+        """
+        now = time.time()
+        if self._summary_cache is not None and (now - self._summary_cache_ts) < ttl_seconds:
+            return self._summary_cache
+
+        summary = self.get_graph_summary()
+        if summary:
+            self._summary_cache = summary
+            self._summary_cache_ts = now
+            return summary
+
+        # On failure, fall back to the last good cache if we have one
+        return self._summary_cache or {}
+
+    def get_dashboard_stats_from_summary(self, flagged_count: int = 0,
+                                         amount: Optional[float] = None,
+                                         fraud_rate: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Build dashboard stats from the Graph summary API for remote mode.
+
+        Vertex/edge counts come from graph metadata (instant even at 1B+).
+        `flagged_count` is supplied from the small KV flagged_accounts set.
+        `amount`/`fraud_rate` are not derivable cheaply from the summary; they
+        come from an external aggregate record when available, else remain None.
+        """
+        summary = self.get_graph_summary_cached()
+        if not summary:
+            return {
+                "users": 0, "accounts": 0, "devices": 0, "txns": 0,
+                "flagged": flagged_count,
+                "amount": amount, "fraud_rate": fraud_rate,
+                "health": "disconnected" if not self.client else "error",
+                "source": "graph_summary",
+            }
+
+        vertices = summary.get("vertex_counts", {}) or {}
+        edges = summary.get("edge_counts", {}) or {}
+
+        return {
+            "users": vertices.get("user", 0),
+            "accounts": vertices.get("account", 0),
+            "devices": vertices.get("device", 0),
+            # One TRANSACTS edge per transaction (no in/out double-count like KV)
+            "txns": edges.get("TRANSACTS", 0),
+            "flagged": flagged_count,
+            "amount": amount,
+            "fraud_rate": fraud_rate,
+            "health": "connected",
+            "source": "graph_summary",
+        }
+
+    # ----------------------------------------------------------------------------------------------------------
+    # Graph-backed browse (remote mode: KV users/transactions are not populated)
+    # ----------------------------------------------------------------------------------------------------------
+
+    def _summary_user_count(self) -> int:
+        summary = self.get_graph_summary_cached()
+        return (summary.get("vertex_counts", {}) or {}).get("user", 0)
+
+    def get_users_paginated_from_graph(self, page: int = 1, page_size: int = 20,
+                                       query: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Paginated user list backed by the Graph (remote mode).
+
+        Uses range() for bounded paging (total from the summary). For search we
+        do a bounded exact id/name lookup to avoid full-graph text scans.
+        """
+        empty = {'result': [], 'total': 0, 'total_pages': 0, 'page': page, 'page_size': page_size}
+        if not self.client:
+            return empty
+
+        def _project(trav):
+            return (trav
+                .project("id", "name", "email", "risk_score", "location", "occupation", "age", "signup_date")
+                .by(__.id_())
+                .by(__.coalesce(__.values("name"), __.constant("")))
+                .by(__.coalesce(__.values("email"), __.constant("")))
+                .by(__.coalesce(__.values("risk_score"), __.constant(0)))
+                .by(__.coalesce(__.values("location"), __.constant("")))
+                .by(__.coalesce(__.values("occupation"), __.constant("")))
+                .by(__.coalesce(__.values("age"), __.constant(0)))
+                .by(__.coalesce(__.values("signup_date"), __.constant(""))))
+
+        try:
+            if query:
+                q = query.strip()
+                seen = {}
+                # Exact vertex id (empty if not found)
+                try:
+                    for v in _project(self.client.V(q).hasLabel("user")).to_list():
+                        seen[v["id"]] = v
+                except Exception:
+                    pass
+                # Exact name match, bounded
+                try:
+                    for v in _project(self.client.V().hasLabel("user").has("name", q).limit(page_size * 5)).to_list():
+                        seen[v["id"]] = v
+                except Exception:
+                    pass
+                results = list(seen.values())
+                total = len(results)
+                start = (page - 1) * page_size
+                paged = results[start:start + page_size]
+            else:
+                total = self._summary_user_count()
+                start = (page - 1) * page_size
+                end = start + page_size
+                paged = _project(self.client.V().hasLabel("user").range(start, end)).to_list()
+
+            for v in paged:
+                v["user_id"] = v["id"]
+
+            total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
+            return {
+                'result': paged,
+                'total': total,
+                'total_pages': total_pages,
+                'page': page,
+                'page_size': page_size,
+                'source': 'graph',
+            }
+        except Exception as e:
+            logger.error(f"Error paginating users from graph: {e}")
+            return empty
+
+    def get_user_profile(self, user_id: str, txn_limit: int = 50) -> Optional[Dict[str, Any]]:
+        """
+        Build a user profile (accounts, devices, recent transactions) from the
+        Graph for remote mode. Returns None if the user vertex does not exist.
+        """
+        if not self.client:
+            return None
+        try:
+            props = self.client.V(user_id).hasLabel("user").value_map().to_list()
+            if not props:
+                return None
+
+            def _flat(vm):
+                return {k: (v[0] if isinstance(v, list) and v else v) for k, v in vm.items()}
+
+            p = _flat(props[0])
+            user = {
+                "id": user_id,
+                "name": p.get("name", ""),
+                "email": p.get("email", ""),
+                "phone": p.get("phone", ""),
+                "age": p.get("age", 0),
+                "location": p.get("location", ""),
+                "occupation": p.get("occupation", ""),
+                "signup_date": p.get("signup_date", ""),
+                "risk_score": p.get("risk_score", 0) or 0,
+                "is_flagged": bool(p.get("is_flagged", False)),
+            }
+
+            accounts = (self.client.V(user_id).out("OWNS").hasLabel("account")
+                .project("id", "type", "balance", "bank_name", "status", "fraud_flag")
+                .by(__.id_())
+                .by(__.coalesce(__.values("type"), __.constant("")))
+                .by(__.coalesce(__.values("balance"), __.constant(0)))
+                .by(__.coalesce(__.values("bank_name"), __.constant("")))
+                .by(__.coalesce(__.values("status"), __.constant("")))
+                .by(__.coalesce(__.values("fraud_flag"), __.constant(False)))
+                .to_list())
+
+            devices = (self.client.V(user_id).out("USES").hasLabel("device")
+                .project("id", "type", "os", "browser", "fraud_flag")
+                .by(__.id_())
+                .by(__.coalesce(__.values("type"), __.constant("")))
+                .by(__.coalesce(__.values("os"), __.constant("")))
+                .by(__.coalesce(__.values("browser"), __.constant("")))
+                .by(__.coalesce(__.values("fraud_flag"), __.constant(False)))
+                .to_list())
+
+            # Recent outgoing transactions across all of the user's accounts (bounded)
+            txns_list = []
+            try:
+                raw_txns = (self.client.V(user_id).out("OWNS").outE("TRANSACTS")
+                    .order().by("timestamp", Order.desc).limit(txn_limit)
+                    .project("txn_id", "amount", "timestamp", "type", "status", "from", "to")
+                    .by(__.coalesce(__.values("txn_id"), __.constant("")))
+                    .by(__.coalesce(__.values("amount"), __.constant(0)))
+                    .by(__.coalesce(__.values("timestamp"), __.constant("")))
+                    .by(__.coalesce(__.values("type"), __.constant("transfer")))
+                    .by(__.coalesce(__.values("status"), __.constant("completed")))
+                    .by(__.outV().id_())
+                    .by(__.inV().id_())
+                    .to_list())
+                for t in raw_txns:
+                    txns_list.append({
+                        "txn": {
+                            "txn_id": t.get("txn_id", ""),
+                            "amount": t.get("amount", 0),
+                            "timestamp": t.get("timestamp", ""),
+                            "type": t.get("type", "transfer"),
+                            "fraud_score": 0,
+                            "status": "clean",
+                        },
+                        "other_party": {
+                            "id": t.get("to", ""),
+                            "name": "Unknown",
+                            "risk_score": 0,
+                        },
+                    })
+            except Exception as e:
+                logger.warning(f"Could not fetch graph transactions for user {user_id}: {e}")
+
+            return {"user": user, "accounts": accounts, "devices": devices, "txns": txns_list}
+        except Exception as e:
+            logger.error(f"Error building user profile from graph for {user_id}: {e}")
+            return None
+
+    @staticmethod
+    def _entropy(items) -> float:
+        """Shannon entropy (base 2) of a list of labels; 0 for empty/uniform."""
+        from collections import Counter
+        import math
+        vals = [i for i in items if i is not None]
+        if not vals:
+            return 0.0
+        total = len(vals)
+        return -sum((c / total) * math.log2(c / total) for c in Counter(vals).values())
+
+    @staticmethod
+    def _age_days(date_str) -> int:
+        """Days since an ISO date string; 365 on parse failure."""
+        from datetime import datetime
+        try:
+            d = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+            now = datetime.now(d.tzinfo) if d.tzinfo else datetime.now()
+            return max(0, (now - d).days)
+        except Exception:
+            return 365
+
+    def compute_account_fact_from_graph(self, account_id: str, max_edges: int = 2000) -> Dict[str, Any]:
+        """
+        Compute a bounded account_fact from the Graph for lazy hydration (remote mode).
+
+        Only the subset of the KV feature set that is cheaply derivable from a
+        bounded traversal is populated (counts, amounts, unique recipients,
+        recipient entropy, device count, account age). Time-window features
+        (24h peak, z-scores, new-recipient ratio, first-txn delay) are left at
+        neutral defaults. `max_edges` caps every traversal so supernode accounts
+        stay fast and bounded.
+        """
+        fact = {
+            'txn_out_7d': 0, 'txn_24h_peak': 0, 'avg_txn_day': 0, 'max_txn_hr': 0,
+            'txn_zscore': 0, 'out_amt_7d': 0, 'avg_out_amt': 0, 'max_out_amt': 0,
+            'amt_zscore': 0, 'uniq_recip': 0, 'new_recip_rat': 0, 'recip_entropy': 0,
+            'dev_count': 1, 'shared_dev_ct': 0, 'acct_age_days': 365, 'first_txn_dly': 0,
+            'source': 'graph_hydrated',
+        }
+        if not self.client:
+            return fact
+        g = self.client
+        try:
+            out_amounts = g.V(account_id).outE("TRANSACTS").limit(max_edges).values("amount").fold().next() or []
+            amts = [float(a) for a in out_amounts if a is not None]
+            fact['txn_out_7d'] = len(amts)
+            if amts:
+                fact['out_amt_7d'] = round(sum(amts), 2)
+                fact['avg_out_amt'] = round(sum(amts) / len(amts), 2)
+                fact['max_out_amt'] = round(max(amts), 2)
+        except Exception as e:
+            logger.debug(f"hydrate: out amounts for {account_id}: {e}")
+        try:
+            recips = g.V(account_id).outE("TRANSACTS").limit(max_edges).inV().id_().fold().next() or []
+            fact['uniq_recip'] = len(set(recips))
+            fact['recip_entropy'] = round(self._entropy(recips), 2)
+        except Exception as e:
+            logger.debug(f"hydrate: recipients for {account_id}: {e}")
+        try:
+            devs = g.V(account_id).bothE("TRANSACTS").limit(max_edges).values("device_id").fold().next() or []
+            distinct_devs = {d for d in devs if d}
+            if distinct_devs:
+                fact['dev_count'] = len(distinct_devs)
+        except Exception as e:
+            logger.debug(f"hydrate: devices for {account_id}: {e}")
+        try:
+            created = g.V(account_id).values("created_date").fold().next() or []
+            if created:
+                fact['acct_age_days'] = self._age_days(created[0])
+        except Exception as e:
+            logger.debug(f"hydrate: age for {account_id}: {e}")
+        return fact
+
+    def compute_device_fact_from_graph(self, device_id: str,
+                                       account_risk_scores: Optional[List[float]] = None,
+                                       max_edges: int = 2000) -> Dict[str, Any]:
+        """
+        Compute a bounded device_fact from the Graph for lazy hydration (remote mode).
+
+        `shared_acct_ct` comes from a bounded count of users linked to the device;
+        risk aggregates are derived from the account risk scores already computed
+        for the owning user in this hydration pass (partial but representative).
+        """
+        fact = {
+            'shared_acct_ct': 0, 'flag_acct_ct': 0, 'avg_acct_risk': 0,
+            'max_acct_risk': 0, 'new_acct_7d': 0, 'fraud': False, 'watchlist': False,
+            'source': 'graph_hydrated',
+        }
+        if not self.client:
+            return fact
+        g = self.client
+        try:
+            shared = g.V(device_id).in_("USES").limit(max_edges).count().next()
+            fact['shared_acct_ct'] = int(shared)
+        except Exception as e:
+            logger.debug(f"hydrate: shared accts for device {device_id}: {e}")
+        scores = [float(s) for s in (account_risk_scores or []) if s is not None]
+        if scores:
+            fact['avg_acct_risk'] = round(sum(scores) / len(scores), 2)
+            fact['max_acct_risk'] = round(max(scores), 2)
+        return fact
+
+    def get_account_transactions_from_graph(self, account_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """
+        Read an account's transaction ledger from the Graph (remote mode).
+
+        Returns up to `limit` TRANSACTS edges (both directions) shaped like the KV
+        transaction records the investigation tools expect, including a resolved
+        `counterparty_user_id`. Bounded by `limit` so supernode accounts stay fast.
+        """
+        if not self.client:
+            return []
+        g = self.client
+        try:
+            raw = (g.V(account_id).bothE("TRANSACTS").limit(limit)
+                .project("txn_id", "amount", "timestamp", "type", "status", "is_fraud", "fraud_score", "out_acct", "in_acct")
+                .by(__.coalesce(__.values("txn_id"), __.constant("")))
+                .by(__.coalesce(__.values("amount"), __.constant(0)))
+                .by(__.coalesce(__.values("timestamp"), __.constant("")))
+                .by(__.coalesce(__.values("type"), __.constant("transfer")))
+                .by(__.coalesce(__.values("status"), __.constant("completed")))
+                .by(__.coalesce(__.values("is_fraud"), __.constant(False)))
+                .by(__.coalesce(__.values("fraud_score"), __.constant(0)))
+                .by(__.outV().id_())
+                .by(__.inV().id_())
+                .to_list())
+        except Exception as e:
+            logger.warning(f"graph txns for account {account_id}: {e}")
+            return []
+
+        # Resolve owner user_id for each distinct counterparty account in one hop.
+        counterparties = set()
+        for t in raw:
+            other = t.get("in_acct") if t.get("out_acct") == account_id else t.get("out_acct")
+            if other:
+                counterparties.add(other)
+        owner_map: Dict[str, str] = {}
+        if counterparties:
+            try:
+                pairs = (g.V(*list(counterparties)).as_("a").in_("OWNS").as_("u")
+                    .select("a", "u").by(__.id_()).by(__.id_()).to_list())
+                for p in pairs:
+                    owner_map[p.get("a")] = p.get("u")
+            except Exception as e:
+                logger.debug(f"graph owner resolve for {account_id}: {e}")
+
+        txns: List[Dict[str, Any]] = []
+        for t in raw:
+            out_acct = t.get("out_acct")
+            in_acct = t.get("in_acct")
+            direction = "out" if out_acct == account_id else "in"
+            other = in_acct if direction == "out" else out_acct
+            txns.append({
+                "txn_id": t.get("txn_id", ""),
+                "amount": t.get("amount", 0),
+                "timestamp": t.get("timestamp", ""),
+                "type": t.get("type", "transfer"),
+                "status": t.get("status", "completed"),
+                "direction": direction,
+                "account_id": account_id,
+                "counterparty": other or "",
+                "counterparty_user_id": owner_map.get(other, ""),
+                "is_fraud": bool(t.get("is_fraud", False)),
+                "fraud_score": t.get("fraud_score", 0),
+            })
+        return txns
+
+    def get_recent_transactions_from_graph(self, page: int = 1, page_size: int = 12) -> Dict[str, Any]:
+        """
+        Paginated transaction list backed by the Graph (remote mode).
+
+        Uses an unordered range() over TRANSACTS edges for bounded, fast paging
+        at billion scale (a global order-by-timestamp over billions of edges is
+        not feasible). Total comes from the summary edge count.
+        """
+        empty = {'result': [], 'total': 0, 'total_pages': 0, 'page': page, 'page_size': page_size}
+        if not self.client:
+            return empty
+        try:
+            start = (page - 1) * page_size
+            end = start + page_size
+            raw = (self.client.E().hasLabel("TRANSACTS").range(start, end)
+                .project("txn_id", "amount", "timestamp", "type", "method", "location", "status", "is_fraud", "fraud_score", "from", "to")
+                .by(__.coalesce(__.values("txn_id"), __.constant("")))
+                .by(__.coalesce(__.values("amount"), __.constant(0)))
+                .by(__.coalesce(__.values("timestamp"), __.constant("")))
+                .by(__.coalesce(__.values("type"), __.constant("transfer")))
+                .by(__.coalesce(__.values("method"), __.constant("")))
+                .by(__.coalesce(__.values("location"), __.constant("")))
+                .by(__.coalesce(__.values("status"), __.constant("completed")))
+                .by(__.coalesce(__.values("is_fraud"), __.constant(False)))
+                .by(__.coalesce(__.values("fraud_score"), __.constant(0)))
+                .by(__.outV().id_())
+                .by(__.inV().id_())
+                .to_list())
+
+            result = []
+            for t in raw:
+                is_fraud = bool(t.get("is_fraud", False))
+                fraud_score = t.get("fraud_score", 0) or 0
+                result.append({
+                    "id": t.get("txn_id", ""),
+                    "txn_id": t.get("txn_id", ""),
+                    "sender": t.get("from", ""),
+                    "receiver": t.get("to", ""),
+                    "amount": t.get("amount", 0),
+                    "fraud_score": fraud_score,
+                    "timestamp": t.get("timestamp", ""),
+                    "location": t.get("location", ""),
+                    "fraud_status": "fraud" if is_fraud else "clean",
+                    "type": t.get("type", "transfer"),
+                    "method": t.get("method", ""),
+                    "status": t.get("status", "completed"),
+                    "is_fraud": is_fraud,
+                })
+
+            summary = self.get_graph_summary_cached()
+            total = (summary.get("edge_counts", {}) or {}).get("TRANSACTS", 0)
+            total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
+            return {
+                'result': result,
+                'total': total,
+                'total_pages': total_pages,
+                'page': page,
+                'page_size': page_size,
+                'source': 'graph',
+            }
+        except Exception as e:
+            logger.error(f"Error paginating transactions from graph: {e}")
+            return empty
+
     # ----------------------------------------------------------------------------------------------------------
     # User functions
     # ----------------------------------------------------------------------------------------------------------

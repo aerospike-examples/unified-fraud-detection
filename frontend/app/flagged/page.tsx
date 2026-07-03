@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -24,6 +24,7 @@ import {
     XCircle
 } from 'lucide-react'
 import useSWR from 'swr'
+import { useAppConfig } from '@/hooks/useAppConfig'
 
 interface FlaggedAccount {
     account_id: string
@@ -59,6 +60,22 @@ interface FlaggedResponse {
     total_pages: number
 }
 
+interface FraudFeedEntry {
+    user_id: string
+    account_id: string
+    risk_score: number
+    reason: string
+    ts: string
+}
+
+interface FraudFeed {
+    run_id: string | null
+    run_started: string | null
+    last_updated: string | null
+    total: number
+    recent: FraudFeedEntry[]
+}
+
 const statusConfig = {
     pending_review: { 
         label: 'Pending Review', 
@@ -88,6 +105,7 @@ export default function FlaggedAccountsPage() {
     const [debouncedSearch, setDebouncedSearch] = useState('')
     const [page, setPage] = useState(1)
     const pageSize = 20
+    const { config } = useAppConfig()
 
     // Build SWR key for accounts list
     const accountsParams = new URLSearchParams({
@@ -104,6 +122,31 @@ export default function FlaggedAccountsPage() {
     const { data: stats, isLoading: statsLoading, mutate: mutateStats } = useSWR<FlaggedStats>(
         '/api/flagged-accounts/stats'
     )
+
+    // Poll the recent-fraud update feed (remote mode). When an external load-gen
+    // injects a new fraud cohort, run_id/total change; surface a banner and
+    // revalidate the queue so freshly-flagged accounts show up without a full scan.
+    const { data: feed } = useSWR<FraudFeed>('/api/flagged-accounts/updates', {
+        refreshInterval: 15000,
+    })
+    const lastFeedSig = useRef<string | null>(null)
+    const [newFraudCount, setNewFraudCount] = useState(0)
+
+    useEffect(() => {
+        if (!feed || !feed.run_id) return
+        const sig = `${feed.run_id}:${feed.total}`
+        if (lastFeedSig.current === null) {
+            // First observation is the baseline — don't alert for pre-existing data.
+            lastFeedSig.current = sig
+            return
+        }
+        if (sig !== lastFeedSig.current) {
+            lastFeedSig.current = sig
+            setNewFraudCount(feed.total)
+            mutateAccounts()
+            mutateStats()
+        }
+    }, [feed, mutateAccounts, mutateStats])
 
     const accounts = accountsData?.accounts ?? []
     const total = accountsData?.total ?? 0
@@ -142,6 +185,28 @@ export default function FlaggedAccountsPage() {
                     Refresh
                 </Button>
             </div>
+
+            {/* New-fraud update banner (remote mode) */}
+            {newFraudCount > 0 && (
+                <div className="flex items-center justify-between gap-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-amber-900 dark:border-amber-800 dark:bg-amber-900/20 dark:text-amber-200">
+                    <div className="flex items-center gap-2">
+                        <AlertTriangle className="h-4 w-4 shrink-0" />
+                        <span className="text-sm font-medium">
+                            New fraud detected — {newFraudCount.toLocaleString()} account{newFraudCount === 1 ? '' : 's'} flagged in the latest injection. The queue has been refreshed.
+                        </span>
+                    </div>
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                            setNewFraudCount(0)
+                            handleRefresh()
+                        }}
+                    >
+                        Dismiss
+                    </Button>
+                </div>
+            )}
 
             {/* Stats Section */}
             <div className="grid gap-4 md:grid-cols-4">
@@ -255,9 +320,11 @@ export default function FlaggedAccountsPage() {
                             <Shield className="h-12 w-12 text-muted-foreground mb-4" />
                             <h3 className="text-lg font-semibold mb-2">No Flagged Accounts</h3>
                             <p className="text-muted-foreground max-w-md">
-                                {searchQuery || filter !== 'all' 
+                                {searchQuery || filter !== 'all'
                                     ? 'No accounts match your search criteria. Try adjusting your filters.'
-                                    : 'No accounts have been flagged yet. Run a detection job from the Admin panel to identify high-risk accounts.'}
+                                    : config.remote
+                                        ? 'No accounts have been flagged yet. Flagged accounts appear here as the load generator injects fraud into the live cluster.'
+                                        : 'No accounts have been flagged yet. Run a detection job from the Admin panel to identify high-risk accounts.'}
                             </p>
                         </div>
                     ) : (

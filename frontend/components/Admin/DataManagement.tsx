@@ -42,13 +42,16 @@ import {
     TrendingUp,
     History,
     ChevronDown,
-    ChevronUp
+    ChevronUp,
+    Cloud,
+    Network
 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { setDisplayLocale, getDisplayLocale, formatCurrencyWithLocale } from '@/lib/utils'
 
 import { useOperationProgress } from '@/context/OperationProgressContext'
+import { useAppConfig } from '@/hooks/useAppConfig'
 import useSWR, { useSWRConfig } from 'swr'
 
 interface BulkLoadStatus {
@@ -127,17 +130,19 @@ interface JobHistoryItem {
 const DataManagement = () => {
     const opCtx = useOperationProgress()
     const { mutate: globalMutate } = useSWRConfig()
+    const { config: appConfig } = useAppConfig()
+    const isRemoteMode = appConfig.remote
 
     const [bulkLoadStatusLocal, setBulkLoadStatusLocal] = useState<BulkLoadStatus>({ loading: false })
 
     // SWR-cached stats — no duplicate fetches, instant on revisit
-    const { data: dashboardData, isLoading: loadingDashboard, mutate: mutateDashboard } = useSWR<{users: number, txns: number, flagged: number}>('/api/dashboard/stats')
+    const { data: dashboardData, isLoading: loadingDashboard, mutate: mutateDashboard } = useSWR<{users: number, txns: number, flagged: number, accounts?: number, devices?: number}>('/api/dashboard/stats')
     const { data: aerospikeStats, isLoading: loadingAerospikeStats, mutate: mutateAerospikeStats } = useSWR<AerospikeStats>('/api/aerospike/stats')
 
     const graphStats: GraphStats | null = dashboardData ? {
         users: dashboardData.users || 0,
-        accounts: 0,
-        devices: 0,
+        accounts: dashboardData.accounts || 0,
+        devices: dashboardData.devices || 0,
         transactions: dashboardData.txns || 0,
         total_vertices: 0,
         total_edges: 0
@@ -648,6 +653,123 @@ const DataManagement = () => {
         { label: 'Calculate features', done: step3Done },
         { label: 'Run ML model', done: step4Done },
     ]
+
+    // ── Remote load-gen mode: a read-only overview. Ingest/detection are external. ──
+    if (isRemoteMode) {
+        return (
+            <div className="space-y-6 pb-4">
+                {/* Remote mode banner */}
+                <Card className="overflow-hidden border border-amber-300/70 dark:border-amber-700/60 shadow-sm bg-amber-50/70 dark:bg-amber-950/20">
+                    <CardContent className="py-3 px-4 flex items-start gap-3">
+                        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/15">
+                            <Cloud className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                        </div>
+                        <div className="min-w-0">
+                            <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                                Remote load-generation mode
+                            </p>
+                            <p className="text-xs text-amber-800/90 dark:text-amber-300/90 mt-0.5">
+                                Data is generated and bulk loaded into the graph externally at scale.
+                                Bulk load, transaction injection, feature computation, and ML detection are
+                                managed by the external pipeline and are disabled here. Counts come from the
+                                graph summary; the review queue is populated externally.
+                            </p>
+                        </div>
+                    </CardContent>
+                </Card>
+
+                {/* Storage overview (graph summary + KV working set) */}
+                <section className="space-y-3">
+                    <div className="flex items-center gap-2 text-muted-foreground">
+                        <Network className="h-4 w-4" />
+                        <span className="text-sm font-medium text-foreground">Storage overview</span>
+                    </div>
+                    <Card className="overflow-hidden border-0 shadow-sm bg-card">
+                        <CardHeader className="pb-2 pt-4 px-4 flex flex-row items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base">Graph (source of truth)</CardTitle>
+                                <CardDescription className="text-xs mt-0.5">Vertex/edge counts from the Aerospike Graph summary API</CardDescription>
+                            </div>
+                            <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={refreshStats} disabled={loadingStats}>
+                                {loadingStats ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                            </Button>
+                        </CardHeader>
+                        <CardContent className="px-4 pb-4">
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                {[
+                                    { icon: Users, label: 'Users', value: graphStats?.users },
+                                    { icon: CreditCard, label: 'Accounts', value: graphStats?.accounts },
+                                    { icon: Smartphone, label: 'Devices', value: graphStats?.devices },
+                                    { icon: GitBranch, label: 'Transactions', value: graphStats?.transactions },
+                                ].map(({ icon: Icon, label, value }) => (
+                                    <div key={label} className="rounded-lg border border-border/80 bg-muted/20 p-3">
+                                        <div className="flex items-center gap-1.5 text-muted-foreground text-xs">
+                                            <Icon className="h-3.5 w-3.5" />
+                                            {label}
+                                        </div>
+                                        <p className="mt-1 text-lg font-semibold">
+                                            {loadingStats ? '…' : (value?.toLocaleString() ?? '0')}
+                                        </p>
+                                    </div>
+                                ))}
+                            </div>
+                            <div className="mt-3 rounded-lg border border-border/80 bg-muted/20 p-3 text-xs text-muted-foreground">
+                                <span className="font-medium text-foreground">KV working set:</span>{' '}
+                                <strong>{aerospikeStats?.flagged_accounts_count?.toLocaleString() ?? '0'}</strong> flagged,{' '}
+                                <strong>{aerospikeStats?.account_facts_count?.toLocaleString() ?? '0'}</strong> account facts,{' '}
+                                <strong>{aerospikeStats?.device_facts_count?.toLocaleString() ?? '0'}</strong> device facts
+                                {aerospikeStats?.connected && (
+                                    <span className="ml-1 text-muted-foreground/80">(P:{aerospikeStats.pending_review ?? 0} F:{aerospikeStats.confirmed_fraud ?? 0} C:{aerospikeStats.cleared ?? 0})</span>
+                                )}
+                            </div>
+                        </CardContent>
+                    </Card>
+                </section>
+
+                {/* Detection history (read-only) */}
+                <section className="space-y-3">
+                    <div className="flex items-center gap-2 text-muted-foreground">
+                        <History className="h-4 w-4" />
+                        <span className="text-sm font-medium text-foreground">Detection history</span>
+                    </div>
+                    <Card className="overflow-hidden border-0 shadow-sm bg-card">
+                        <CardContent className="px-4 py-4">
+                            {historyLoading ? (
+                                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                                    <Loader2 className="h-4 w-4 animate-spin" /> Loading history…
+                                </div>
+                            ) : detectionHistory.length === 0 ? (
+                                <p className="text-sm text-muted-foreground">
+                                    No detection runs recorded yet. Detection is run by the external pipeline.
+                                </p>
+                            ) : (
+                                <Table>
+                                    <TableHeader>
+                                        <TableRow>
+                                            <TableHead>When</TableHead>
+                                            <TableHead className="text-right">Newly flagged</TableHead>
+                                            <TableHead className="text-right">Accounts</TableHead>
+                                            <TableHead className="text-right">Duration</TableHead>
+                                        </TableRow>
+                                    </TableHeader>
+                                    <TableBody>
+                                        {detectionHistory.slice(0, 10).map((h, i) => (
+                                            <TableRow key={i}>
+                                                <TableCell className="text-xs">{h.start_time ? formatDateTime(h.start_time) : '—'}</TableCell>
+                                                <TableCell className="text-right text-xs">{h.newly_flagged?.toLocaleString() ?? '—'}</TableCell>
+                                                <TableCell className="text-right text-xs">{h.total_accounts?.toLocaleString() ?? '—'}</TableCell>
+                                                <TableCell className="text-right text-xs">{h.duration_seconds != null ? formatDuration(h.duration_seconds) : '—'}</TableCell>
+                                            </TableRow>
+                                        ))}
+                                    </TableBody>
+                                </Table>
+                            )}
+                        </CardContent>
+                    </Card>
+                </section>
+            </div>
+        )
+    }
 
     return (
         <div className="space-y-6 pb-4">

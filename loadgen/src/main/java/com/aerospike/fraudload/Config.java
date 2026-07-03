@@ -5,9 +5,16 @@ public record Config(
         String host,
         int port,
         String namespace,
-        int accountCount,
+        AccountPool accountPool,
         int workers,
         long targetRatePerSec,
         int durationSeconds,
-        boolean updateBalances) {
+        boolean updateBalances,
+        WriteMode writeMode,
+        String graphHost,
+        int graphPort,
+        FraudCohort fraudCohort,
+        double fraudRatio,
+        String accountPrefix,
+        String userPrefix) {
 }

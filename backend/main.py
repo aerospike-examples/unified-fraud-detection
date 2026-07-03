@@ -28,6 +28,8 @@ from services.feature_service import FeatureService
 from services.transaction_injector import TransactionInjector
 from services.progress_service import progress_service
 
+import settings
+
 from logging_config import setup_logging, get_logger
 
 # Setup logging
@@ -91,9 +93,12 @@ async def lifespan(app: FastAPI):
     scheduler_service.set_detection_callback(flagged_account_service.run_detection)
     scheduler_service.start()
     
-    # Schedule detection job based on config
+    # Schedule detection job based on config.
+    # In remote mode, detection runs externally, so skip the scheduled job.
     config = flagged_account_service.get_config()
-    if config.get("schedule_enabled", True):
+    if settings.is_remote_mode():
+        logger.info("Remote load-gen mode: skipping scheduled detection job (handled externally)")
+    elif config.get("schedule_enabled", True):
         try:
             schedule_time = config.get("schedule_time", "21:30")
             hour, minute = map(int, schedule_time.split(":"))
@@ -129,6 +134,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _ensure_operation_allowed(capability: str, operation: str):
+    """
+    Guard mutating/ingest operations that are unavailable in remote load-gen
+    mode (data is loaded externally). Raises HTTP 409 when disabled.
+    """
+    capabilities = settings.get_capabilities()
+    if not capabilities.get(capability, True):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{operation} is disabled in remote load-gen mode "
+                f"(DATA_SOURCE_MODE={settings.DATA_SOURCE_MODE}). "
+                "Data is generated and loaded externally in this environment."
+            ),
+        )
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Configuration endpoint
+# ----------------------------------------------------------------------------------------------------------
+
+
+@app.get("/config")
+def get_runtime_config():
+    """
+    Runtime configuration consumed by the frontend to adapt the UI.
+
+    Reports the data-source mode (local | remote) and capability flags that
+    indicate which admin operations are available and where stats are sourced.
+    """
+    return settings.get_runtime_config()
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -193,8 +231,37 @@ def get_operation_progress(operation_id: str = Path(..., description="Operation 
 
 @app.get("/dashboard/stats")
 def get_dashboard_stats():
-    """Get dashboard statistics from KV store"""
+    """
+    Get dashboard statistics.
+
+    - local mode: computed from Aerospike KV scans.
+    - remote mode: entity counts come from the Graph summary API (instant even
+      at billion scale); flagged count from the small KV flagged_accounts set;
+      amount/fraud_rate from the external aggregate record when available.
+    """
     try:
+        if settings.is_remote_mode():
+            # Flagged count from the small externally-populated KV set
+            flagged_count = 0
+            try:
+                flagged_count = flagged_account_service.get_flagged_stats().get("total_flagged", 0)
+            except Exception as e:
+                logger.warning(f"Could not read flagged stats in remote mode: {e}")
+
+            # Optional aggregate record (amount, fraud_rate) from external pipeline
+            amount = None
+            fraud_rate = None
+            aggregate = aerospike_service.get_remote_aggregate_stats()
+            if aggregate:
+                amount = aggregate.get("total_amount", aggregate.get("amount"))
+                fraud_rate = aggregate.get("fraud_rate")
+                if aggregate.get("flagged") is not None:
+                    flagged_count = aggregate.get("flagged")
+
+            return graph_service.get_dashboard_stats_from_summary(
+                flagged_count=flagged_count, amount=amount, fraud_rate=fraud_rate
+            )
+
         return aerospike_service.get_dashboard_stats()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get dashboard stats: {str(e)}")
@@ -214,8 +281,10 @@ def get_users(
     order: str = Query('asc', description="Direction to order results"),
     query: str | None = Query(None, description="Search term for user name or ID")
 ):
-    """Get paginated list of all users from KV store"""
+    """Get paginated list of all users (KV in local mode, Graph in remote mode)"""
     try:
+        if settings.is_remote_mode():
+            return graph_service.get_users_paginated_from_graph(page, page_size, query)
         return aerospike_service.get_all_users_paginated(page, page_size, order_by, order, query)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get users: {str(e)}")
@@ -223,8 +292,26 @@ def get_users(
 
 @app.get("/users/stats")
 def get_users_stats():
-    """Get user stats from KV store"""
+    """
+    Get user stats.
+
+    - local mode: KV scan bucketed by risk score.
+    - remote mode: total from Graph summary; risk buckets are not aggregated at
+      billion scale and are reported as 0 (unknown).
+    """
     try:
+        if settings.is_remote_mode():
+            summary = graph_service.get_graph_summary_cached()
+            total_users = (summary.get("vertex_counts", {}) or {}).get("user", 0)
+            # Risk buckets aren't aggregatable at billion scale; return null so the
+            # UI shows "—" (unknown) rather than a misleading 0.
+            return {
+                "total_users": total_users,
+                "total_low_risk": None,
+                "total_med_risk": None,
+                "total_high_risk": None,
+                "source": "graph_summary",
+            }
         # Get stats by scanning users in KV
         stats = aerospike_service.get_user_stats()
         return stats
@@ -232,12 +319,53 @@ def get_users_stats():
         raise HTTPException(status_code=500, detail=f"Failed to get user stats: {str(e)}")
 
 
+def _risk_level_from_score(risk_score: float) -> str:
+    if risk_score < 25:
+        return "LOW"
+    elif risk_score < 50:
+        return "MEDIUM"
+    elif risk_score < 75:
+        return "HIGH"
+    return "CRITICAL"
+
+
+def _user_profile_from_graph(user_id: str):
+    """Build the /users/{id} response from the Graph. Returns None if absent."""
+    profile = graph_service.get_user_profile(user_id)
+    if not profile:
+        return None
+    risk_score = profile["user"].get("risk_score", 0) or 0
+    return {
+        "user": profile["user"],
+        "risk_level": _risk_level_from_score(risk_score),
+        "accounts": profile["accounts"],
+        "devices": profile["devices"],
+        "txns": profile["txns"],
+    }
+
+
 @app.get("/users/{user_id}")
 def get_user(user_id: str):
-    """Get user's profile with accounts, devices, and transactions from KV store"""
+    """
+    Get user's profile with accounts, devices, and transactions.
+
+    - local mode: from Aerospike KV (falls back to Graph if the KV record is
+      absent, e.g. a flagged user whose neighborhood was loaded externally).
+    - remote mode: from the Graph.
+    """
     try:
+        if settings.is_remote_mode():
+            profile = _user_profile_from_graph(user_id)
+            if not profile:
+                raise HTTPException(status_code=404, detail="User not found")
+            return profile
+
         user = aerospike_service.get_user(user_id)
         if not user:
+            # Fall back to the graph if the KV record is missing
+            profile = _user_profile_from_graph(user_id)
+            if profile:
+                return profile
             raise HTTPException(status_code=404, detail="User not found")
         
         # Calculate risk level from risk score
@@ -377,8 +505,16 @@ def get_transactions(
     page_size: int = Query(12, ge=1, le=100, description="Number of transactions per page"),
     day: str | None = Query(None, description="Date filter (YYYY-MM-DD), defaults to today")
 ):
-    """Get paginated list of transactions for today (or specified day) from KV store"""
+    """
+    Get paginated list of transactions.
+
+    - local mode: today's (or specified day's) transactions from KV.
+    - remote mode: a bounded page of TRANSACTS edges from the Graph (the day
+      filter does not apply to externally bulk-loaded historical data).
+    """
     try:
+        if settings.is_remote_mode():
+            return graph_service.get_recent_transactions_from_graph(page, page_size)
         # Default to today's date if not specified
         if not day:
             day = datetime.now().strftime('%Y-%m-%d')
@@ -392,6 +528,7 @@ def get_transactions(
 @app.delete("/transactions")
 def delete_all_transactions():
     """Delete all transactions from the graph"""
+    _ensure_operation_allowed("clearData", "Delete transactions")
     try:
         result = graph_service.drop_all_transactions()
         return result
@@ -401,8 +538,28 @@ def delete_all_transactions():
 
 @app.get("/transactions/stats")
 def get_transaction_stats():
-    """Get transaction stats from KV store"""
+    """
+    Get transaction stats.
+
+    - local mode: KV scan bucketed by fraud disposition.
+    - remote mode: total from the Graph TRANSACTS edge count; blocked/review/
+      clean breakdown is not derivable at scale (reported as 0 unless an
+      external aggregate record supplies it).
+    """
     try:
+        if settings.is_remote_mode():
+            summary = graph_service.get_graph_summary_cached()
+            total_txns = (summary.get("edge_counts", {}) or {}).get("TRANSACTS", 0)
+            aggregate = aerospike_service.get_remote_aggregate_stats() or {}
+            # Disposition breakdown isn't derivable from the summary at scale;
+            # return null (shown as "—") unless the external aggregate supplies it.
+            return {
+                "total_txns": aggregate.get("txns", total_txns),
+                "total_blocked": aggregate.get("blocked", None),
+                "total_review": aggregate.get("review", None),
+                "total_clean": aggregate.get("clean", None),
+                "source": "graph_summary",
+            }
         results = aerospike_service.get_transaction_stats()
         return results
     except Exception as e:
@@ -520,6 +677,7 @@ def create_manual_transaction(
     transaction_type: str = Query("transfer", description="Transaction type")
 ):
     """Create a manual transaction between specific accounts"""
+    _ensure_operation_allowed("rtGeneration", "Transaction generation")
     try:
         logger.info(f"Attempting to create manual transaction from {from_account_id} to {to_account_id} amount {amount}")
         result = transaction_generator.create_manual_transaction(
@@ -549,6 +707,7 @@ def create_manual_transaction(
 @app.post("/transaction-generation/generate")
 def generate_single_transaction():
     """Generate one transaction (used by Bulk Generation workers). Writes to Graph and KV so transactions appear on the Transaction page."""
+    _ensure_operation_allowed("rtGeneration", "Transaction generation")
     try:
         transaction_generator.generate_transaction()
         return {"status": "created"}
@@ -670,6 +829,7 @@ def bulk_load_csv_data(
         load_aerospike: Load users into Aerospike KV for tracking (default: True)
         locale: Demographics region for default data (american, indian, en_GB, en_AU, zh_CN)
     """
+    _ensure_operation_allowed("bulkLoad", "Bulk load")
     result = {
         "success": True,
         "graph": None,
@@ -824,6 +984,7 @@ def bulk_load_csv_data(
 @app.get("/bulk-load-status")
 def get_bulk_load_status():
     """Get the status of the current bulk load operation"""
+    _ensure_operation_allowed("bulkLoad", "Bulk load")
     try:
         result = graph_service.get_bulk_load_status()
         
@@ -866,6 +1027,7 @@ def inject_transactions_bulk(
     
     For 10,000 transactions: ~3 DB operations instead of ~50,000.
     """
+    _ensure_operation_allowed("injectTransactions", "Transaction injection")
     # Prefer locale from request body (reliable for POST); fall back to query
     locale = locale or (body.locale if body else None)
     logger.info(f"Inject transactions bulk: locale={locale!r} (will use regional locations/currency)")
@@ -901,6 +1063,7 @@ def compute_features(
     
     Should be run before ML detection for accurate scoring.
     """
+    _ensure_operation_allowed("computeFeatures", "Feature computation")
     if not feature_service:
         raise HTTPException(status_code=503, detail="Feature service not available. Aerospike may not be connected.")
     
@@ -923,6 +1086,7 @@ def delete_all_data(confirm: bool = Query(False, description="Must be True to co
     
     Use with caution!
     """
+    _ensure_operation_allowed("clearData", "Delete all data")
     if not confirm:
         raise HTTPException(status_code=400, detail="Must set confirm=True to delete all data")
     
@@ -980,6 +1144,7 @@ async def bulk_load_upload(
         load_graph: Load data into Aerospike Graph (default: True)
         load_aerospike: Load users into Aerospike KV for tracking (default: True)
     """
+    _ensure_operation_allowed("bulkLoad", "Bulk load")
     result = {
         "success": True,
         "graph": None,
@@ -1098,14 +1263,40 @@ async def bulk_load_upload(
 
 @app.get("/aerospike/stats")
 def get_aerospike_stats():
-    """Get statistics about data stored in Aerospike"""
+    """
+    Get statistics about data stored in Aerospike.
+
+    - local mode: single users scan + lightweight set counts.
+    - remote mode: users_count from the Graph summary, workflow-status counts
+      from the small KV flagged_accounts set, and lightweight counts of the KV
+      working-set sets (avoids scanning a billion-scale users set).
+    """
     try:
         if not aerospike_service.is_connected():
             return {
                 "connected": False,
                 "message": "Aerospike KV service not available"
             }
-        
+
+        if settings.is_remote_mode():
+            summary = graph_service.get_graph_summary_cached()
+            users_count = (summary.get("vertex_counts", {}) or {}).get("user", 0)
+            counts = aerospike_service.get_working_set_counts()
+            flagged = flagged_account_service.get_flagged_stats()
+            return {
+                "users_count": users_count,
+                "flagged_accounts_count": counts["flagged_accounts_count"],
+                "account_facts_count": counts["account_facts_count"],
+                "device_facts_count": counts["device_facts_count"],
+                "transaction_records_count": counts["transaction_records_count"],
+                "pending_review": flagged.get("pending_review", 0),
+                "under_investigation": flagged.get("under_investigation", 0),
+                "confirmed_fraud": flagged.get("confirmed_fraud", 0),
+                "cleared": flagged.get("cleared", 0),
+                "connected": True,
+                "source": "graph_summary",
+            }
+
         stats = aerospike_service.get_stats()
         return stats
     except Exception as e:
@@ -1143,6 +1334,28 @@ def get_flagged_accounts_stats():
     except Exception as e:
         logger.error(f"❌ Failed to get flagged accounts stats: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+
+@app.get("/flagged-accounts/updates")
+def get_flagged_account_updates():
+    """
+    Recent-fraud update feed (remote mode).
+
+    The external load-gen writes a single `fraud_feed` KV record after injecting a
+    fraud cohort. The frontend polls this cheaply to detect a new injection run
+    (via `run_id`/`total`/`last_updated`) and then revalidates the review queue —
+    no full scan of the billion-row dataset required. Returns an empty feed when
+    nothing has been injected yet.
+    """
+    try:
+        feed = aerospike_service.get_fraud_feed()
+        if not feed:
+            return {"run_id": None, "run_started": None, "last_updated": None,
+                    "total": 0, "recent": []}
+        return feed
+    except Exception as e:
+        logger.error(f"❌ Failed to get fraud update feed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get fraud update feed: {str(e)}")
 
 
 @app.get("/flagged-accounts/{account_id}")
@@ -1291,6 +1504,7 @@ def trigger_detection_job(
     By default, users evaluated within the cooldown period (7 days) are skipped.
     Set skip_cooldown=true to force evaluation of ALL users regardless of when they were last evaluated.
     """
+    _ensure_operation_allowed("runDetection", "ML detection")
     try:
         # Check if Aerospike KV is connected - required for risk evaluation
         if not aerospike_service.is_connected():

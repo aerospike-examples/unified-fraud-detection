@@ -9,20 +9,33 @@ public final class Metrics {
     private static final Logger log = LoggerFactory.getLogger(Metrics.class);
     private final LongAdder txns = new LongAdder();
     private final LongAdder errors = new LongAdder();
+    private final LongAdder fraudTxns = new LongAdder();
+    private final LongAdder amountCents = new LongAdder();
 
     public void recordTxn() { txns.increment(); }
     public void recordError() { errors.increment(); }
+    public void recordAmount(long cents) { amountCents.add(cents); }
+    public void recordFraud() { fraudTxns.increment(); }
     public long txns() { return txns.sum(); }
     public long errors() { return errors.sum(); }
+    public long fraudTxns() { return fraudTxns.sum(); }
+    public double totalAmount() { return amountCents.sum() / 100.0; }
 
-    public Thread startReporter() {
+    /** Fraud rate as a percentage of processed transactions (0 when none yet). */
+    public double fraudRatePct() {
+        long t = txns.sum();
+        return t == 0 ? 0.0 : (fraudTxns.sum() * 100.0) / t;
+    }
+
+    public Thread startReporter(WriteMode mode) {
         Thread t = new Thread(() -> {
             long last = 0;
             try {
                 while (!Thread.currentThread().isInterrupted()) {
                     Thread.sleep(1000);
                     long now = txns.sum();
-                    log.info("throughput={} txn/s total={} errors={}", now - last, now, errors.sum());
+                    log.info("mode={} throughput={} txn/s total={} errors={}",
+                            mode, now - last, now, errors.sum());
                     last = now;
                 }
             } catch (InterruptedException ignored) {

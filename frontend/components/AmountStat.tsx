@@ -9,6 +9,6 @@ interface AmountStatProps extends Omit<StatProps, 'stat'> {
 
 /** Client component so currency symbol respects display locale (localStorage). */
 export default function AmountStat({ amount, loading, ...rest }: AmountStatProps) {
-	const stat = amount != null ? formatCurrency(amount) : (loading ? undefined : formatCurrency(0))
+	const stat = amount != null ? formatCurrency(amount) : (loading ? undefined : '—')
 	return <Stat {...rest} stat={stat} loading={loading} />
 }
