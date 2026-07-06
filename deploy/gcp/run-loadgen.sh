@@ -11,11 +11,7 @@ DURATION="${3:-60}"
 WORKERS="${4:-16}"
 ACCOUNTS="${5:-0}"
 
-# Optional fraud injection (env-driven; defaults off). When MULES/FRAUDSTERS > 0
-# the loadgen marks a fraction of txns as fraud (FRAUD_RATIO), and after the run
-# writes flagged_accounts + the fraud_feed update queue so the UI can populate.
-MULES="${MULES:-0}"
-FRAUDSTERS="${FRAUDSTERS:-0}"
+# Live fraud: fraction of txns marked fraudulent; accounts flagged on detection (KV required).
 FRAUD_RATIO="${FRAUD_RATIO:-0.0}"
 ACCOUNT_PREFIX="${ACCOUNT_PREFIX:-Account}"
 USER_PREFIX="${USER_PREFIX:-User}"
@@ -31,8 +27,6 @@ ARGS=(
   --workers "${WORKERS}"
   --duration "${DURATION}"
   --rate "${RATE}"
-  --mules "${MULES}"
-  --fraudsters "${FRAUDSTERS}"
   --fraud-ratio "${FRAUD_RATIO}"
   --account-prefix "${ACCOUNT_PREFIX}"
   --user-prefix "${USER_PREFIX}"

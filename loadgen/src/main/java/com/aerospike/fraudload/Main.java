@@ -25,35 +25,28 @@ public final class Main implements Callable<Integer> {
             description = "Write path: kv, graph, or paired (parallel KV + graph)") WriteMode mode;
     @Option(names = "--graph-host", defaultValue = "localhost", description = "Gremlin/AGS host") String graphHost;
     @Option(names = "--graph-port", defaultValue = "8182", description = "Gremlin/AGS port") int graphPort;
-    @Option(names = "--mules", defaultValue = "0",
-            description = "Fraud cohort: accounts receiving concentrated fan-in (money mules)") int mules;
-    @Option(names = "--fraudsters", defaultValue = "0",
-            description = "Fraud cohort: accounts originating fan-out/bursts") int fraudsters;
+    @Option(names = "--mules", defaultValue = "0", hidden = true,
+            description = "Deprecated — live fraud uses --fraud-ratio only") int mules;
+    @Option(names = "--fraudsters", defaultValue = "0", hidden = true,
+            description = "Deprecated — live fraud uses --fraud-ratio only") int fraudsters;
     @Option(names = "--fraud-ratio", defaultValue = "0.0",
-            description = "Fraction (0..1) of generated txns that are fraudulent (needs a cohort)") double fraudRatio;
+            description = "Fraction (0..1) of txns flagged as fraudulent; accounts flagged live on detection") double fraudRatio;
     @Option(names = "--account-prefix", defaultValue = "Account",
             description = "Account id prefix for deterministic account->user mapping") String accountPrefix;
     @Option(names = "--user-prefix", defaultValue = "User",
             description = "User id prefix for deterministic account->user mapping") String userPrefix;
-    @Option(names = "--cohort-seed", defaultValue = "0",
-            description = "RNG seed for fraud cohort selection; 0 = random each run") long cohortSeed;
+    @Option(names = "--cohort-seed", defaultValue = "0", hidden = true,
+            description = "Deprecated — no fixed cohort") long cohortSeed;
 
     @Override
     public Integer call() throws Exception {
+        if (mules > 0 || fraudsters > 0) {
+            System.err.println("WARN: --mules/--fraudsters are deprecated; "
+                    + "fraud is injected live via --fraud-ratio on random accounts");
+        }
         AccountPool pool = resolveAccountPool();
-        long seed = cohortSeed != 0 ? cohortSeed : System.currentTimeMillis();
-        FraudCohort cohort = FraudCohort.select(pool, mules, fraudsters, seed);
-        if (!cohort.isEmpty()) {
-            System.err.printf("INFO: fraud cohort seed=%d (%d mules, %d fraudsters)%n",
-                    seed, cohort.muleCount(), cohort.fraudsterCount());
-        }
-        double effectiveFraudRatio = fraudRatio;
-        if (!cohort.isEmpty() && fraudRatio <= 0.0) {
-            effectiveFraudRatio = 0.02; // sensible default so a cohort actually gets fraud traffic
-            System.err.println("INFO: cohort set but --fraud-ratio=0; defaulting to 0.02");
-        }
         Config cfg = new Config(host, port, namespace, pool, workers, rate, duration, balances,
-                mode, graphHost, graphPort, cohort, effectiveFraudRatio, accountPrefix, userPrefix);
+                mode, graphHost, graphPort, fraudRatio, accountPrefix, userPrefix);
         new LoadDriver(cfg).run();
         return 0;
     }

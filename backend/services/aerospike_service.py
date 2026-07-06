@@ -35,7 +35,8 @@ AEROSPIKE_NAMESPACE = os.environ.get('AEROSPIKE_NAMESPACE', 'test')
 SET_USERS = 'users'
 SET_EVALUATIONS = 'evaluations'
 SET_FLAGGED_ACCOUNTS = 'flagged_accounts'
-SET_FRAUD_FEED = 'fraud_feed'  # single record: recent-fraud update queue (remote mode)
+SET_FLAGGED_QUEUE = 'flagged_queue'  # persistent user_id index for batch reads (remote mode)
+SET_FRAUD_FEED = 'fraud_feed'  # single record: per-run new-fraud counter (remote mode)
 SET_WORKFLOW = 'workflow'
 SET_CONFIG = 'config'
 SET_HISTORY = 'detection_history'
@@ -44,6 +45,7 @@ SET_TRANSACTIONS = 'transactions'      # PK = {account_id}:{year_month}
 SET_ACCOUNT_FACT = 'account_fact'      # PK = account_id
 SET_DEVICE_FACT = 'device_fact'        # PK = device_id
 SET_INVESTIGATIONS = 'investigations'  # PK = investigation_id
+SET_CASE_MEMORY = 'case_memory'          # cross-engine case recall (adk-aerospike, case_ prefix)
 
 # Aerospike bin name limit is 15 characters
 # Map long bin names to short versions
@@ -1312,15 +1314,58 @@ class AerospikeService:
         return self.scan_all(SET_FLAGGED_ACCOUNTS, limit)
 
     def get_flagged_accounts_batch(self, user_ids: List[str]) -> List[Dict[str, Any]]:
-        """Point-read flagged accounts by user_id (no set scan — safe under KV load)."""
+        """Point-read flagged accounts by user_id using batch_get (no set scan)."""
         if not self.is_connected() or not user_ids:
             return []
+        keys = [(self.namespace, SET_FLAGGED_ACCOUNTS, uid) for uid in user_ids]
         records: List[Dict[str, Any]] = []
-        for user_id in user_ids:
-            rec = self.get(SET_FLAGGED_ACCOUNTS, user_id)
-            if rec:
-                records.append(rec)
+        try:
+            for result in self.batch_get(keys):
+                if result is None:
+                    continue
+                _, _, bins = result
+                if bins:
+                    records.append(self._expand_bin_names(bins))
+        except Exception as e:
+            logger.error(f"get_flagged_accounts_batch failed: {e}")
         return records
+
+    def get_flagged_queue_user_ids(self) -> List[str]:
+        """Read persistent flagged_queue index (survives loadgen restarts)."""
+        rec = self.get(SET_FLAGGED_QUEUE, 'index')
+        if not rec:
+            return []
+        user_ids = rec.get('user_ids') or []
+        return [str(uid) for uid in user_ids if uid]
+
+    def get_flagged_accounts_from_queue(self) -> List[Dict[str, Any]]:
+        """Load all flagged accounts via persistent queue index + batch_get."""
+        user_ids = self.get_flagged_queue_user_ids()
+        if not user_ids:
+            return []
+        return self.get_flagged_accounts_batch(user_ids)
+
+    def rebuild_flagged_queue_index(self, limit: int = 100_000) -> int:
+        """
+        One-time migration: scan flagged_accounts and rebuild flagged_queue:index.
+        Run with loadgen paused. Returns number of user_ids indexed.
+        """
+        accounts = self.get_all_flagged_accounts(limit=limit)
+        user_ids: List[str] = []
+        seen = set()
+        for account in accounts:
+            uid = account.get('user_id') or account.get('account_id')
+            if uid and uid not in seen:
+                seen.add(uid)
+                user_ids.append(str(uid))
+        now = datetime.now().isoformat()
+        self.put(SET_FLAGGED_QUEUE, 'index', {
+            'user_ids': user_ids,
+            'total': len(user_ids),
+            'last_updated': now,
+            'rebuilt_at': now,
+        })
+        return len(user_ids)
 
     def get_flagged_accounts_for_feed(self) -> List[Dict[str, Any]]:
         """
@@ -2118,16 +2163,25 @@ class AerospikeService:
         return {
             "users": self.truncate_set(SET_USERS),
             "flagged_accounts": self.truncate_set(SET_FLAGGED_ACCOUNTS),
+            "flagged_queue": self.truncate_set(SET_FLAGGED_QUEUE),
+            "fraud_feed": self.truncate_set(SET_FRAUD_FEED),
             "account_facts": self.truncate_set(SET_ACCOUNT_FACT),
             "device_facts": self.truncate_set(SET_DEVICE_FACT),
             "transactions": self.truncate_set(SET_TRANSACTIONS),
             "evaluations": self.truncate_set(SET_EVALUATIONS),
             "history": self.truncate_set(SET_HISTORY),
             "investigations": self.truncate_set(SET_INVESTIGATIONS),
-            # LangGraph checkpoint sets
+            # LangGraph checkpoint sets (INVESTIGATION_ENGINE=langgraph)
             "lg_checkpoints": self.truncate_set("lg_cp"),
             "lg_checkpoint_writes": self.truncate_set("lg_cp_w"),
             "lg_checkpoint_meta": self.truncate_set("lg_cp_meta"),
+            # Cross-engine case memory (ADK + LangGraph via case_memory.py)
+            "case_memory": self.truncate_set(SET_CASE_MEMORY),
+            # Google ADK session/artifact sets (INVESTIGATION_ENGINE=adk only)
+            "adk_sessions": self.truncate_set("adk_sessions"),
+            "adk_app_state": self.truncate_set("adk_app_state"),
+            "adk_user_state": self.truncate_set("adk_user_state"),
+            "adk_artifacts": self.truncate_set("adk_artifacts"),
         }
     
     # ----------------------------------------------------------------------------------------------------------

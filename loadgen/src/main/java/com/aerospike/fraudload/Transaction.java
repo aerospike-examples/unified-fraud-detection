@@ -14,12 +14,15 @@ public record Transaction(
         String location,
         Instant timestamp,
         boolean fraud,
-        double fraudScore) {
+        double fraudScore,
+        String alertAccountId,
+        String fraudTypology) {
 
     /** Convenience constructor for benign transactions (fraud=false, score=0). */
     public Transaction(String txnId, String senderAccountId, String receiverAccountId,
                        long amountCents, String type, String location, Instant timestamp) {
-        this(txnId, senderAccountId, receiverAccountId, amountCents, type, location, timestamp, false, 0.0);
+        this(txnId, senderAccountId, receiverAccountId, amountCents, type, location, timestamp,
+                false, 0.0, null, null);
     }
 
     /** The per-entry map stored under the txs map, keyed by ISO timestamp. */

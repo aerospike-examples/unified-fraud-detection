@@ -1,15 +1,21 @@
 """
 Investigation Workflow Package
 
-LangGraph-based fraud investigation workflow that orchestrates
-multi-dimensional evidence gathering and LLM-powered analysis.
+Polymorphic fraud-investigation backends:
+
+- ``adk`` — Google ADK SequentialAgent (Aerospike sessions/memory/artifacts)
+- ``langgraph`` — LangGraph StateGraph with ADK feature parity
+
+Select via ``INVESTIGATION_ENGINE`` (default ``adk``).
 """
 
+from workflow.engines import get_engine, SUPPORTED_ENGINES, BaseInvestigationEngine
 from workflow.state import InvestigationState, create_initial_state
-from workflow.graph import create_investigation_workflow
 
 __all__ = [
+    "BaseInvestigationEngine",
+    "get_engine",
+    "SUPPORTED_ENGINES",
     "InvestigationState",
-    "create_initial_state", 
-    "create_investigation_workflow"
+    "create_initial_state",
 ]

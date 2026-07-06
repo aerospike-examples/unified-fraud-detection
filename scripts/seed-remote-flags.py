@@ -304,6 +304,8 @@ def main():
 
     print(f"\nDone. flagged={flagged}, missing={missing}, requested={len(user_ids)}")
     if not args.dry_run:
+        indexed = aerospike_service.rebuild_flagged_queue_index()
+        print(f"flagged_queue:index rebuilt ({indexed} user_ids)")
         print("Review queue is now populated. Open the app (remote mode) to investigate.")
 
 

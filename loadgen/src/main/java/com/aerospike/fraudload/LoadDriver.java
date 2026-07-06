@@ -51,21 +51,16 @@ public final class LoadDriver {
             PairedWriter pairedWriter = (kvWriter != null && graph != null)
                     ? new PairedWriter(kvWriter, graph) : null;
 
-            // Populate the review queue + update feed for the fraud cohort UP FRONT so
-            // the frontend has flagged accounts to show immediately; the fraudulent
-            // TRANSACTS edges then stream in as the workers run below. Requires KV
-            // (flagged_accounts is a KV set); graph is only used for the account->user
-            // OWNS fallback when the id pattern doesn't match.
-            FraudCohort cohort = cfg.fraudCohort();
-            if (cohort != null && !cohort.isEmpty()) {
-                if (client != null) {
-                    FraudInjector injector = new FraudInjector(
-                            client, cfg.namespace(), graph, cfg.accountPrefix(), cfg.userPrefix());
-                    int flagged = injector.injectFlags(cohort);
-                    log.info("flagged {} cohort accounts into review queue", flagged);
-                } else {
-                    log.warn("cohort set but write mode has no KV client; "
-                            + "flagged_accounts/fraud_feed NOT written (use --mode kv or paired)");
+            final FraudInjector fraudInjector;
+            if (client != null && cfg.fraudRatio() > 0.0) {
+                fraudInjector = new FraudInjector(client, cfg.namespace(), graph,
+                        cfg.accountPrefix(), cfg.userPrefix());
+                fraudInjector.beginRun();
+            } else {
+                fraudInjector = null;
+                if (cfg.fraudRatio() > 0.0 && client == null) {
+                    log.warn("fraud-ratio set but write mode has no KV client; "
+                            + "live flags require --mode kv or paired");
                 }
             }
 
@@ -97,7 +92,7 @@ public final class LoadDriver {
                     Random rnd = new Random(0x5DEECE66DL ^ workerIndex);
                     KeyShard shard = new KeyShard(workerIndex, cfg.workers(), cfg.accountPool().size());
                     TransactionGenerator gen = new TransactionGenerator(cfg.accountPool(), shard, rnd);
-                    boolean fraudEnabled = cohort != null && !cohort.isEmpty() && cfg.fraudRatio() > 0.0;
+                    boolean fraudEnabled = cfg.fraudRatio() > 0.0;
                     long next = System.nanoTime();
                     try {
                         while (System.nanoTime() < deadline) {
@@ -108,12 +103,15 @@ public final class LoadDriver {
                             }
                             try {
                                 Transaction t = (fraudEnabled && rnd.nextDouble() < cfg.fraudRatio())
-                                        ? gen.fraudTransaction(cohort)
+                                        ? gen.fraudTransaction()
                                         : gen.next();
                                 switch (cfg.writeMode()) {
                                     case kv -> kvWriter.writeTransaction(t);
                                     case graph -> graph.writeEdge(t);
                                     case paired -> pairedWriter.writeTransaction(t, pairExecutor);
+                                }
+                                if (t.fraud() && fraudInjector != null) {
+                                    fraudInjector.flagOnDetection(t);
                                 }
                                 metrics.recordTxn();
                                 metrics.recordAmount(t.amountCents());

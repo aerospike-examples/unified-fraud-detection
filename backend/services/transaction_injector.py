@@ -108,6 +108,10 @@ class TransactionInjector:
             'velocity_burst_size': 30,       # Transactions per burst
             'amount_anomaly_count': 20,      # High-value outlier transactions
             'new_account_fraud_count': 5,    # New accounts with immediate activity
+            # Fraud bursts land within this many recent days so they fall inside the
+            # feature-detection window (feature_service.default_window_days = 7).
+            # Normal transactions still spread over the full spread_days for history.
+            'fraud_recency_days': 7,
         }
     
     def _get_account_lock(self, account_id: str) -> threading.Lock:
@@ -225,11 +229,11 @@ class TransactionInjector:
                 receiver = random.choice([a for a in ring_accounts if a != sender])
                 
                 amount = random.uniform(2000, 15000)
-                timestamp = self._generate_timestamp(spread_days)
+                timestamp = self._recent_fraud_timestamp()
                 txn_id = str(uuid.uuid4())
                 location = random.choice(self._run_locations())
                 txn_type = random.choice(self.txn_types)
-                
+
                 sender_user = account_to_user.get(sender, '')
                 receiver_user = account_to_user.get(receiver, '')
                 device_id = ''
@@ -237,7 +241,7 @@ class TransactionInjector:
                     devices = user_to_devices[sender_user]
                     if devices:
                         device_id = random.choice(devices)
-                
+
                 transactions.append({
                     'graph': {
                         'sender_account_id': sender,
@@ -309,8 +313,10 @@ class TransactionInjector:
         
         anomaly_accounts = random.sample(accounts, min(anomaly_count, len(accounts) // 2))
         
+        recency = max(1, self.fraud_config.get('fraud_recency_days', 7))
         for anomaly_account in anomaly_accounts:
-            burst_day = random.randint(1, max(1, spread_days - 1))
+            # Burst lands within the recent feature-detection window.
+            burst_day = random.randint(1, max(1, min(recency, spread_days) - 1) or 1)
             
             for _ in range(burst_size):
                 receiver = random.choice([a for a in accounts if a != anomaly_account])
@@ -406,8 +412,8 @@ class TransactionInjector:
                 random.uniform(50000, 100000),
                 random.uniform(10000, 15000),
             ])
-            
-            timestamp = self._generate_timestamp(spread_days)
+
+            timestamp = self._recent_fraud_timestamp()
             txn_id = str(uuid.uuid4())
             location = random.choice(self._run_locations())
             txn_type = 'transfer'
@@ -1190,8 +1196,19 @@ class TransactionInjector:
         days_back = random.randint(0, days_back_max)
         hours_back = random.randint(0, 23)
         minutes_back = random.randint(0, 59)
-        
+
         dt = datetime.now() - timedelta(days=days_back, hours=hours_back, minutes=minutes_back)
+        return dt.isoformat()
+
+    def _recent_fraud_timestamp(self) -> str:
+        """Timestamp within the recent fraud window so injected fraud falls inside
+        the feature-detection window and is actually detectable."""
+        recency = max(1, self.fraud_config.get('fraud_recency_days', 7))
+        dt = datetime.now() - timedelta(
+            days=random.randint(0, recency - 1),
+            hours=random.randint(0, 23),
+            minutes=random.randint(0, 59),
+        )
         return dt.isoformat()
     
     def _create_transaction(

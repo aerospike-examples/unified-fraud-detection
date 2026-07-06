@@ -49,38 +49,49 @@ public final class TransactionGenerator {
                 Instant.now());
     }
 
-    private String shardAccountOtherThan(String excluded) {
+    private String randomShardAccount() {
         int span = endIndex - firstIndex;
-        String id = pool.idAt(firstIndex + random.nextInt(span));
-        if (id.equals(excluded) && span > 1) {
-            id = pool.idAt(firstIndex + ((firstIndex + random.nextInt(span) + 1 - firstIndex) % span));
+        return pool.idAt(firstIndex + random.nextInt(span));
+    }
+
+    private String randomShardAccountOtherThan(String excluded) {
+        int span = endIndex - firstIndex;
+        if (span <= 1) {
+            return excluded;
+        }
+        String id = randomShardAccount();
+        int guard = 0;
+        while (id.equals(excluded) && guard++ < 8) {
+            id = randomShardAccount();
         }
         return id;
     }
 
     /**
-     * Builds a fraudulent transaction using the cohort: either fan-in (a shard
-     * account sends to a global mule) or fan-out (a global fraudster sends to a
-     * shard account). High value + high fraud score. Cross-shard by design so
-     * mule fan-in / fraudster fan-out actually concentrate.
+     * Fraudulent transaction between random accounts in this shard. Alternates fan-out
+     * (flag sender) and fan-in (flag receiver) patterns. No fixed cohort — mimics live
+     * detection on suspicious activity anywhere in the graph.
      */
-    public Transaction fraudTransaction(FraudCohort cohort) {
-        boolean canFanIn = cohort.muleCount() > 0;
-        boolean canFanOut = cohort.fraudsterCount() > 0;
-        boolean fanOut = canFanOut && (!canFanIn || random.nextBoolean());
-
+    public Transaction fraudTransaction() {
+        boolean fanOut = random.nextBoolean();
         String sender;
         String receiver;
+        String alertAccount;
+        String typology;
         if (fanOut) {
-            sender = cohort.randomFraudster(random);
-            receiver = shardAccountOtherThan(sender);
+            sender = randomShardAccount();
+            receiver = randomShardAccountOtherThan(sender);
+            alertAccount = sender;
+            typology = "fraudster";
         } else {
-            receiver = cohort.randomMule(random);
-            sender = shardAccountOtherThan(receiver);
+            receiver = randomShardAccount();
+            sender = randomShardAccountOtherThan(receiver);
+            alertAccount = receiver;
+            typology = "money_mule";
         }
 
         long amountCents = 300_000L + (long) (random.nextDouble() * 4_700_000L); // $3k-$50k
-        double score = Math.round((70.0 + random.nextDouble() * 30.0) * 100.0) / 100.0; // 70-100
+        double score = Math.round((70.0 + random.nextDouble() * 30.0) * 100.0) / 100.0;
         return new Transaction(
                 UUID.randomUUID().toString(),
                 sender,
@@ -90,6 +101,8 @@ public final class TransactionGenerator {
                 LOCATIONS[random.nextInt(LOCATIONS.length)],
                 Instant.now(),
                 true,
-                score);
+                score,
+                alertAccount,
+                typology);
     }
 }

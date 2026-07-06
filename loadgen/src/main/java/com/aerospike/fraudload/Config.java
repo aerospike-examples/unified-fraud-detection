@@ -13,7 +13,6 @@ public record Config(
         WriteMode writeMode,
         String graphHost,
         int graphPort,
-        FraudCohort fraudCohort,
         double fraudRatio,
         String accountPrefix,
         String userPrefix) {

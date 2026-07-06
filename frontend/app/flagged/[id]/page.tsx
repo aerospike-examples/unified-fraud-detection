@@ -23,15 +23,16 @@ import {
     Shield,
     Smartphone,
     Globe,
-    Brain,
-    PlayCircle,
-    StopCircle,
     RefreshCw
 } from 'lucide-react'
 import ReviewWorkflow from '@/components/Flagged/Details/ReviewWorkflow'
 import GraphVisualization from '@/components/Flagged/Details/GraphVisualization'
 import { InvestigationReport } from '@/components/Flagged/Details/InvestigationReport'
 import PerformanceMetricsPanel from '@/components/Flagged/Details/PerformanceMetricsPanel'
+import { ActionApprovalCard } from '@/components/Flagged/Details/ActionApprovalCard'
+import { DecisionReviewDialog } from '@/components/Flagged/Details/DecisionReviewDialog'
+import { EvidenceSpecialists } from '@/components/Flagged/Details/EvidenceSpecialists'
+import { PriorCasesPanel } from '@/components/Flagged/Details/PriorCasesPanel'
 import { useInvestigation } from '@/hooks/useInvestigation'
 import { useAccountData } from '@/hooks/useAccountData'
 import { formatCurrency } from '@/lib/utils'
@@ -109,6 +110,8 @@ export default function FlaggedAccountDetailsPage() {
     const [currentStep, setCurrentStep] = useState(0)
     const [activeTab, setActiveTab] = useState('overview')
     const [loadedExisting, setLoadedExisting] = useState(false)
+    // Review-report-and-decide dialog (opens when the agent pauses for approval)
+    const [reviewOpen, setReviewOpen] = useState(false)
     
     // Fetch real account data
     const { data: account, loading, error, refetch } = useAccountData(accountId)
@@ -129,6 +132,23 @@ export default function FlaggedAccountDetailsPage() {
         }
         loadExisting()
     }, [account?.user_id, investigation.status, loadedExisting])
+
+    // When the agent pauses for approval, open the review-and-decide dialog so the
+    // analyst reads the full report before approving/rejecting.
+    useEffect(() => {
+        if (investigation.status === 'awaiting_confirmation') {
+            setActiveTab('investigation')
+            setReviewOpen(true)
+        } else {
+            setReviewOpen(false)
+        }
+    }, [investigation.status])
+
+    // Refresh the account once the run completes so the flagged status reflects
+    // whatever disposition was enacted (approve or override).
+    useEffect(() => {
+        if (investigation.status === 'completed') refetch()
+    }, [investigation.status, refetch])
 
     const handleStartInvestigation = () => {
         if (account) {
@@ -185,24 +205,7 @@ export default function FlaggedAccountDetailsPage() {
                     <Button variant="outline" size="icon" onClick={refetch} title="Refresh data" className="border-slate-300">
                         <RefreshCw className="h-4 w-4" />
                     </Button>
-                    {/* Investigation Button */}
-                    {investigation.status === 'idle' || investigation.status === 'completed' || investigation.status === 'error' ? (
-                        <Button 
-                            onClick={handleStartInvestigation}
-                            className="bg-indigo-600 hover:bg-indigo-700 text-white"
-                        >
-                            <Brain className="h-4 w-4 mr-2" />
-                            Start AI Investigation
-                        </Button>
-                    ) : (
-                        <Button 
-                            onClick={handleStopInvestigation}
-                            variant="destructive"
-                        >
-                            <StopCircle className="h-4 w-4 mr-2" />
-                            Stop Investigation
-                        </Button>
-                    )}
+                    {/* AI Investigation start/stop now lives in the Review Workflow panel */}
                     <Link href={`/users/${account.user_id}`}>
                         <Button variant="outline" className="border-slate-300 text-slate-700 hover:bg-slate-50">
                             <User className="h-4 w-4 mr-2" />
@@ -412,6 +415,15 @@ export default function FlaggedAccountDetailsPage() {
 
                         {/* Investigation Tab - Shows report (progress is in Review Workflow on the right) */}
                         <TabsContent value="investigation" className="mt-6 space-y-6">
+                            <PriorCasesPanel priorCases={investigation.priorCases} />
+
+                            <EvidenceSpecialists
+                                specialistFindings={investigation.specialistFindings}
+                                toolCalls={investigation.toolCalls}
+                                active={investigation.currentNode === 'llm_agent' &&
+                                    (investigation.status === 'running' || investigation.status === 'awaiting_confirmation')}
+                            />
+
                             <InvestigationReport
                                 userId={accountId}
                                 finalAssessment={investigation.finalAssessment}
@@ -426,7 +438,36 @@ export default function FlaggedAccountDetailsPage() {
                                 accountProfile={investigation.accountProfile}
                                 networkEvidence={investigation.networkEvidence}
                             />
-                            
+
+                            {/* Actions enacted by the agent (after analyst approval) */}
+                            {investigation.enactedActions.length > 0 && (
+                                <Card className="bg-white border-slate-200 shadow-sm">
+                                    <CardHeader>
+                                        <CardTitle className="flex items-center gap-2 text-lg text-slate-900">
+                                            <Shield className="h-5 w-5 text-emerald-600" />
+                                            Actions Taken
+                                        </CardTitle>
+                                        <CardDescription className="text-slate-500">
+                                            Mitigation actions the agent enacted on this account
+                                        </CardDescription>
+                                    </CardHeader>
+                                    <CardContent className="space-y-3">
+                                        {investigation.enactedActions.map((action, idx) => (
+                                            <div key={idx} className="flex items-start gap-3 rounded-lg border border-emerald-100 bg-emerald-50 p-3">
+                                                <div className="mt-0.5 h-2 w-2 rounded-full bg-emerald-500" />
+                                                <div className="flex-1">
+                                                    <p className="font-medium text-slate-900">
+                                                        {action.action.replace(/_/g, ' ')}
+                                                        <span className="ml-2 font-mono text-xs text-slate-500">{action.account_id}</span>
+                                                    </p>
+                                                    <p className="text-sm text-slate-600">{action.effect}</p>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </CardContent>
+                                </Card>
+                            )}
+
                             {/* Graph visualization from investigation if available */}
                             {investigation.networkEvidence?.subgraph_nodes && investigation.networkEvidence.subgraph_nodes.length > 0 && (
                                 <Card className="bg-white border-slate-200 shadow-sm">
@@ -631,20 +672,30 @@ export default function FlaggedAccountDetailsPage() {
                 </div>
 
                 {/* Right Column - Workflow with AI Integration */}
-                <div className="lg:col-span-1">
-                    <ReviewWorkflow 
+                <div className="lg:col-span-1 space-y-6">
+                    {/* Human-in-the-loop: agent paused awaiting analyst approval */}
+                    {investigation.status === 'awaiting_confirmation' && investigation.pendingAction && (
+                        <ActionApprovalCard
+                            pendingAction={investigation.pendingAction}
+                            onApprove={() => investigation.approveAction(true)}
+                            onOverride={(d) => investigation.approveAction(false, d)}
+                            onReview={() => setReviewOpen(true)}
+                        />
+                    )}
+
+                    <ReviewWorkflow
                         currentStep={currentStep}
                         onStepChange={setCurrentStep}
                         investigationStatus={investigation.status}
+                        aiDecision={investigation.enactedActions[0]?.action || investigation.finalAssessment?.decision || ''}
                         investigationSteps={investigation.steps}
                         completedInvestigationSteps={investigation.completedSteps}
                         currentNode={investigation.currentNode}
                         toolCalls={investigation.toolCalls}
                         traceEvents={investigation.traceEvents}
                         getStepStatus={investigation.getStepStatus}
-                        accountPredictions={account.account_predictions || []}
-                        highestRiskAccountId={account.highest_risk_account_id || ''}
-                        existingResolutions={account.account_resolutions || {}}
+                        onStart={handleStartInvestigation}
+                        onStop={handleStopInvestigation}
                     />
                     
                     {/* Performance Metrics - shown after investigation runs */}
@@ -653,6 +704,18 @@ export default function FlaggedAccountDetailsPage() {
                     )}
                 </div>
             </div>
+
+            {/* Review the full report, then approve/reject — opens at the approval pause */}
+            {investigation.status === 'awaiting_confirmation' && investigation.pendingAction && (
+                <DecisionReviewDialog
+                    open={reviewOpen}
+                    onOpenChange={setReviewOpen}
+                    pendingAction={investigation.pendingAction}
+                    report={investigation.report}
+                    onApprove={() => { setReviewOpen(false); investigation.approveAction(true) }}
+                    onOverride={(d) => { setReviewOpen(false); investigation.approveAction(false, d) }}
+                />
+            )}
         </div>
     )
 }

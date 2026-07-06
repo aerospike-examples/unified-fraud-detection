@@ -32,4 +32,20 @@ class TransactionGeneratorTest {
             assertTrue(receiverIdx >= shard.firstIndex() && receiverIdx < shard.endIndex());
         }
     }
+
+    @Test
+    void fraudTransactionUsesRandomAccountsAndAlertParty() {
+        AccountPool pool = AccountPool.deterministic(10_000, "Account");
+        KeyShard shard = new KeyShard(0, 4, 10_000);
+        TransactionGenerator gen = new TransactionGenerator(pool, shard, new Random(99));
+        for (int i = 0; i < 200; i++) {
+            Transaction t = gen.fraudTransaction();
+            assertTrue(t.fraud());
+            assertNotNull(t.alertAccountId());
+            assertTrue(t.alertAccountId().startsWith("Account"));
+            assertNotEquals(t.senderAccountId(), t.receiverAccountId());
+            assertTrue(t.amountCents() >= 300_000L);
+            assertFalse(t.alertAccountId().equals("Account1"));
+        }
+    }
 }

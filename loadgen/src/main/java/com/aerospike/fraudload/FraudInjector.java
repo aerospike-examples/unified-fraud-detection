@@ -16,37 +16,36 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Populates the small, directly-readable KV structures that let the frontend
- * find injected fraud WITHOUT scanning the billion-row dataset:
- *
- *   - flagged_accounts (keyed by user_id): the durable review queue the app
- *     already reads. Bins use the same shortened names the Python service writes
- *     (Aerospike's 15-char limit), so the backend expands them transparently.
- *
- *   - fraud_feed (single record): a short "recently flagged" update queue the
- *     frontend polls to detect a new injection run and refresh the queue.
- *
- * Account -> user mapping is deterministic (Account{n} -> User{n}, configurable
- * prefixes) with a graph in('OWNS') fallback for non-matching id schemes.
+ * Live fraud detection: flags accounts when fraudulent transactions are written.
+ * Persists a durable review queue in flagged_accounts (key=user_id) plus a
+ * persistent flagged_queue index for batch reads across loadgen restarts.
  */
 public final class FraudInjector {
     private static final Logger log = LoggerFactory.getLogger(FraudInjector.class);
 
     public static final String FLAGGED_SET = "flagged_accounts";
+    public static final String QUEUE_SET = "flagged_queue";
+    public static final String QUEUE_KEY = "index";
     public static final String FEED_SET = "fraud_feed";
     public static final String FEED_KEY = "fraud_feed";
     private static final int RECENT_CAP = 100;
+    private static final int QUEUE_CAP = 50_000;
 
     private final AerospikeClient client;
     private final String namespace;
-    private final GraphWriter graph; // nullable; used only for OWNS fallback
+    private final GraphWriter graph;
     private final String accountPrefix;
     private final String userPrefix;
     private final WritePolicy writePolicy;
     private final Random rnd = new Random(20260703L);
-    private final List<String> flaggedUserIds = new ArrayList<>();
+    /** Users flagged this JVM run — avoids duplicate KV writes under concurrency. */
+    private final Set<String> flaggedUsers = ConcurrentHashMap.newKeySet();
+    /** Users already in persistent queue index (loaded at beginRun). */
+    private final Set<String> queuedUsers = ConcurrentHashMap.newKeySet();
 
     public FraudInjector(AerospikeClient client, String namespace, GraphWriter graph,
                          String accountPrefix, String userPrefix) {
@@ -58,47 +57,55 @@ public final class FraudInjector {
         this.writePolicy = new WritePolicy(client.writePolicyDefault);
     }
 
-    /** Writes flagged_accounts + fraud_feed for the whole cohort. Returns count written. */
-    public int injectFlags(FraudCohort cohort) {
-        if (cohort.isEmpty()) {
-            return 0;
-        }
-        String runId = Instant.now().toString();
-        flaggedUserIds.clear();
-        resetFeed(runId);
+    /** Reset per-run fraud_feed counters; load persistent queue index into memory. */
+    public void beginRun() {
+        flaggedUsers.clear();
+        queuedUsers.clear();
+        queuedUsers.addAll(loadQueueUserIds());
 
-        int written = 0;
-        for (String acct : cohort.mules()) {
-            written += flagOne(acct, "money_mule", "Concentrated fan-in from many senders", written);
-        }
-        for (String acct : cohort.fraudsters()) {
-            written += flagOne(acct, "fraudster", "Rapid fan-out of high-value transfers", written);
-        }
-        writeFeedUserIndex();
-        log.info("fraud injection: wrote {} flagged_accounts (+fraud_feed run {})", written, runId);
-        return written;
+        String runId = Instant.now().toString();
+        Key key = new Key(namespace, FEED_SET, FEED_KEY);
+        client.put(writePolicy, key,
+                new Bin("total", 0),
+                new Bin("recent", Value.get(new ArrayList<>())),
+                new Bin("run_id", runId),
+                new Bin("run_started", runId),
+                new Bin("last_updated", runId));
+        log.info("live fraud detection enabled (fraud_feed run {}, {} users in flagged_queue)",
+                runId, queuedUsers.size());
     }
 
-    private int flagOne(String accountId, String typology, String reason, int writtenSoFar) {
+    /**
+     * Flag the alert account from a fraudulent transaction if not already flagged.
+     * Thread-safe for concurrent loadgen workers.
+     */
+    public void flagOnDetection(Transaction txn) {
+        if (!txn.fraud() || txn.alertAccountId() == null) {
+            return;
+        }
+        String accountId = txn.alertAccountId();
         String userId = resolveUser(accountId);
         if (userId == null) {
-            log.warn("could not map account {} to a user; skipping flag", accountId);
-            return 0;
+            log.debug("could not map account {} to user; skipping live flag", accountId);
+            return;
         }
-        double risk = Math.round((72.0 + rnd.nextDouble() * 27.0) * 100.0) / 100.0;
-        double amount = Math.round((5_000.0 + rnd.nextDouble() * 145_000.0) * 100.0) / 100.0;
+        if (!flaggedUsers.add(userId)) {
+            return;
+        }
+        String typology = txn.fraudTypology() != null ? txn.fraudTypology() : "suspicious_activity";
+        String reason = reasonFor(typology);
+        double risk = txn.fraudScore() > 0
+                ? txn.fraudScore()
+                : Math.round((72.0 + rnd.nextDouble() * 27.0) * 100.0) / 100.0;
+        double amount = Math.round((txn.amountCents() / 100.0) * 100.0) / 100.0;
         String now = Instant.now().toString();
 
-        // account_predictions: single-element list of {account_id, risk_score}
         List<Object> preds = new ArrayList<>();
         Map<String, Object> pred = new LinkedHashMap<>();
         pred.put("account_id", accountId);
         pred.put("risk_score", risk);
         preds.add(pred);
 
-        // Bin names MUST match Python _shorten_bin_names output:
-        //   account_holder -> acct_holder, total_flagged_amount -> total_flag_amt,
-        //   account_predictions -> acct_preds. Others pass through unchanged.
         Key key = new Key(namespace, FLAGGED_SET, userId);
         client.put(writePolicy, key,
                 new Bin("account_id", accountId),
@@ -112,16 +119,19 @@ public final class FraudInjector {
                 new Bin("flagged_date", now),
                 new Bin("total_flag_amt", amount),
                 new Bin("acct_preds", Value.get(preds)),
-                new Bin("model_version", "loadgen-fraud-v1"),
+                new Bin("model_version", "loadgen-live-v1"),
                 new Bin("confidence", 0.9),
-                new Bin("source", "loadgen"),
+                new Bin("source", "loadgen-live"),
                 new Bin("created_at", now));
 
-        // Always bump the total; only keep the first RECENT_CAP entries in the
-        // preview list to keep the single feed record small for large cohorts.
-        appendFeed(userId, accountId, risk, reason, now, writtenSoFar < RECENT_CAP);
-        flaggedUserIds.add(userId);
-        return 1;
+        appendQueueUserId(userId, now);
+        appendFeed(userId, accountId, risk, reason, now);
+    }
+
+    private static String reasonFor(String typology) {
+        return "money_mule".equals(typology)
+                ? "Concentrated fan-in from many senders"
+                : "Rapid fan-out of high-value transfers";
     }
 
     private String resolveUser(String accountId) {
@@ -131,53 +141,79 @@ public final class FraudInjector {
                 return userPrefix + suffix;
             }
         }
-        // Fallback: resolve via the graph if a client is available.
         return graph != null ? graph.resolveOwner(accountId) : null;
     }
 
-    private void writeFeedUserIndex() {
-        if (flaggedUserIds.isEmpty()) {
+    @SuppressWarnings("unchecked")
+    private List<String> loadQueueUserIds() {
+        List<String> ids = new ArrayList<>();
+        try {
+            Key key = new Key(namespace, QUEUE_SET, QUEUE_KEY);
+            var rec = client.get(null, key);
+            if (rec != null) {
+                Object raw = rec.getValue("user_ids");
+                if (raw instanceof List<?> list) {
+                    for (Object o : list) {
+                        if (o != null) {
+                            ids.add(o.toString());
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("could not read flagged_queue index: {}", e.toString());
+        }
+        return ids;
+    }
+
+    private void appendQueueUserId(String userId, String ts) {
+        if (!queuedUsers.add(userId)) {
             return;
         }
-        Key key = new Key(namespace, FEED_SET, FEED_KEY);
-        client.operate(writePolicy, key,
-                Operation.put(new Bin("user_ids", Value.get(new ArrayList<>(flaggedUserIds)))));
+        if (queuedUsers.size() > QUEUE_CAP) {
+            log.warn("flagged_queue cap {} reached; skipping index append for {}", QUEUE_CAP, userId);
+            return;
+        }
+        Key key = new Key(namespace, QUEUE_SET, QUEUE_KEY);
+        synchronized (this) {
+            try {
+                client.operate(writePolicy, key,
+                        ListOperation.append("user_ids", Value.get(userId)),
+                        Operation.add(new Bin("total", 1)),
+                        Operation.put(new Bin("last_updated", ts)));
+            } catch (Exception e) {
+                log.debug("flagged_queue append failed for {}: {}", userId, e.toString());
+            }
+        }
     }
 
-    private void resetFeed(String runId) {
-        String now = Instant.now().toString();
+    private void appendFeed(String userId, String accountId, double risk, String reason, String ts) {
         Key key = new Key(namespace, FEED_SET, FEED_KEY);
-        client.put(writePolicy, key,
-                new Bin("total", 0),
-                new Bin("recent", Value.get(new ArrayList<>())),
-                new Bin("user_ids", Value.get(new ArrayList<>())),
-                new Bin("run_id", runId),
-                new Bin("run_started", now),
-                new Bin("last_updated", now));
-    }
-
-    private void appendFeed(String userId, String accountId, double risk, String reason,
-                            String ts, boolean keepInPreview) {
-        Key key = new Key(namespace, FEED_SET, FEED_KEY);
-        try {
-            if (keepInPreview) {
+        synchronized (this) {
+            try {
                 Map<String, Object> entry = new LinkedHashMap<>();
                 entry.put("user_id", userId);
                 entry.put("account_id", accountId);
                 entry.put("risk_score", risk);
                 entry.put("reason", reason);
                 entry.put("ts", ts);
-                client.operate(writePolicy, key,
-                        Operation.add(new Bin("total", 1)),
-                        ListOperation.append("recent", Value.get(entry)),
-                        Operation.put(new Bin("last_updated", ts)));
-            } else {
-                client.operate(writePolicy, key,
-                        Operation.add(new Bin("total", 1)),
-                        Operation.put(new Bin("last_updated", ts)));
+
+                int runTotal = flaggedUsers.size();
+                boolean keepInPreview = runTotal <= RECENT_CAP;
+
+                if (keepInPreview) {
+                    client.operate(writePolicy, key,
+                            Operation.add(new Bin("total", 1)),
+                            ListOperation.append("recent", Value.get(entry)),
+                            Operation.put(new Bin("last_updated", ts)));
+                } else {
+                    client.operate(writePolicy, key,
+                            Operation.add(new Bin("total", 1)),
+                            Operation.put(new Bin("last_updated", ts)));
+                }
+            } catch (Exception e) {
+                log.debug("feed append failed for {}: {}", userId, e.toString());
             }
-        } catch (Exception e) {
-            log.debug("feed append failed for {}: {}", userId, e.toString());
         }
     }
 }
