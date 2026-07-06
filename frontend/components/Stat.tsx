@@ -6,7 +6,7 @@ export type Color = 'destructive' | 'warning' | 'foreground' | 'green-600' | 'bl
 
 export interface StatProps {
     color?: Color
-    stat?: string | number | {
+    stat?: string | number | null | {
         icon: {
             name: IconName
             color: Color
@@ -39,7 +39,7 @@ const Stat = ({
             <CardContent className='p-4 pt-1'>
                 <div className={`flex items-center justify-between text-${color}`}>
                     <div>
-                        {typeof stat === 'object' ? (
+                        {typeof stat === 'object' && stat !== null ? (
                             <Label icon={stat.icon.name} color={stat.icon.color} text={stat.text} size='lg' loading={loading} />
                         ) : (
                             loading ? (

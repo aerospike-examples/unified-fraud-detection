@@ -248,19 +248,25 @@ def get_dashboard_stats():
             except Exception as e:
                 logger.warning(f"Could not read flagged stats in remote mode: {e}")
 
-            # Optional aggregate record (amount, fraud_rate) from external pipeline
+            # Optional aggregate record (amount, fraud_rate, live txn count) from external pipeline
             amount = None
             fraud_rate = None
+            txn_count = None
             aggregate = aerospike_service.get_remote_aggregate_stats()
             if aggregate:
                 amount = aggregate.get("total_amount", aggregate.get("amount"))
                 fraud_rate = aggregate.get("fraud_rate")
                 if aggregate.get("flagged") is not None:
                     flagged_count = aggregate.get("flagged")
+                if aggregate.get("txns") is not None:
+                    txn_count = aggregate.get("txns")
 
-            return graph_service.get_dashboard_stats_from_summary(
+            stats = graph_service.get_dashboard_stats_from_summary(
                 flagged_count=flagged_count, amount=amount, fraud_rate=fraud_rate
             )
+            if txn_count is not None:
+                stats["txns"] = txn_count
+            return stats
 
         return aerospike_service.get_dashboard_stats()
     except Exception as e:
@@ -567,6 +573,20 @@ def get_transaction_stats():
 
 
 
+@app.get("/transaction/{account_id}/txn/{txn_id}")
+def get_transaction_detail_graph(account_id: str, txn_id: str):
+    """Get transaction details from the Graph using a bounded account-scoped lookup (remote mode)."""
+    try:
+        detail = graph_service.get_transaction_from_graph(account_id, txn_id)
+        if not detail:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        return detail
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get transaction detail: {str(e)}")
+
+
 @app.get("/transaction/{account_id}/{day}/{txn_id}")
 def get_transaction_detail_kv(account_id: str, day: str, txn_id: str):
     """Get transaction details from KV store by account_id, day, and txn_id"""
@@ -652,7 +672,15 @@ def get_transaction_detail_kv(account_id: str, day: str, txn_id: str):
 def get_transaction_detail_legacy(transaction_id: str):
     """Legacy: Get transaction details from Graph by txn_id (backward compatibility)"""
     try:
-        transaction_detail = graph_service.get_transaction_summary(urllib.parse.unquote(transaction_id))
+        txn_id = urllib.parse.unquote(transaction_id)
+        if settings.is_remote_mode():
+            account_id = graph_service.account_id_from_txn_id(txn_id)
+            if account_id:
+                transaction_detail = graph_service.get_transaction_from_graph(account_id, txn_id)
+                if transaction_detail:
+                    return transaction_detail
+            raise HTTPException(status_code=404, detail="Transaction not found")
+        transaction_detail = graph_service.get_transaction_summary(txn_id)
         if not transaction_detail:
             raise HTTPException(status_code=404, detail="Transaction not found")
         return transaction_detail

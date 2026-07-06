@@ -13,10 +13,10 @@ public final class Main implements Callable<Integer> {
     @Option(names = "--host", defaultValue = "localhost", description = "Aerospike host") String host;
     @Option(names = "--port", defaultValue = "3000", description = "Aerospike port") int port;
     @Option(names = "--namespace", defaultValue = "test", description = "Aerospike namespace") String namespace;
-    @Option(names = "--accounts", defaultValue = "1000000",
-            description = "Account count (synthetic) or cap when loading --accounts-file") int accounts;
+    @Option(names = "--accounts", defaultValue = "0",
+            description = "Account pool size (Account1..N); 0 = read account count from graph summary") int accounts;
     @Option(names = "--accounts-file",
-            description = "Graph accounts CSV (~id column); required for graph writes against seeded data") String accountsFile;
+            description = "Optional graph accounts CSV (~id column); default derives Account1..N from --account-prefix") String accountsFile;
     @Option(names = "--workers", defaultValue = "16", description = "Worker threads") int workers;
     @Option(names = "--rate", defaultValue = "0", description = "Target txn/s, 0 = unbounded") long rate;
     @Option(names = "--duration", defaultValue = "30", description = "Run duration in seconds") int duration;
@@ -35,11 +35,18 @@ public final class Main implements Callable<Integer> {
             description = "Account id prefix for deterministic account->user mapping") String accountPrefix;
     @Option(names = "--user-prefix", defaultValue = "User",
             description = "User id prefix for deterministic account->user mapping") String userPrefix;
+    @Option(names = "--cohort-seed", defaultValue = "0",
+            description = "RNG seed for fraud cohort selection; 0 = random each run") long cohortSeed;
 
     @Override
     public Integer call() throws Exception {
         AccountPool pool = resolveAccountPool();
-        FraudCohort cohort = FraudCohort.select(pool, mules, fraudsters);
+        long seed = cohortSeed != 0 ? cohortSeed : System.currentTimeMillis();
+        FraudCohort cohort = FraudCohort.select(pool, mules, fraudsters, seed);
+        if (!cohort.isEmpty()) {
+            System.err.printf("INFO: fraud cohort seed=%d (%d mules, %d fraudsters)%n",
+                    seed, cohort.muleCount(), cohort.fraudsterCount());
+        }
         double effectiveFraudRatio = fraudRatio;
         if (!cohort.isEmpty() && fraudRatio <= 0.0) {
             effectiveFraudRatio = 0.02; // sensible default so a cohort actually gets fraud traffic
@@ -60,11 +67,20 @@ public final class Main implements Callable<Integer> {
             }
             return AccountPool.fromCsv(path, accounts);
         }
-        if (mode.writesGraph()) {
-            System.err.println("WARN: graph mode without --accounts-file uses synthetic acct-N ids; "
-                    + "edges fail unless those vertices exist. Pass the seeded accounts CSV for demos.");
+
+        int poolSize = accounts;
+        if (poolSize <= 0) {
+            if (!mode.writesGraph()) {
+                throw new CommandLine.ParameterException(new CommandLine(this),
+                        "--accounts 0 requires graph or paired mode to read the graph summary");
+            }
+            GraphSummary.Counts summary = GraphSummary.fetch(graphHost, graphPort);
+            poolSize = summary.accountsAsInt();
+            System.err.printf(
+                    "INFO: account pool from graph summary: %,d accounts (%,d users, %,d TRANSACTS edges)%n",
+                    summary.accounts(), summary.users(), summary.transacts());
         }
-        return AccountPool.synthetic(accounts);
+        return AccountPool.deterministic(poolSize, accountPrefix);
     }
 
     public static void main(String[] args) {

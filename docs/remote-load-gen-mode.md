@@ -109,8 +109,9 @@ one of these to give the demo signal:
      deploy/gcp/run-loadgen.sh paired 0 120 16 500000
    ```
 
-   - **Cohort sizing is by count** (`--mules`, `--fraudsters`), taken as the first
-     N accounts from the accounts file.
+   - **Cohort sizing is by count** (`--mules`, `--fraudsters`). Members are **random
+     distinct accounts** from the pool (uniform index in `0..N-1`), with a shared
+     seed (`--cohort-seed`, default random per run) so all workers agree.
    - **Patterns are realistic**: mules receive concentrated fan-in; fraudsters
      originate high-value fan-out/bursts. Fraud edges carry `is_fraud=true` +
      `fraud_score` (surfaced in the transaction list and graph-backed tools).

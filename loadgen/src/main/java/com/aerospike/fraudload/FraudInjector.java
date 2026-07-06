@@ -46,6 +46,7 @@ public final class FraudInjector {
     private final String userPrefix;
     private final WritePolicy writePolicy;
     private final Random rnd = new Random(20260703L);
+    private final List<String> flaggedUserIds = new ArrayList<>();
 
     public FraudInjector(AerospikeClient client, String namespace, GraphWriter graph,
                          String accountPrefix, String userPrefix) {
@@ -63,6 +64,7 @@ public final class FraudInjector {
             return 0;
         }
         String runId = Instant.now().toString();
+        flaggedUserIds.clear();
         resetFeed(runId);
 
         int written = 0;
@@ -72,6 +74,7 @@ public final class FraudInjector {
         for (String acct : cohort.fraudsters()) {
             written += flagOne(acct, "fraudster", "Rapid fan-out of high-value transfers", written);
         }
+        writeFeedUserIndex();
         log.info("fraud injection: wrote {} flagged_accounts (+fraud_feed run {})", written, runId);
         return written;
     }
@@ -117,6 +120,7 @@ public final class FraudInjector {
         // Always bump the total; only keep the first RECENT_CAP entries in the
         // preview list to keep the single feed record small for large cohorts.
         appendFeed(userId, accountId, risk, reason, now, writtenSoFar < RECENT_CAP);
+        flaggedUserIds.add(userId);
         return 1;
     }
 
@@ -131,12 +135,22 @@ public final class FraudInjector {
         return graph != null ? graph.resolveOwner(accountId) : null;
     }
 
+    private void writeFeedUserIndex() {
+        if (flaggedUserIds.isEmpty()) {
+            return;
+        }
+        Key key = new Key(namespace, FEED_SET, FEED_KEY);
+        client.operate(writePolicy, key,
+                Operation.put(new Bin("user_ids", Value.get(new ArrayList<>(flaggedUserIds)))));
+    }
+
     private void resetFeed(String runId) {
         String now = Instant.now().toString();
         Key key = new Key(namespace, FEED_SET, FEED_KEY);
         client.put(writePolicy, key,
                 new Bin("total", 0),
                 new Bin("recent", Value.get(new ArrayList<>())),
+                new Bin("user_ids", Value.get(new ArrayList<>())),
                 new Bin("run_id", runId),
                 new Bin("run_started", now),
                 new Bin("last_updated", now));

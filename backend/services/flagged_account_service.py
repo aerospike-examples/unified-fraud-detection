@@ -24,6 +24,7 @@ from gremlin_python.process.traversal import P
 from services.ml_service import ml_model_service
 from services.graph_service import GraphService
 from services.progress_service import progress_service
+import settings
 
 logger = logging.getLogger('fraud_detection.flagged_accounts')
 
@@ -868,6 +869,16 @@ class FlaggedAccountService:
     # Flagged Accounts Management
     # ----------------------------------------------------------------------------------------------------------
     
+    def _load_flagged_accounts(self) -> List[Dict[str, Any]]:
+        """Load flagged accounts; remote mode uses feed index to avoid set scans."""
+        if not self._use_aerospike():
+            return list(self._flagged_accounts.values())
+        if settings.is_remote_mode():
+            indexed = self._aerospike.get_flagged_accounts_for_feed()
+            if indexed:
+                return indexed
+        return self._aerospike.get_all_flagged_accounts(limit=10000)
+
     def get_flagged_accounts(
         self, 
         page: int = 1, 
@@ -876,11 +887,7 @@ class FlaggedAccountService:
         search: Optional[str] = None
     ) -> Dict[str, Any]:
         """Get paginated list of flagged accounts."""
-        # Get from Aerospike if available
-        if self._use_aerospike():
-            accounts = self._aerospike.get_all_flagged_accounts(limit=10000)
-        else:
-            accounts = list(self._flagged_accounts.values())
+        accounts = self._load_flagged_accounts()
         
         # Filter by status
         if status and status != "all":
@@ -1117,7 +1124,7 @@ class FlaggedAccountService:
     def get_flagged_stats(self) -> Dict[str, Any]:
         """Get statistics for flagged accounts."""
         if self._use_aerospike():
-            accounts = self._aerospike.get_all_flagged_accounts(limit=10000)
+            accounts = self._load_flagged_accounts()
         else:
             return {
                 "total_flagged": 0,

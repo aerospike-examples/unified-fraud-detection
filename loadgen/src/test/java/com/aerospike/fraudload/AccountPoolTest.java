@@ -18,6 +18,14 @@ class AccountPoolTest {
     }
 
     @Test
+    void deterministicPoolMatchesBulkLoadIds() {
+        AccountPool pool = AccountPool.deterministic(5, "Account");
+        assertEquals(5, pool.size());
+        assertEquals("Account1", pool.idAt(0));
+        assertEquals("Account5", pool.idAt(4));
+    }
+
+    @Test
     void syntheticPoolHasExpectedIds() {
         AccountPool pool = AccountPool.synthetic(5);
         assertEquals(5, pool.size());

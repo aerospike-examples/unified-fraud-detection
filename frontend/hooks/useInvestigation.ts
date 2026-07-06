@@ -334,6 +334,14 @@ export function useInvestigation() {
             if (data.report_markdown) {
               updates.report = data.report_markdown;
             }
+
+            const nextCompleted = [...prev.completedSteps];
+            if (data.report_markdown && !nextCompleted.includes("report_generation")) {
+              nextCompleted.push("report_generation");
+            }
+            if (nextCompleted.length !== prev.completedSteps.length) {
+              updates.completedSteps = nextCompleted;
+            }
             
             // Handle new agentic workflow data
             if (data.initial_evidence) {
@@ -364,13 +372,34 @@ export function useInvestigation() {
         });
 
         // Handle 'complete' event
-        eventSource.addEventListener("complete", (event) => {
+        eventSource.addEventListener("complete", async (event) => {
           const data = JSON.parse(event.data);
+          const allSteps = ["alert_validation", "data_collection", "llm_agent", "report_generation"];
           setState((prev) => ({
             ...prev,
             status: "completed",
             investigation_id: data.investigation_id,
+            currentNode: "complete",
+            currentPhase: "complete",
+            completedSteps: allSteps,
           }));
+          try {
+            const res = await fetch(`/api/investigation/user/${userId}/latest`);
+            if (res.ok) {
+              const body = await res.json();
+              if (body.found && body.investigation?.report_markdown) {
+                setState((prev) => ({
+                  ...prev,
+                  report: body.investigation.report_markdown,
+                  finalAssessment: body.investigation.final_assessment ?? prev.finalAssessment,
+                  toolCalls: body.investigation.tool_calls ?? prev.toolCalls,
+                  agentIterations: body.investigation.agent_iterations ?? prev.agentIterations,
+                }));
+              }
+            }
+          } catch (e) {
+            console.warn("[Investigation] Could not load persisted report:", e);
+          }
           eventSource.close();
         });
 

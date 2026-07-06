@@ -266,8 +266,7 @@ async def _call_llm(prompt: str) -> str:
     
     if provider == "gemini":
         return await _call_gemini(prompt)
-    else:
-        return await _call_ollama(prompt)
+    return await _call_ollama(prompt)
 
 
 def _build_fraud_ring_section(tool_calls: list, user_id: str) -> str:

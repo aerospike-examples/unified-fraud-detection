@@ -151,7 +151,9 @@ class HydrationService:
                 self._aero.batch_put(SET_ACCOUNT_FACT, account_records)
             if device_records:
                 self._aero.batch_put(SET_DEVICE_FACT, device_records)
-            self._aero.put(SET_USERS, user_id, user_record)
+            if not self._aero.put(SET_USERS, user_id, user_record):
+                logger.error(f"hydrate: failed persisting users record for {user_id}")
+                return False
         except Exception as e:
             logger.error(f"hydrate: failed persisting KV working set for {user_id}: {e}")
             return False

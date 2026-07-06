@@ -21,6 +21,7 @@ public final class LoadDriver {
 
     private final Config cfg;
     private final Metrics metrics = new Metrics();
+    private long baselineTxns = 0L;
 
     public LoadDriver(Config cfg) { this.cfg = cfg; }
 
@@ -33,6 +34,12 @@ public final class LoadDriver {
         GraphWriter graphWriter = null;
         if (cfg.writeMode().writesGraph()) {
             graphWriter = new GraphWriter(cfg.graphHost(), cfg.graphPort(), cfg.workers() * 4);
+            try {
+                baselineTxns = GraphSummary.fetch(cfg.graphHost(), cfg.graphPort()).transacts();
+                log.info("baseline TRANSACTS from graph summary: {}", baselineTxns);
+            } catch (Exception e) {
+                log.warn("could not read graph summary for txn baseline: {}", e.toString());
+            }
         }
 
         try (AerospikeClient client = cfg.writeMode().writesKv()
@@ -161,9 +168,8 @@ public final class LoadDriver {
 
     /**
      * Writes the optional `config:aggregate_stats` record the backend reads in
-     * remote mode. Only fields the load-gen actually knows (live volume + fraud
-     * rate) are written — never users/txns, so the graph-summary counts stay
-     * authoritative on the dashboard.
+     * remote mode. Includes live txn count (baseline graph summary + this run) so
+     * the dashboard updates during the demo without waiting for AGS metadata lag.
      */
     private void writeAggregate(AerospikeClient client, String namespace) {
         try {
@@ -172,6 +178,7 @@ public final class LoadDriver {
             client.put(wp, key,
                     new Bin("total_amount", Math.round(metrics.totalAmount() * 100.0) / 100.0),
                     new Bin("fraud_rate", Math.round(metrics.fraudRatePct() * 100.0) / 100.0),
+                    new Bin("txns", baselineTxns + metrics.txns()),
                     new Bin("last_updated", Instant.now().toString()));
         } catch (Exception e) {
             log.debug("aggregate write failed: {}", e.toString());

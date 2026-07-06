@@ -128,7 +128,9 @@ class AerospikeService:
             
         try:
             config = {
-                'hosts': [(AEROSPIKE_HOST, AEROSPIKE_PORT)]
+                'hosts': [(AEROSPIKE_HOST, AEROSPIKE_PORT)],
+                # Nested dicts (user.accounts/devices, investigation state) require JSON serialization.
+                'serialization': aerospike.SERIALIZER_JSON,
             }
             self.client = aerospike.client(config).connect()
             self.connected = True
@@ -1308,6 +1310,32 @@ class AerospikeService:
     def get_all_flagged_accounts(self, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get all flagged accounts."""
         return self.scan_all(SET_FLAGGED_ACCOUNTS, limit)
+
+    def get_flagged_accounts_batch(self, user_ids: List[str]) -> List[Dict[str, Any]]:
+        """Point-read flagged accounts by user_id (no set scan — safe under KV load)."""
+        if not self.is_connected() or not user_ids:
+            return []
+        records: List[Dict[str, Any]] = []
+        for user_id in user_ids:
+            rec = self.get(SET_FLAGGED_ACCOUNTS, user_id)
+            if rec:
+                records.append(rec)
+        return records
+
+    def get_flagged_accounts_for_feed(self) -> List[Dict[str, Any]]:
+        """
+        Load flagged accounts via the fraud_feed index (remote / loadgen path).
+        Avoids scanning the flagged_accounts set, which can stall under heavy KV write load.
+        """
+        feed = self.get_fraud_feed()
+        if not feed or int(feed.get('total') or 0) <= 0:
+            return []
+        user_ids = feed.get('user_ids') or []
+        if not user_ids:
+            logger.warning("fraud_feed has total=%s but no user_ids; cannot load flagged accounts without scan",
+                           feed.get('total'))
+            return []
+        return self.get_flagged_accounts_batch(user_ids)
     
     def update_flagged_account(self, account_id: str, updates: Dict[str, Any]) -> bool:
         """Update a flagged account."""
@@ -1353,6 +1381,7 @@ class AerospikeService:
             'last_updated': rec.get('last_updated'),
             'total': int(rec.get('total') or 0),
             'recent': recent,
+            'user_ids': rec.get('user_ids') or [],
         }
     
     # ----------------------------------------------------------------------------------------------------------

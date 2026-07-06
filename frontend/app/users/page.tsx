@@ -17,9 +17,10 @@ const options: Option[] = [
 	{
 		name: "ID",
 		item: 'id',
-		width: "75px",
+		width: "140px",
 		label: {
-			subtitle: 'id'
+			subtitle: 'id',
+			className: 'truncate font-mono text-xs normal-case'
 		}
 	},
 	{
@@ -30,7 +31,7 @@ const options: Option[] = [
 			size: 'sm',
 			text: 'email',
 			icon: 'mail',
-			className: 'lowercase'
+			className: 'lowercase truncate'
 		}
 	},
 	{

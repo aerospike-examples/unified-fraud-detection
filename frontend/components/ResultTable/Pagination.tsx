@@ -48,6 +48,8 @@ const Pagination = ({
     handlePagination,
     setPageSize
 }: Props) => {
+    const safeTotalPages = Math.max(totalPages, 1)
+
     const handlePageSize = (size: number) => {
         setPageSize(size)
         if((((currentPage - 1) * size) + 1) > totalEntries) {
@@ -86,7 +88,7 @@ const Pagination = ({
                     disabled={currentPage === 1}
                     contents={<ChevronLeft className="h-4 w-4" />} />
                 <div className="flex items-center gap-1">
-                    {Array.from({ length: Math.min(5, Math.max(totalPages, 1)) }, (_, i) => {
+                    {Array.from({ length: Math.min(5, safeTotalPages) }, (_, i) => {
                         let pageNum
                         if(totalPages <= 5) pageNum = i + 1;
                         else if(currentPage <= 3) pageNum = i + 1;
@@ -108,13 +110,13 @@ const Pagination = ({
                     aria-label='Next'
                     title='Next'
                     onClick={() => handlePagination(currentPage + 1)}
-                    disabled={currentPage === totalPages}
+                    disabled={currentPage === totalPages || totalPages === 0}
                     contents={<ChevronRight className="h-4 w-4" />} />
                 <BtnLayout
                     aria-label='Last'
                     title='Last'
                     onClick={() => handlePagination(totalPages)}
-                    disabled={currentPage === totalPages}
+                    disabled={currentPage === totalPages || totalPages === 0}
                     contents={<ChevronLast className="h-4 w-4" />} />
             </div>
         </div>

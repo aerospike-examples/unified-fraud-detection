@@ -13,6 +13,8 @@ from gremlin_python.process.traversal import T, Order
 # Get logger for graph service
 logger = logging.getLogger('fraud_detection.graph')
 
+_TXN_ACCOUNT_RE = re.compile(r'^txn-(\d+)-')
+
 class GraphService:
     def __init__(self, host: str = os.environ.get('GRAPH_HOST_ADDRESS') or 'localhost', port: int = 8182):
         self.host = host
@@ -225,8 +227,7 @@ class GraphService:
             else:
                 total = self._summary_user_count()
                 start = (page - 1) * page_size
-                end = start + page_size
-                paged = _project(self.client.V().hasLabel("user").range(start, end)).to_list()
+                paged = _project(self.client.V().has_label("user").skip(start).limit(page_size)).to_list()
 
             for v in paged:
                 v["user_id"] = v["id"]
@@ -498,21 +499,108 @@ class GraphService:
             })
         return txns
 
+    def _flatten_element(self, m: Optional[dict]) -> dict:
+        """Normalize a Gremlin elementMap() dict to plain JSON-friendly fields."""
+        if not m:
+            return {}
+        out: dict = {}
+        for k, v in m.items():
+            if k == T.id:
+                out['id'] = v
+            elif k == T.label:
+                out['label'] = v
+            else:
+                out[k] = v
+        return out
+
+    @staticmethod
+    def account_id_from_txn_id(txn_id: str) -> Optional[str]:
+        """Derive sender account id from demo/loadgen txn ids like txn-988771400-1."""
+        m = _TXN_ACCOUNT_RE.match(txn_id or "")
+        return f"Account{m.group(1)}" if m else None
+
+    def get_transaction_from_graph(self, account_id: str, txn_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Bounded transaction detail lookup for remote mode.
+
+        Scopes the search to edges incident on `account_id` so we avoid a
+        billion-edge scan by txn_id alone.
+        """
+        if not self.client:
+            return None
+        try:
+            raw = (self.client.V(account_id).bothE("TRANSACTS").has("txn_id", txn_id).limit(1)
+                .project("txn", "src", "dest")
+                .by(__.elementMap())
+                .by(__.outV()
+                    .project("account", "user")
+                    .by(__.elementMap())
+                    .by(__.coalesce(__.in_("OWNS").elementMap(), __.constant({}))))
+                .by(__.inV()
+                    .project("account", "user")
+                    .by(__.elementMap())
+                    .by(__.coalesce(__.in_("OWNS").elementMap(), __.constant({}))))
+                .to_list())
+            if not raw:
+                return None
+
+            row = raw[0]
+            edge = self._flatten_element(row.get("txn"))
+            src = row.get("src") or {}
+            dest = row.get("dest") or {}
+            src_acct = self._flatten_element(src.get("account"))
+            dest_acct = self._flatten_element(dest.get("account"))
+            src_user = self._flatten_element(src.get("user"))
+            dest_user = self._flatten_element(dest.get("user"))
+
+            is_fraud = bool(edge.get("is_fraud", False))
+            fraud_score = float(edge.get("fraud_score", 0) or 0)
+            ts = edge.get("timestamp", "")
+            if hasattr(ts, "isoformat"):
+                ts = ts.isoformat()
+
+            return {
+                "txn": {
+                    "txn_id": edge.get("txn_id", txn_id),
+                    "amount": edge.get("amount", 0),
+                    "type": edge.get("type", "transfer"),
+                    "method": edge.get("method", "electronic_transfer"),
+                    "location": edge.get("location", ""),
+                    "timestamp": ts,
+                    "status": edge.get("status", "completed"),
+                    "is_fraud": is_fraud,
+                    "fraud_score": fraud_score,
+                    "device_id": edge.get("device_id", ""),
+                    "details": [],
+                    "fraud_status": "fraud" if is_fraud else "clean",
+                },
+                "src": {
+                    "account": src_acct,
+                    "user": src_user or None,
+                },
+                "dest": {
+                    "account": dest_acct,
+                    "user": dest_user or None,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error getting graph transaction {txn_id} for account {account_id}: {e}")
+            return None
+
     def get_recent_transactions_from_graph(self, page: int = 1, page_size: int = 12) -> Dict[str, Any]:
         """
         Paginated transaction list backed by the Graph (remote mode).
 
-        Uses an unordered range() over TRANSACTS edges for bounded, fast paging
-        at billion scale (a global order-by-timestamp over billions of edges is
-        not feasible). Total comes from the summary edge count.
+        Uses skip/limit over TRANSACTS edges for bounded, fast paging at billion
+        scale (a global order-by-timestamp over billions of edges is not feasible).
+        Total comes from the summary edge count.
         """
         empty = {'result': [], 'total': 0, 'total_pages': 0, 'page': page, 'page_size': page_size}
         if not self.client:
             return empty
         try:
             start = (page - 1) * page_size
-            end = start + page_size
-            raw = (self.client.E().hasLabel("TRANSACTS").range(start, end)
+            raw = (self.client.E().has_label("TRANSACTS").skip(start).limit(page_size)
                 .project("txn_id", "amount", "timestamp", "type", "method", "location", "status", "is_fraud", "fraud_score", "from", "to")
                 .by(__.coalesce(__.values("txn_id"), __.constant("")))
                 .by(__.coalesce(__.values("amount"), __.constant(0)))
@@ -534,6 +622,7 @@ class GraphService:
                 result.append({
                     "id": t.get("txn_id", ""),
                     "txn_id": t.get("txn_id", ""),
+                    "account_id": t.get("from", ""),
                     "sender": t.get("from", ""),
                     "receiver": t.get("to", ""),
                     "amount": t.get("amount", 0),

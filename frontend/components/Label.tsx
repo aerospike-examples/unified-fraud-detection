@@ -37,9 +37,9 @@ const Label = ({
         <div className="flex flex-col gap-1">
             {title && <p className="text-sm font-medium text-muted-foreground">{title}</p>}
             <div>
-                <div className='flex items-center gap-2'>
-                    {icon && <Icon className={`h-${iconSize} w-${iconSize} text-${color}`} icon={icon} />}
-                    {text && <p className={`text-${size} capitalize ${className}`} title={text}>{text}</p>}
+                <div className='flex items-center gap-2 min-w-0'>
+                    {icon && <Icon className={`h-${iconSize} w-${iconSize} shrink-0 text-${color}`} icon={icon} />}
+                    {text && <p className={`text-${size} capitalize min-w-0 truncate ${className ?? ''}`} title={text}>{text}</p>}
                     {badge && (
                         loading ? (
                             <Skeleton />
@@ -50,7 +50,7 @@ const Label = ({
                         )
                     )}
                 </div>
-                {subtitle && <p className="text-sm font-medium text-muted-foreground" title={subtitle}>{subtitle}</p>}
+                {subtitle && <p className={`text-sm font-medium text-muted-foreground min-w-0 truncate ${className ?? ''}`} title={subtitle}>{subtitle}</p>}
             </div>
         </div>
     )

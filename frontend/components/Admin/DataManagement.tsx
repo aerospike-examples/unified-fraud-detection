@@ -92,6 +92,8 @@ interface AerospikeStats {
     connected: boolean
     users_count: number
     flagged_accounts_count: number
+    account_facts_count?: number
+    device_facts_count?: number
     pending_review: number
     confirmed_fraud: number
     cleared: number

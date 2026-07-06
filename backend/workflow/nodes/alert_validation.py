@@ -73,12 +73,8 @@ def alert_validation_node(
         flag_reason = flagged_account.get("flag_reason", "")
         trigger_rule = _determine_trigger_rule(flag_reason)
         
-        # Get previous flag count
-        all_flagged = aerospike_service.get_all_flagged_accounts()
-        user_previous_flags = [
-            f for f in all_flagged 
-            if f.get("user_id") == user_id and f.get("status") in ["cleared", "confirmed_fraud"]
-        ]
+        # Previous resolved flags are not tracked per-user at scale; avoid scanning flagged_accounts.
+        previous_flags_count = int(flagged_account.get("previous_flags_count", 0) or 0)
         
         alert_evidence = AlertEvidence(
             trigger_type=trigger_rule["type"],
@@ -86,7 +82,7 @@ def alert_validation_node(
             trigger_timestamp=flagged_account.get("flagged_date", datetime.now().isoformat()),
             flag_reason=flag_reason,
             original_score=float(flagged_account.get("risk_score", 0)),
-            previous_flags_count=len(user_previous_flags)
+            previous_flags_count=previous_flags_count
         )
         
         # Emit evidence event
