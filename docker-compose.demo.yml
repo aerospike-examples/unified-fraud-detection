@@ -14,7 +14,11 @@ services:
       # counts, externally-loaded data, Admin write ops disabled.
       - DATA_SOURCE_MODE=${DATA_SOURCE_MODE:-remote}
       - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+      - INVESTIGATION_ENGINE=${INVESTIGATION_ENGINE:-adk}
+      - ADK_MODEL=${ADK_MODEL:-gemini-2.0-flash}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
       - DATA_DIR=/data
     volumes:

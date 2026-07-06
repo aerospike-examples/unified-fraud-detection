@@ -47,6 +47,16 @@ SET_DEVICE_FACT = 'device_fact'        # PK = device_id
 SET_INVESTIGATIONS = 'investigations'  # PK = investigation_id
 SET_CASE_MEMORY = 'case_memory'          # cross-engine case recall (adk-aerospike, case_ prefix)
 
+# Aerospike secondary index names (created on connect via create_secondary_indexes)
+IDX_TXN_DAY = 'idx_txn_day'
+IDX_INV_USER_ID = 'idx_inv_user_id'
+IDX_USER_WF_STATUS = 'idx_user_wf_status'
+IDX_FLAGGED_STATUS = 'idx_flagged_status'
+
+# flagged_queue pointer list (loadgen contract — batch_get all flagged; not an Aerospike SI)
+INDEX_LIST_KEY = 'index'
+FLAGGED_QUEUE_CAP = 50_000
+
 # Aerospike bin name limit is 15 characters
 # Map long bin names to short versions
 BIN_NAME_MAP = {
@@ -146,24 +156,63 @@ class AerospikeService:
             return False
     
     def create_secondary_indexes(self):
-        """Create secondary indexes for efficient queries."""
+        """Create Aerospike secondary indexes for query-by-bin on small sets."""
         if not self.is_connected():
             return
-        
+
+        indexes = [
+            (SET_TRANSACTIONS, 'day', IDX_TXN_DAY),
+            (SET_INVESTIGATIONS, 'user_id', IDX_INV_USER_ID),
+            (SET_USERS, 'wf_status', IDX_USER_WF_STATUS),
+            (SET_FLAGGED_ACCOUNTS, 'status', IDX_FLAGGED_STATUS),
+        ]
+        for set_name, bin_name, index_name in indexes:
+            try:
+                self.client.index_string_create(
+                    self.namespace, set_name, bin_name, index_name
+                )
+                logger.info(
+                    "✅ Created secondary index '%s' on %s.%s",
+                    index_name, set_name, bin_name,
+                )
+            except ex.IndexFoundError:
+                logger.debug("Secondary index '%s' already exists", index_name)
+            except Exception as e:
+                logger.warning(
+                    "⚠️ Failed to create secondary index '%s' on %s.%s: %s",
+                    index_name, set_name, bin_name, e,
+                )
+
+    def _storage_bin(self, field: str) -> str:
+        """Bin name as stored in Aerospike (after shortening)."""
+        return BIN_NAME_MAP.get(field, field)
+
+    def _query_equals(
+        self,
+        set_name: str,
+        bin_name: str,
+        value: str,
+        limit: int = 10_000,
+    ) -> List[Dict[str, Any]]:
+        """Query records using a secondary index (equals predicate)."""
+        if not self.is_connected():
+            return []
+        records: List[Dict[str, Any]] = []
         try:
-            # Create index on 'day' bin for transactions set (for querying by date)
-            self.client.index_string_create(
-                self.namespace,
-                SET_TRANSACTIONS,
-                'day',
-                'idx_txn_day'
-            )
-            logger.info("✅ Created secondary index 'idx_txn_day' on transactions.day")
-        except ex.IndexFoundError:
-            # Index already exists - this is fine
-            logger.info("ℹ️ Secondary index 'idx_txn_day' already exists")
+            query = self.client.query(self.namespace, set_name)
+            query.where(aerospike.predicates.equals(bin_name, value))
+
+            def callback(record):
+                if len(records) < limit and record and len(record) > 2 and record[2]:
+                    records.append(self._expand_bin_names(record[2]))
+
+            query.foreach(callback)
         except Exception as e:
-            logger.warning(f"⚠️ Failed to create secondary index 'idx_txn_day': {e}")
+            logger.error(
+                "Secondary-index query %s.%s=%r failed: %s",
+                set_name, bin_name, value, e,
+            )
+        return records
     
     def close(self):
         """Close Aerospike connection."""
@@ -427,12 +476,54 @@ class AerospikeService:
         except Exception as e:
             logger.error(f"Error scanning {set_name}: {e}")
             return []
-    
+
+    # ----------------------------------------------------------------------------------------------------------
+    # flagged_queue pointer list (loadgen + backend; batch_get — not replaceable by SI)
+    # ----------------------------------------------------------------------------------------------------------
+
+    def _read_flagged_queue_ids(self) -> List[str]:
+        rec = self.get(SET_FLAGGED_QUEUE, INDEX_LIST_KEY) or {}
+        return [str(uid) for uid in (rec.get('user_ids') or []) if uid]
+
+    def _write_flagged_queue_ids(self, user_ids: List[str], **extra: Any) -> bool:
+        now = datetime.now().isoformat()
+        payload: Dict[str, Any] = {
+            'user_ids': user_ids,
+            'total': len(user_ids),
+            'last_updated': now,
+            **extra,
+        }
+        return self.put(SET_FLAGGED_QUEUE, INDEX_LIST_KEY, payload)
+
+    def _add_to_flagged_queue(self, user_id: str) -> None:
+        """Append user_id to flagged_queue:index (same contract as loadgen FraudInjector)."""
+        if not user_id:
+            return
+        user_id = str(user_id)
+        ids = self._read_flagged_queue_ids()
+        if user_id in ids:
+            return
+        if len(ids) >= FLAGGED_QUEUE_CAP:
+            logger.warning("flagged_queue cap %s reached; skipping %s", FLAGGED_QUEUE_CAP, user_id)
+            return
+        ids.append(user_id)
+        self._write_flagged_queue_ids(ids)
+
+    def _remove_from_flagged_queue(self, user_id: str) -> None:
+        if not user_id:
+            return
+        ids = self._read_flagged_queue_ids()
+        user_id = str(user_id)
+        if user_id not in ids:
+            return
+        ids.remove(user_id)
+        self._write_flagged_queue_ids(ids)
+
     def truncate_set(self, set_name: str) -> bool:
         """Delete all records in a set."""
         if not self.is_connected():
             return False
-            
+
         try:
             self.client.truncate(self.namespace, set_name, 0)
             logger.info(f"Truncated set {set_name}")
@@ -440,7 +531,7 @@ class AerospikeService:
         except Exception as e:
             logger.error(f"Error truncating {set_name}: {e}")
             return False
-    
+
     # ----------------------------------------------------------------------------------------------------------
     # User Operations
     # ----------------------------------------------------------------------------------------------------------
@@ -1302,15 +1393,21 @@ class AerospikeService:
         
         account_data["flagged_date"] = datetime.now().isoformat()
         account_data["status"] = account_data.get("status", "pending_review")
-        
-        return self.put(SET_FLAGGED_ACCOUNTS, user_id, account_data)
+
+        ok = self.put(SET_FLAGGED_ACCOUNTS, user_id, account_data)
+        if ok:
+            self._add_to_flagged_queue(user_id)
+        return ok
     
     def get_flagged_account(self, account_id: str) -> Optional[Dict[str, Any]]:
         """Get a flagged account by ID."""
         return self.get(SET_FLAGGED_ACCOUNTS, account_id)
     
     def get_all_flagged_accounts(self, limit: int = 1000) -> List[Dict[str, Any]]:
-        """Get all flagged accounts."""
+        """Get all flagged accounts via flagged_queue index (no set scan)."""
+        queued = self.get_flagged_accounts_from_queue()
+        if queued:
+            return queued[:limit]
         return self.scan_all(SET_FLAGGED_ACCOUNTS, limit)
 
     def get_flagged_accounts_batch(self, user_ids: List[str]) -> List[Dict[str, Any]]:
@@ -1332,11 +1429,7 @@ class AerospikeService:
 
     def get_flagged_queue_user_ids(self) -> List[str]:
         """Read persistent flagged_queue index (survives loadgen restarts)."""
-        rec = self.get(SET_FLAGGED_QUEUE, 'index')
-        if not rec:
-            return []
-        user_ids = rec.get('user_ids') or []
-        return [str(uid) for uid in user_ids if uid]
+        return self._read_flagged_queue_ids()
 
     def get_flagged_accounts_from_queue(self) -> List[Dict[str, Any]]:
         """Load all flagged accounts via persistent queue index + batch_get."""
@@ -1359,12 +1452,10 @@ class AerospikeService:
                 seen.add(uid)
                 user_ids.append(str(uid))
         now = datetime.now().isoformat()
-        self.put(SET_FLAGGED_QUEUE, 'index', {
-            'user_ids': user_ids,
-            'total': len(user_ids),
-            'last_updated': now,
-            'rebuilt_at': now,
-        })
+        self._write_flagged_queue_ids(
+            user_ids[:FLAGGED_QUEUE_CAP],
+            rebuilt_at=now,
+        )
         return len(user_ids)
 
     def get_flagged_accounts_for_feed(self) -> List[Dict[str, Any]]:
@@ -1394,7 +1485,10 @@ class AerospikeService:
     
     def delete_flagged_account(self, account_id: str) -> bool:
         """Delete a flagged account."""
-        return self.delete(SET_FLAGGED_ACCOUNTS, account_id)
+        ok = self.delete(SET_FLAGGED_ACCOUNTS, account_id)
+        if ok:
+            self._remove_from_flagged_queue(account_id)
+        return ok
     
     def clear_all_flagged_accounts(self) -> bool:
         """Clear all flagged accounts."""
@@ -1460,9 +1554,16 @@ class AerospikeService:
         return self.put(SET_USERS, user_id, user)
     
     def get_users_by_workflow_status(self, status: str, limit: int = 1000) -> List[Dict[str, Any]]:
-        """Get users with a specific workflow status."""
-        all_users = self.scan_all(SET_USERS, limit=10000)
-        return [u for u in all_users if u.get('workflow_status') == status][:limit]
+        """Get users with a specific workflow status (secondary index on wf_status)."""
+        return self._query_equals(
+            SET_USERS, self._storage_bin('workflow_status'), status, limit
+        )[:limit]
+
+    def query_flagged_accounts_by_status(
+        self, status: str, limit: int = 10_000
+    ) -> List[Dict[str, Any]]:
+        """Get flagged accounts with a given status (secondary index on status)."""
+        return self._query_equals(SET_FLAGGED_ACCOUNTS, 'status', status, limit)
     
     # ----------------------------------------------------------------------------------------------------------
     # Configuration Operations
@@ -1485,11 +1586,10 @@ class AerospikeService:
         """Add a detection job result to history."""
         job_id = job_result.get("job_id", f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         return self.put(SET_HISTORY, job_id, job_result)
-    
+
     def get_detection_history(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Get detection job history."""
+        """Get detection job history (small set — scan is acceptable)."""
         records = self.scan_all(SET_HISTORY, limit=100)
-        # Sort by start_time descending
         records.sort(key=lambda x: x.get('start_time', ''), reverse=True)
         return records[:limit]
     
@@ -2049,18 +2149,6 @@ class AerospikeService:
         Used in remote mode where the KV `users`/`transactions` sets are empty
         (data lives in the Graph), so we avoid the full users scan in get_stats().
         """
-        def _count_set(set_name: str) -> int:
-            count = 0
-            try:
-                s = self.client.scan(self.namespace, set_name)
-                def inc(record):
-                    nonlocal count
-                    count += 1
-                s.foreach(inc)
-            except Exception:
-                pass
-            return count
-
         if not self.is_connected():
             return {
                 "flagged_accounts_count": 0,
@@ -2069,12 +2157,29 @@ class AerospikeService:
                 "transaction_records_count": 0,
             }
 
+        flagged_count = len(self._read_flagged_queue_ids())
+        if not flagged_count:
+            flagged_count = self._count_set_records(SET_FLAGGED_ACCOUNTS)
+
         return {
-            "flagged_accounts_count": _count_set(SET_FLAGGED_ACCOUNTS),
-            "account_facts_count": _count_set(SET_ACCOUNT_FACT),
-            "device_facts_count": _count_set(SET_DEVICE_FACT),
-            "transaction_records_count": _count_set(SET_TRANSACTIONS),
+            "flagged_accounts_count": flagged_count,
+            "account_facts_count": self._count_set_records(SET_ACCOUNT_FACT),
+            "device_facts_count": self._count_set_records(SET_DEVICE_FACT),
+            "transaction_records_count": self._count_set_records(SET_TRANSACTIONS),
         }
+
+    def _count_set_records(self, set_name: str) -> int:
+        """Lightweight record count (scan) — use only for large/unindexed sets."""
+        count = 0
+        try:
+            s = self.client.scan(self.namespace, set_name)
+            def inc(record):
+                nonlocal count
+                count += 1
+            s.foreach(inc)
+        except Exception:
+            pass
+        return count
 
     def get_remote_aggregate_stats(self) -> Optional[Dict[str, Any]]:
         """
@@ -2093,8 +2198,7 @@ class AerospikeService:
     def get_stats(self) -> Dict[str, Any]:
         """
         Get statistics about stored data.
-        Optimized: single scan of users for workflow status counts,
-        and lightweight set-count queries for other sets.
+        Workflow counts use secondary indexes on users.wf_status.
         """
         if not self.is_connected():
             return {
@@ -2106,51 +2210,27 @@ class AerospikeService:
                 "connected": False
             }
 
-        # Single scan of users to count workflow statuses
-        users_count = 0
-        pending_review = 0
-        under_investigation = 0
-        confirmed_fraud = 0
-        cleared = 0
+        # Workflow status counts via secondary index (avoids full users scan)
+        wf_bin = self._storage_bin('workflow_status')
+        pending_review = len(self._query_equals(SET_USERS, wf_bin, 'pending_review', 100_000))
+        under_investigation = len(self._query_equals(SET_USERS, wf_bin, 'under_investigation', 100_000))
+        confirmed_fraud = len(self._query_equals(SET_USERS, wf_bin, 'confirmed_fraud', 100_000))
+        cleared = len(self._query_equals(SET_USERS, wf_bin, 'cleared', 100_000))
+        users_count = pending_review + under_investigation + confirmed_fraud + cleared
+        # Users with no workflow status are not indexed; add via lightweight scan if needed
+        if users_count == 0:
+            users_count = self._count_set_records(SET_USERS)
 
-        try:
-            scan = self.client.scan(self.namespace, SET_USERS)
-            def count_user(record):
-                nonlocal users_count, pending_review, under_investigation, confirmed_fraud, cleared
-                if record and len(record) > 2 and record[2]:
-                    users_count += 1
-                    wf = record[2].get('wf_status') or record[2].get('workflow_status', '')
-                    if wf == 'pending_review':
-                        pending_review += 1
-                    elif wf == 'under_investigation':
-                        under_investigation += 1
-                    elif wf == 'confirmed_fraud':
-                        confirmed_fraud += 1
-                    elif wf == 'cleared':
-                        cleared += 1
-            scan.foreach(count_user)
-        except Exception as e:
-            logger.error(f"Error scanning users for stats: {e}")
-
-        # Count other sets with lightweight scans (count only, don't load full records)
-        def _count_set(set_name: str) -> int:
-            count = 0
-            try:
-                s = self.client.scan(self.namespace, set_name)
-                def inc(record):
-                    nonlocal count
-                    count += 1
-                s.foreach(inc)
-            except Exception:
-                pass
-            return count
+        flagged_count = len(self._read_flagged_queue_ids())
+        if not flagged_count:
+            flagged_count = self._count_set_records(SET_FLAGGED_ACCOUNTS)
 
         return {
             "users_count": users_count,
-            "flagged_accounts_count": _count_set(SET_FLAGGED_ACCOUNTS),
-            "account_facts_count": _count_set(SET_ACCOUNT_FACT),
-            "device_facts_count": _count_set(SET_DEVICE_FACT),
-            "transaction_records_count": _count_set(SET_TRANSACTIONS),
+            "flagged_accounts_count": flagged_count,
+            "account_facts_count": self._count_set_records(SET_ACCOUNT_FACT),
+            "device_facts_count": self._count_set_records(SET_DEVICE_FACT),
+            "transaction_records_count": self._count_set_records(SET_TRANSACTIONS),
             "pending_review": pending_review,
             "under_investigation": under_investigation,
             "confirmed_fraud": confirmed_fraud,
@@ -2187,94 +2267,52 @@ class AerospikeService:
     # ----------------------------------------------------------------------------------------------------------
     # Investigation Operations
     # ----------------------------------------------------------------------------------------------------------
-    
+
+    def _investigations_for_user(self, user_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+        """All investigations for a user via secondary index on user_id."""
+        invs = self._query_equals(SET_INVESTIGATIONS, 'user_id', str(user_id), limit)
+        invs.sort(key=lambda x: x.get('completed_at', ''), reverse=True)
+        return invs
+
     def put_investigation(self, investigation_id: str, data: Dict[str, Any]) -> bool:
         """
         Store a completed investigation result.
-        
-        Args:
-            investigation_id: Unique investigation ID
-            data: Investigation data including:
-                - user_id: The user that was investigated
-                - completed_at: Timestamp of completion
-                - initial_evidence: Evidence collected
-                - final_assessment: AI assessment result
-                - tool_calls: Tools called during investigation
-                - report_markdown: Generated report
+
+        Requires idx_inv_user_id on investigations.user_id (created on connect).
         """
         if not self.is_connected():
             return False
-        
+
         try:
-            # Add metadata
             data["investigation_id"] = investigation_id
             data["stored_at"] = datetime.now().isoformat()
-            
             return self.put(SET_INVESTIGATIONS, investigation_id, data)
         except Exception as e:
             logger.error(f"Error storing investigation {investigation_id}: {e}")
             return False
-    
+
     def get_investigation(self, investigation_id: str) -> Optional[Dict[str, Any]]:
         """Get an investigation by ID."""
         return self.get(SET_INVESTIGATIONS, investigation_id)
-    
+
     def get_user_latest_investigation(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Get the most recent completed investigation for a user.
-        
-        Args:
-            user_id: The user ID to find investigations for
-            
-        Returns:
-            The most recent investigation or None
-        """
+        """Get the most recent investigation for a user (SI query on user_id)."""
         if not self.is_connected():
             return None
-        
         try:
-            # Scan all investigations and filter by user_id
-            all_investigations = self.scan_all(SET_INVESTIGATIONS, limit=1000)
-            
-            # Filter by user_id and sort by completed_at
-            user_investigations = [
-                inv for inv in all_investigations 
-                if inv.get("user_id") == user_id
-            ]
-            
-            if not user_investigations:
-                return None
-            
-            # Sort by completed_at descending (most recent first)
-            user_investigations.sort(
-                key=lambda x: x.get("completed_at", ""),
-                reverse=True
-            )
-            
-            return user_investigations[0]
-            
+            invs = self._investigations_for_user(user_id, limit=500)
+            return invs[0] if invs else None
         except Exception as e:
             logger.error(f"Error getting latest investigation for user {user_id}: {e}")
             return None
-    
+
     def get_user_investigation_history(self, user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        Get investigation history for a user.
-        
-        Args:
-            user_id: The user ID
-            limit: Maximum number of investigations to return
-            
-        Returns:
-            List of investigations sorted by date (newest first)
-        """
+        """Get investigation history for a user (SI query on user_id)."""
         if not self.is_connected():
             return []
-        
         try:
-            all_investigations = self.scan_all(SET_INVESTIGATIONS, limit=1000)
-            
-            user_investigations = [
+            invs = self._investigations_for_user(user_id, limit=500)
+            return [
                 {
                     "investigation_id": inv.get("investigation_id"),
                     "completed_at": inv.get("completed_at"),
@@ -2282,17 +2320,8 @@ class AerospikeService:
                     "risk_level": inv.get("final_assessment", {}).get("risk_level"),
                     "typology": inv.get("final_assessment", {}).get("typology"),
                 }
-                for inv in all_investigations 
-                if inv.get("user_id") == user_id
+                for inv in invs[:limit]
             ]
-            
-            user_investigations.sort(
-                key=lambda x: x.get("completed_at", ""),
-                reverse=True
-            )
-            
-            return user_investigations[:limit]
-            
         except Exception as e:
             logger.error(f"Error getting investigation history for user {user_id}: {e}")
             return []

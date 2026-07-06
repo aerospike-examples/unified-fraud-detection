@@ -119,19 +119,32 @@ export default function FlaggedAccountDetailsPage() {
     // Investigation hook
     const investigation = useInvestigation()
 
-    // Load existing investigation on mount
+    // Load saved investigation on mount and when opening the Investigation tab
+    useEffect(() => {
+        setLoadedExisting(false)
+    }, [account?.user_id])
+
     useEffect(() => {
         const loadExisting = async () => {
-            if (account?.user_id && investigation.status === 'idle' && !loadedExisting) {
-                setLoadedExisting(true)
-                const found = await investigation.loadExistingInvestigation(account.user_id)
-                if (found) {
-                    console.log('[Page] Loaded existing investigation')
-                }
+            if (!account?.user_id) return
+            if (investigation.status === 'running' || investigation.status === 'connecting' || investigation.status === 'awaiting_confirmation') {
+                return
             }
+            if (loadedExisting && investigation.report) return
+            const ok = await investigation.loadExistingInvestigation(account.user_id)
+            if (ok) setLoadedExisting(true)
         }
         loadExisting()
-    }, [account?.user_id, investigation.status, loadedExisting])
+    }, [account?.user_id, investigation.status, investigation.report, loadedExisting])
+
+    // Re-fetch persisted report when user opens the Investigation tab
+    useEffect(() => {
+        if (activeTab !== 'investigation' || !account?.user_id) return
+        if (investigation.status === 'running' || investigation.status === 'connecting') return
+        if (!investigation.report && investigation.status !== 'awaiting_confirmation') {
+            investigation.loadExistingInvestigation(account.user_id)
+        }
+    }, [activeTab, account?.user_id, investigation.status, investigation.report])
 
     // When the agent pauses for approval, open the review-and-decide dialog so the
     // analyst reads the full report before approving/rejecting.
@@ -426,6 +439,7 @@ export default function FlaggedAccountDetailsPage() {
 
                             <InvestigationReport
                                 userId={accountId}
+                                investigationActive={investigation.status === 'running' || investigation.status === 'connecting'}
                                 finalAssessment={investigation.finalAssessment}
                                 toolCalls={investigation.toolCalls}
                                 agentIterations={investigation.agentIterations}

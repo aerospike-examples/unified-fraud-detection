@@ -32,33 +32,29 @@ _SPECIALIST_SYSTEM = """You are a {role} on a fraud-investigation team. You are 
 _SPECIALIST_SPECS = {
     NETWORK_ANALYST_NAME: dict(
         role="NETWORK ANALYST",
-        max_calls=5,
+        max_calls=2,
         focus=(
-            "Counterparties and the money-movement graph: who the flagged account transacts with, "
-            "fan-out / fan-in patterns, repeated counterparties, mule chains, and coordinated fraud "
-            "rings. Use detect_fraud_ring and get_transaction_network to map the network, and "
-            "get_counterparty_profile / get_counterparty_transactions to vet the 2-3 most suspicious "
-            "counterparties (highest volume, newest, highest risk, or most repeated)."
+            "Counterparties and money-movement patterns. Use get_transaction_network "
+            "(hops=1) OR detect_fraud_ring (hops=1) — pick ONE, not both. Then vet at most "
+            "1-2 suspicious counterparties with get_counterparty_profile. Be fast and decisive."
         ),
     ),
     DEVICE_ANALYST_NAME: dict(
         role="DEVICE & INFRASTRUCTURE ANALYST",
-        max_calls=4,
+        max_calls=1,
         focus=(
-            "Devices and account infrastructure risk: devices shared across multiple accounts, "
-            "device risk/spoofing signals, and account-level infrastructure risk features. Use "
-            "get_device_risk_features on the account's devices and get_account_risk_features on the "
-            "flagged/suspicious accounts. Flag any device tied to many accounts or with high risk."
+            "Device and account infrastructure risk only. One call to get_account_risk_features "
+            "on the flagged account is usually enough. Add get_device_risk_features only if "
+            "devices are present in the evidence."
         ),
     ),
     VELOCITY_ANALYST_NAME: dict(
         role="VELOCITY & TRANSACTION ANALYST",
-        max_calls=5,
+        max_calls=2,
         focus=(
-            "Transaction velocity and amount behavior: bursts of activity, transaction velocity vs "
-            "baseline, unusual amounts, new-recipient ratio, and structuring/timing patterns. Use "
-            "get_account_transactions to pull history and get_account_risk_features for pre-computed "
-            "velocity/amount anomaly scores. Quantify the burst (count, window, total amount)."
+            "Velocity and amount behavior. get_account_risk_features first, then "
+            "get_account_transactions (days=7) only if velocity scores look anomalous. "
+            "Quantify any burst in one line."
         ),
     ),
 }

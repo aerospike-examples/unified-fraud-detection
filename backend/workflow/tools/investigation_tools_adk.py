@@ -116,7 +116,7 @@ def get_device_risk_features(device_id: str, tool_context: ToolContext) -> dict:
     return _engine(tool_context).get_device_risk_features(device_id=device_id)
 
 
-def detect_fraud_ring(tool_context: ToolContext, hops: int = 2) -> dict:
+def detect_fraud_ring(tool_context: ToolContext, hops: int = 1) -> dict:
     """Detect whether the investigated user is part of a coordinated fraud ring by
     analyzing the network graph. Checks shared devices, flagged entities,
     device+transaction overlap, transaction triangles/cycles, reciprocal money
@@ -129,7 +129,7 @@ def detect_fraud_ring(tool_context: ToolContext, hops: int = 2) -> dict:
     return _engine(tool_context).detect_fraud_ring(hops=hops)
 
 
-def get_transaction_network(tool_context: ToolContext, hops: int = 2, min_amount: float = 0) -> dict:
+def get_transaction_network(tool_context: ToolContext, hops: int = 1, min_amount: float = 0) -> dict:
     """Visualize the money-flow network around the user. Multi-hop traversal
     through transaction edges showing who sent money to whom, total amounts,
     transaction counts, and which accounts on the path are flagged. Use this to

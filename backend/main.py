@@ -11,6 +11,7 @@ import zipfile
 import os
 import shutil
 import json
+import asyncio
 import subprocess
 import sys
 
@@ -31,6 +32,10 @@ from services.progress_service import progress_service
 import settings
 
 from logging_config import setup_logging, get_logger
+
+# ADK / google-genai read GOOGLE_API_KEY; many deployments only set GEMINI_API_KEY.
+if not os.environ.get("GOOGLE_API_KEY") and os.environ.get("GEMINI_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
 # Setup logging
 setup_logging()
@@ -1725,6 +1730,12 @@ async def stream_investigation(
                     "event": event_type,
                     "data": json.dumps(event_data, default=json_serializer)
                 }
+        except asyncio.CancelledError:
+            logger.info("Investigation stream client disconnected for %s", user_id)
+            raise
+        except GeneratorExit:
+            logger.info("Investigation stream closed for %s", user_id)
+            return
         except Exception as e:
             logger.error(f"Investigation stream error: {e}")
             yield {
@@ -1732,7 +1743,7 @@ async def stream_investigation(
                 "data": json.dumps({"error": str(e)})
             }
     
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), ping=10)
 
 
 @app.get("/investigation/{investigation_id}/resume")
@@ -1760,11 +1771,16 @@ async def resume_investigation_action(
                     "event": event.get("event", "message"),
                     "data": json.dumps(event.get("data", event), default=json_serializer),
                 }
+        except asyncio.CancelledError:
+            logger.info("Investigation resume stream client disconnected for %s", investigation_id)
+            raise
+        except GeneratorExit:
+            return
         except Exception as e:
             logger.error(f"Investigation resume stream error: {e}")
             yield {"event": "error", "data": json.dumps({"error": str(e)})}
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), ping=10)
 
 
 @app.post("/investigation/{user_id}/start")
@@ -1790,6 +1806,27 @@ async def start_investigation(
     except Exception as e:
         logger.error(f"❌ Failed to start investigation: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to start investigation: {str(e)}")
+
+
+@app.get("/investigation/record/{investigation_id}")
+def get_investigation_record(
+    investigation_id: str = Path(..., description="Investigation ID"),
+):
+    """Fast O(1) lookup of a persisted investigation snapshot (for UI restore)."""
+    try:
+        if not investigation_service:
+            raise HTTPException(status_code=503, detail="Investigation service not initialized")
+
+        record = investigation_service.get_investigation_record(investigation_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Investigation not found")
+
+        return {"found": True, "investigation": record}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to get investigation record: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/investigation/{investigation_id}/status")
@@ -1885,7 +1922,7 @@ def get_user_investigation_history(
 
 
 @app.get("/investigation/user/{user_id}/latest")
-def get_user_latest_investigation(
+async def get_user_latest_investigation(
     user_id: str = Path(..., description="User ID")
 ):
     """
@@ -1905,7 +1942,7 @@ def get_user_latest_investigation(
         if not investigation_service:
             raise HTTPException(status_code=503, detail="Investigation service not initialized")
         
-        latest = investigation_service.get_user_latest_investigation(user_id)
+        latest = await investigation_service.get_user_latest_investigation_async(user_id)
         
         if not latest:
             return {

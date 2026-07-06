@@ -126,6 +126,13 @@ class InvestigationTools:
         if self.metrics:
             self.metrics.track_db_call(operation, target, duration_ms, success)
 
+    def _graph_hops(self, hops: int) -> int:
+        """Cap Gremlin depth — remote demo graph is billion-scale."""
+        hops = min(3, max(1, int(hops or 1)))
+        if settings.is_remote_mode():
+            return 1
+        return hops
+
     @staticmethod
     def _fget(facts: Dict[str, Any], *keys: str, default: Any = 0) -> Any:
         """
@@ -695,7 +702,7 @@ class InvestigationTools:
         """
         logger.info(f"[Tool] detect_fraud_ring(hops={hops})")
         
-        hops = min(3, max(1, hops))
+        hops = self._graph_hops(hops)
         g = self.graph.client
         
         try:
@@ -1069,7 +1076,7 @@ class InvestigationTools:
         """
         logger.info(f"[Tool] get_transaction_network(hops={hops}, min_amount={min_amount})")
         
-        hops = min(3, max(1, hops))
+        hops = self._graph_hops(hops)
         
         try:
             if not self.graph.client:

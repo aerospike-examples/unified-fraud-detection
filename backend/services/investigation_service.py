@@ -39,6 +39,7 @@ class InvestigationService:
         self._active_investigations: Dict[str, Dict[str, Any]] = {}
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
+        self._checkpoint_persisted: set[str] = set()
 
         logger.info(
             "Investigation service initialized (engine=%s, llm_provider=%s)",
@@ -78,6 +79,32 @@ class InvestigationService:
             self.llm_config,
         ).get_workflow_steps()
 
+    def _running_investigation_for_user(self, user_id: str) -> Optional[str]:
+        """Return an in-flight investigation id for this user, if any."""
+        stale_seconds = 10 * 60
+        now = datetime.now()
+        for inv_id, meta in list(self._active_investigations.items()):
+            if meta.get("user_id") != user_id or meta.get("status") != "running":
+                continue
+            started = meta.get("started_at")
+            if started:
+                try:
+                    age = (now - datetime.fromisoformat(started)).total_seconds()
+                    if age > stale_seconds:
+                        logger.warning(
+                            "Clearing stale investigation %s for %s (%.0fs old)",
+                            inv_id,
+                            user_id,
+                            age,
+                        )
+                        meta["status"] = "error"
+                        meta["error"] = "Timed out — client disconnected"
+                        continue
+                except Exception:
+                    pass
+            return inv_id
+        return None
+
     async def start_investigation(
         self,
         user_id: str,
@@ -96,6 +123,67 @@ class InvestigationService:
 
         logger.info("Started investigation %s for user %s", investigation_id, user_id)
         return investigation_id
+
+    def _kv_payload_from_state(
+        self,
+        investigation_id: str,
+        user_id: str,
+        final_state: Dict[str, Any],
+        status: str,
+    ) -> Dict[str, Any]:
+        completed_at = datetime.now().isoformat()
+        completed_steps = (
+            ["alert_validation", "data_collection", "llm_agent", "report_generation"]
+            if status == "completed"
+            else ["alert_validation", "data_collection", "llm_agent"]
+        )
+        payload = {
+            "investigation_id": investigation_id,
+            "user_id": user_id,
+            "completed_at": completed_at,
+            "status": status,
+            "initial_evidence": final_state.get("initial_evidence", {}),
+            "final_assessment": final_state.get("final_assessment", {}),
+            "tool_calls": final_state.get("tool_calls", []),
+            "spec_findings": final_state.get("specialist_findings", {}),
+            "prior_cases": final_state.get("prior_cases", []),
+            "enacted_actions": final_state.get("enacted_actions", []),
+            "agent_iterations": final_state.get("agent_iterations", 0),
+            "report_markdown": final_state.get("report_markdown", ""),
+            "completed_steps": completed_steps,
+        }
+        pending = final_state.get("pending_action")
+        if pending:
+            payload["pending_action"] = pending
+        return payload
+
+    def _persist_to_kv(
+        self,
+        investigation_id: str,
+        user_id: str,
+        final_state: Dict[str, Any],
+        status: str = "completed",
+    ) -> None:
+        """Write investigation snapshot to Aerospike (UI restore; SI on investigations.user_id)."""
+        if not final_state or not self.aerospike_service or not self.aerospike_service.is_connected():
+            return
+        try:
+            kv_data = self._kv_payload_from_state(
+                investigation_id, user_id, final_state, status
+            )
+            self.aerospike_service.put_investigation(investigation_id, kv_data)
+            self._investigation_results[investigation_id] = {
+                "user_id": user_id,
+                "completed_at": kv_data["completed_at"],
+                "state": {**final_state, **kv_data},
+            }
+            logger.info(
+                "Investigation %s persisted to KV store (status=%s)",
+                investigation_id,
+                status,
+            )
+        except Exception as e:
+            logger.warning("Failed to persist investigation to KV: %s", e)
 
     async def _consume(
         self,
@@ -141,6 +229,12 @@ class InvestigationService:
                 if not final_state:
                     final_state = {}
                 final_state.update(data)
+                if data.get("report_markdown") and investigation_id not in self._checkpoint_persisted:
+                    self._checkpoint_persisted.add(investigation_id)
+                    persist_status = "awaiting_confirmation" if paused else "in_progress"
+                    self._persist_to_kv(
+                        investigation_id, user_id, final_state, status=persist_status
+                    )
 
             elif event_type == "metrics":
                 yield {
@@ -167,6 +261,13 @@ class InvestigationService:
                 }
 
         if paused:
+            if final_state:
+                pending = self._pending_confirmations.get(investigation_id)
+                if pending:
+                    final_state = {**final_state, "pending_action": pending}
+                self._persist_to_kv(
+                    investigation_id, user_id, final_state, status="awaiting_confirmation"
+                )
             return
 
         if final_state:
@@ -176,32 +277,8 @@ class InvestigationService:
                 "completed_at": completed_at,
                 "state": final_state,
             }
-            if self.aerospike_service and self.aerospike_service.is_connected():
-                try:
-                    kv_data = {
-                        "investigation_id": investigation_id,
-                        "user_id": user_id,
-                        "completed_at": completed_at,
-                        "status": "completed",
-                        "initial_evidence": final_state.get("initial_evidence", {}),
-                        "final_assessment": final_state.get("final_assessment", {}),
-                        "tool_calls": final_state.get("tool_calls", []),
-                        "spec_findings": final_state.get("specialist_findings", {}),
-                        "prior_cases": final_state.get("prior_cases", []),
-                        "enacted_actions": final_state.get("enacted_actions", []),
-                        "agent_iterations": final_state.get("agent_iterations", 0),
-                        "report_markdown": final_state.get("report_markdown", ""),
-                        "completed_steps": [
-                            "alert_validation",
-                            "data_collection",
-                            "llm_agent",
-                            "report_generation",
-                        ],
-                    }
-                    self.aerospike_service.put_investigation(investigation_id, kv_data)
-                    logger.info("Investigation %s persisted to KV store", investigation_id)
-                except Exception as e:
-                    logger.warning("Failed to persist investigation to KV: %s", e)
+            self._persist_to_kv(investigation_id, user_id, final_state, status="completed")
+            self._checkpoint_persisted.discard(investigation_id)
 
         self._pending_confirmations.pop(investigation_id, None)
         if investigation_id in self._active_investigations:
@@ -214,6 +291,23 @@ class InvestigationService:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Stream investigation progress as SSE events (may pause for HITL approval)."""
         if not investigation_id:
+            existing = self._running_investigation_for_user(user_id)
+            if existing:
+                logger.info(
+                    "Rejecting duplicate stream for %s — %s already running",
+                    user_id,
+                    existing,
+                )
+                yield {
+                    "event": "error",
+                    "data": {
+                        "error": "Investigation already in progress",
+                        "code": "already_running",
+                        "investigation_id": existing,
+                        "user_id": user_id,
+                    },
+                }
+                return
             investigation_id = await self.start_investigation(user_id)
         if not self.engine:
             await self.initialize()
@@ -244,6 +338,15 @@ class InvestigationService:
             if investigation_id in self._active_investigations:
                 self._active_investigations[investigation_id]["status"] = "error"
                 self._active_investigations[investigation_id]["error"] = str(e)
+        finally:
+            meta = self._active_investigations.get(investigation_id)
+            if meta and meta.get("status") == "running":
+                logger.info(
+                    "Investigation %s stream ended without completing — releasing lock",
+                    investigation_id,
+                )
+                meta["status"] = "error"
+                meta["error"] = meta.get("error") or "Stream closed before completion"
 
     def has_pending_action(self, investigation_id: str) -> bool:
         """Whether the investigation is paused awaiting analyst approval."""
@@ -311,6 +414,21 @@ class InvestigationService:
             if investigation_id in self._active_investigations:
                 self._active_investigations[investigation_id]["status"] = "error"
 
+    def get_investigation_record(self, investigation_id: str) -> Optional[Dict[str, Any]]:
+        """Get a persisted investigation snapshot by ID (O(1) KV lookup)."""
+        if self.aerospike_service and self.aerospike_service.is_connected():
+            record = self.aerospike_service.get_investigation(investigation_id)
+            return self._restore_bin_names(record)
+        result = self._investigation_results.get(investigation_id)
+        if result:
+            state = result.get("state") or {}
+            return {
+                "investigation_id": investigation_id,
+                "user_id": result.get("user_id"),
+                **state,
+            }
+        return None
+
     def get_investigation_status(self, investigation_id: str) -> Optional[Dict[str, Any]]:
         """Get status of an investigation."""
         if investigation_id in self._active_investigations:
@@ -346,7 +464,7 @@ class InvestigationService:
         return record
 
     def get_user_latest_investigation(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Get the most recent completed investigation for a user."""
+        """Get the most recent investigation for a user from KV (sync)."""
         if self.aerospike_service and self.aerospike_service.is_connected():
             return self._restore_bin_names(
                 self.aerospike_service.get_user_latest_investigation(user_id)
@@ -363,6 +481,38 @@ class InvestigationService:
 
         user_investigations.sort(key=lambda x: x.get("completed_at", ""), reverse=True)
         return user_investigations[0]
+
+    async def get_user_latest_investigation_async(
+        self, user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """KV lookup with ADK session/artifact fallback when KV is empty."""
+        latest = self.get_user_latest_investigation(user_id)
+        if latest and latest.get("report_markdown"):
+            return latest
+
+        inv_id = (latest or {}).get("investigation_id")
+        if not inv_id and self.aerospike_service and self.aerospike_service.is_connected():
+            # Re-query in case report was missing from latest snapshot
+            retry = self.aerospike_service.get_user_latest_investigation(user_id)
+            inv_id = (retry or {}).get("investigation_id")
+            if retry and retry.get("report_markdown"):
+                latest = retry
+
+        if inv_id and self.engine and hasattr(self.engine, "load_investigation_snapshot"):
+            snap = await self.engine.load_investigation_snapshot(user_id, inv_id)
+            if snap:
+                self._persist_to_kv(
+                    inv_id,
+                    user_id,
+                    {
+                        **snap,
+                        "specialist_findings": snap.get("specialist_findings", {}),
+                    },
+                    status=snap.get("status", "completed"),
+                )
+                return self._restore_bin_names(snap)
+
+        return latest
 
     def get_user_investigation_history(self, user_id: str) -> list[Dict[str, Any]]:
         """Get investigation history for a user."""
@@ -388,10 +538,30 @@ class InvestigationService:
         return sorted(history, key=lambda x: x.get("completed_at", ""), reverse=True)
 
     async def get_investigation_report(self, investigation_id: str) -> Optional[str]:
-        """Get the markdown report for an investigation."""
-        result = self._investigation_results.get(investigation_id)
+        """Get the markdown report for an investigation (KV, memory, or ADK artifact)."""
+        result = self.get_investigation_result(investigation_id)
         if result:
-            return result.get("state", {}).get("report_markdown")
+            md = (result.get("state") or {}).get("report_markdown")
+            if md:
+                return md
+
+        if self.aerospike_service and self.aerospike_service.is_connected():
+            kv = self.aerospike_service.get_investigation(investigation_id)
+            if kv and kv.get("report_markdown"):
+                return kv["report_markdown"]
+
+        if self.engine and hasattr(self.engine, "load_investigation_snapshot"):
+            user_id = None
+            if investigation_id in self._investigation_results:
+                user_id = self._investigation_results[investigation_id].get("user_id")
+            if not user_id and self.aerospike_service:
+                kv = self.aerospike_service.get_investigation(investigation_id)
+                user_id = (kv or {}).get("user_id")
+            if user_id:
+                snap = await self.engine.load_investigation_snapshot(user_id, investigation_id)
+                if snap:
+                    return snap.get("report_markdown")
+
         return None
 
 

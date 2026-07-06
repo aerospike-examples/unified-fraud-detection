@@ -235,7 +235,7 @@ def _build_specialist(name: str, model: str) -> LlmAgent:
         instruction=_make_specialist_instruction(name),
         tools=_ADK_SPECIALIST_TOOLS[name],
         output_key=SPECIALIST_OUTPUT_KEYS[name],
-        generate_content_config=types.GenerateContentConfig(temperature=0.3),
+        generate_content_config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=800),
         # Leaf agents in the ParallelAgent — no transfer.
         disallow_transfer_to_parent=True,
         disallow_transfer_to_peers=True,
@@ -259,7 +259,7 @@ def build_investigation_agent(model: str = None) -> SequentialAgent:
         model=model,
         instruction=_investigator_instruction,
         tools=INVESTIGATION_TOOLS,  # assesses only; enacting happens later
-        generate_content_config=types.GenerateContentConfig(temperature=0.3),
+        generate_content_config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=800),
         # The investigator owns its turn; no transfer to peers/parent.
         disallow_transfer_to_parent=True,
         disallow_transfer_to_peers=True,

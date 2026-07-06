@@ -18,6 +18,7 @@ import {
   CheckCircle,
   XCircle,
   Clock,
+  Loader2,
   Shield,
   Scale,
   Brain,
@@ -40,6 +41,8 @@ import type {
 interface InvestigationReportProps {
   // User ID for fraud ring graph
   userId?: string;
+  /** When true, show partial in-progress evidence instead of the empty placeholder */
+  investigationActive?: boolean;
 
   // New agentic workflow props
   finalAssessment?: FinalAssessment;
@@ -102,6 +105,7 @@ export function InvestigationReport({
   report,
   accountProfile,
   networkEvidence,
+  investigationActive = false,
 }: InvestigationReportProps) {
   // Check which steps are completed to control what to show
   const dataCollectionComplete = completedSteps.includes('data_collection');
@@ -114,6 +118,8 @@ export function InvestigationReport({
   // Check if we have any data to show
   const hasAgentResults = finalAssessment || (toolCalls && toolCalls.length > 0);
   const hasLegacyResults = risk || decision || report;
+  const hasPartialResults = hasAgentResults || hasLegacyResults || !!initialEvidence;
+  const showReport = !!report;
   
   const reportContentRef = useRef<HTMLDivElement>(null);
   
@@ -191,7 +197,20 @@ export function InvestigationReport({
     pdf.save(fileName);
   }, []);
   
-  if (!hasAgentResults && !hasLegacyResults) {
+  if (!hasPartialResults) {
+    if (investigationActive) {
+      return (
+        <Card className="bg-white border-slate-200 shadow-sm">
+          <CardContent className="pt-6">
+            <div className="text-center text-slate-500">
+              <Loader2 className="w-10 h-10 mx-auto mb-4 animate-spin text-indigo-500" />
+              <p className="text-slate-700 font-medium">AI investigation in progress</p>
+              <p className="text-sm mt-1">Evidence and the report will stream in as each stage completes. This usually takes 2–4 minutes.</p>
+            </div>
+          </CardContent>
+        </Card>
+      );
+    }
     return (
       <Card className="bg-white border-slate-200 shadow-sm">
         <CardContent className="pt-6">
@@ -577,8 +596,8 @@ export function InvestigationReport({
         </Card>
       )}
 
-      {/* Full Report (Markdown) - only show after report_generation step completes */}
-      {report && reportGenerationComplete && (
+      {/* Full Report (Markdown) — show as soon as the agent writes it (including HITL pause) */}
+      {showReport && (
         <Card className="bg-white border-slate-200 shadow-sm">
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
