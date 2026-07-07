@@ -203,6 +203,7 @@ export interface PendingAction {
 export const DISPOSITIONS: { id: string; label: string }[] = [
   { id: "clear", label: "Clear (not fraud)" },
   { id: "allow_monitor", label: "Allow & Monitor" },
+  { id: "step_up_auth", label: "Step-up Authentication" },
   { id: "temporary_freeze", label: "Temporary Freeze" },
   { id: "full_block", label: "Full Block (Confirm Fraud)" },
   { id: "escalate_compliance", label: "Escalate to Compliance" },
@@ -568,7 +569,7 @@ export function useInvestigation() {
         });
 
         // Handle 'action_confirmation_required' event (human-in-the-loop).
-        // The agent has paused on a destructive action; surface it for approval.
+        // The agent has paused before enacting; surface the report + decision for approval.
         eventSource.addEventListener("action_confirmation_required", (event) => {
           const data = JSON.parse(event.data) as PendingAction;
           console.log("[Investigation] Action confirmation required:", data);
@@ -876,6 +877,45 @@ export function useInvestigation() {
     [cleanup, attachStreamListeners]
   );
 
+  // Directly set (or change) the disposition on an investigation, without
+  // requiring the agent to have paused with a proposed action first. Used by
+  // the "view report" flow so an analyst can make the first decision when the
+  // agent never produced one, or change a decision that was already enacted.
+  const manualDecide = useCallback(
+    async (investigationId: string, decision: string, reason?: string): Promise<boolean> => {
+      try {
+        const res = await fetch(`/api/investigation/${investigationId}/decide`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision, reason }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.detail || "Failed to record decision");
+        }
+        const body = await res.json();
+        const inv = body.investigation;
+        pendingActionRef.current = null;
+        setState((prev) => ({
+          ...prev,
+          status: "completed",
+          pendingAction: undefined,
+          enactedActions: inv?.enacted_actions ?? prev.enactedActions,
+          report: inv?.report_markdown ?? prev.report,
+        }));
+        return true;
+      } catch (error) {
+        console.error("[Investigation] Manual decision failed:", error);
+        setState((prev) => ({
+          ...prev,
+          error: error instanceof Error ? error.message : "Failed to record decision",
+        }));
+        return false;
+      }
+    },
+    []
+  );
+
   // Stop investigation
   const stopInvestigation = useCallback(() => {
     cleanup();
@@ -957,6 +997,7 @@ export function useInvestigation() {
           enactedActions: inv.enacted_actions || [],
           specialistFindings: inv.specialist_findings || {},
           priorCases: inv.prior_cases || [],
+          pendingAction: pending,
         };
       });
       
@@ -996,6 +1037,7 @@ export function useInvestigation() {
     startInvestigation,
     stopInvestigation,
     approveAction,
+    manualDecide,
     reset,
     getStepStatus,
     loadExistingInvestigation,

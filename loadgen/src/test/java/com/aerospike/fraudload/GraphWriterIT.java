@@ -23,14 +23,15 @@ class GraphWriterIT {
                 "transfer",
                 "Austin, TX",
                 ts);
-        try (GraphWriter writer = new GraphWriter("localhost", 8182, 4)) {
-            assertDoesNotThrow(() -> writer.writeEdge(t));
+        try (GremlinPool gremlin = new GremlinPool("localhost", 8182, 2)) {
+            GraphWriter writer = new GraphWriter(gremlin);
+            assertDoesNotThrow(() -> writer.writeEdge(t, 0));
         }
     }
 
     private static void assumeGremlinReachable() {
-        try (GraphWriter writer = new GraphWriter("localhost", 8182, 2)) {
-            // connection opened successfully
+        try (GremlinPool gremlin = new GremlinPool("localhost", 8182, 1)) {
+            new GraphWriter(gremlin);
         } catch (Exception e) {
             assumeTrue(false, "Gremlin not reachable on localhost:8182 — skipping");
         }

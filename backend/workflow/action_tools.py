@@ -1,8 +1,8 @@
 """
 ADK human-in-the-loop action tool.
 
-Destructive dispositions pause via ADK ``tool_context.request_confirmation``;
-enforcement delegates to :mod:`workflow.action_core`.
+All dispositions pause via ADK ``tool_context.request_confirmation`` before
+enforcement; execution delegates to :mod:`workflow.action_core`.
 """
 
 import logging
@@ -12,7 +12,6 @@ from google.adk.tools import ToolContext
 
 from workflow.action_core import (
     ALL_DECISIONS,
-    DESTRUCTIVE_DECISIONS,
     execute_action,
     init_action_services,
 )
@@ -30,7 +29,7 @@ def init_action_tools(flagged_account_service: Any, aerospike_service: Any = Non
 
 
 def enact_decision(decision: str, account_id: str, reason: str, tool_context: ToolContext) -> dict:
-    """Enforce the recommended decision (ADK tool with HITL for destructive actions)."""
+    """Enforce the recommended decision (ADK tool with HITL for all actions)."""
     decision = (decision or "").strip()
     if decision not in ALL_DECISIONS:
         return {
@@ -39,30 +38,29 @@ def enact_decision(decision: str, account_id: str, reason: str, tool_context: To
             "valid_decisions": sorted(ALL_DECISIONS),
         }
 
-    destructive = decision in DESTRUCTIVE_DECISIONS
-
-    if destructive:
-        confirmation = tool_context.tool_confirmation
-        if confirmation is None:
-            logger.info("[enact_decision] requesting approval for %s on %s", decision, account_id)
-            tool_context.request_confirmation(
-                hint=(
-                    f"The AI agent recommends **{decision.replace('_', ' ')}** on account "
-                    f"{account_id}. Reason: {reason}. Approve this action?"
-                ),
-                payload={"decision": decision, "account_id": account_id, "reason": reason},
-            )
-            return {"status": "pending_confirmation", "decision": decision, "account_id": account_id}
-        if not confirmation.confirmed:
-            logger.info("[enact_decision] analyst REJECTED %s on %s", decision, account_id)
-            return {
-                "status": "rejected",
-                "executed": False,
-                "decision": decision,
-                "account_id": account_id,
-                "message": "Analyst rejected the action; no change made.",
-            }
-        logger.info("[enact_decision] analyst APPROVED %s on %s", decision, account_id)
+    # Always pause for analyst approval — the report is written before this tool
+    # runs, so the UI can show the full investigation and let the human decide.
+    confirmation = tool_context.tool_confirmation
+    if confirmation is None:
+        logger.info("[enact_decision] requesting approval for %s on %s", decision, account_id)
+        tool_context.request_confirmation(
+            hint=(
+                f"The AI agent recommends **{decision.replace('_', ' ')}** on account "
+                f"{account_id}. Reason: {reason}. Approve this action?"
+            ),
+            payload={"decision": decision, "account_id": account_id, "reason": reason},
+        )
+        return {"status": "pending_confirmation", "decision": decision, "account_id": account_id}
+    if not confirmation.confirmed:
+        logger.info("[enact_decision] analyst REJECTED %s on %s", decision, account_id)
+        return {
+            "status": "rejected",
+            "executed": False,
+            "decision": decision,
+            "account_id": account_id,
+            "message": "Analyst rejected the action; no change made.",
+        }
+    logger.info("[enact_decision] analyst APPROVED %s on %s", decision, account_id)
 
     try:
         result = execute_action(decision, account_id, reason)

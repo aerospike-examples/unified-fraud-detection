@@ -11,6 +11,13 @@ public final class Metrics {
     private final LongAdder errors = new LongAdder();
     private final LongAdder fraudTxns = new LongAdder();
     private final LongAdder amountCents = new LongAdder();
+    // Disposition breakdown for THIS run's transactions only, mirroring the
+    // backend's local-mode bucketing convention (fraud_score >= 90 -> blocked,
+    // else review). Used to extrapolate a blocked/review/clean split over the
+    // full (baseline + run) transaction count — see LoadDriver.writeAggregate.
+    private static final double BLOCKED_SCORE_THRESHOLD = 90.0;
+    private final LongAdder blockedTxns = new LongAdder();
+    private final LongAdder reviewTxns = new LongAdder();
 
     public void recordTxn() { txns.increment(); }
     public void recordError() { errors.increment(); }
@@ -20,6 +27,19 @@ public final class Metrics {
     public long errors() { return errors.sum(); }
     public long fraudTxns() { return fraudTxns.sum(); }
     public double totalAmount() { return amountCents.sum() / 100.0; }
+
+    /** Record a transaction's fraud disposition (no-op for clean transactions). */
+    public void recordDisposition(boolean fraud, double fraudScore) {
+        if (!fraud) return;
+        if (fraudScore >= BLOCKED_SCORE_THRESHOLD) {
+            blockedTxns.increment();
+        } else {
+            reviewTxns.increment();
+        }
+    }
+
+    public long blockedTxns() { return blockedTxns.sum(); }
+    public long reviewTxns() { return reviewTxns.sum(); }
 
     /** Fraud rate as a percentage of processed transactions (0 when none yet). */
     public double fraudRatePct() {

@@ -316,13 +316,14 @@ class GraphService:
             }
 
             accounts = (self.client.V(user_id).out("OWNS").hasLabel("account")
-                .project("id", "type", "balance", "bank_name", "status", "fraud_flag")
+                .project("id", "type", "balance", "bank_name", "status", "fraud_flag", "frozen")
                 .by(__.id_())
                 .by(__.coalesce(__.values("type"), __.constant("")))
                 .by(__.coalesce(__.values("balance"), __.constant(0)))
                 .by(__.coalesce(__.values("bank_name"), __.constant("")))
                 .by(__.coalesce(__.values("status"), __.constant("")))
                 .by(__.coalesce(__.values("fraud_flag"), __.constant(False)))
+                .by(__.coalesce(__.values("frozen"), __.constant(False)))
                 .to_list())
 
             devices = (self.client.V(user_id).out("USES").hasLabel("device")
@@ -348,7 +349,40 @@ class GraphService:
                     .by(__.outV().id_())
                     .by(__.inV().id_())
                     .to_list())
+
+                # TRANSACTS edges connect ACCOUNT vertices ("to" is Account{n}), so
+                # resolve the owning user for each distinct counterparty account
+                # (one hop), then batch-fetch names/risk scores for those owners —
+                # otherwise the UI ends up linking to a nonexistent /users/Account{n}
+                # profile and showing "Unknown".
+                counterparty_accounts = {t.get("to") for t in raw_txns if t.get("to")}
+                owner_of: Dict[str, str] = {}
+                if counterparty_accounts:
+                    try:
+                        pairs = (self.client.V(*list(counterparty_accounts)).as_("a").in_("OWNS").as_("u")
+                            .select("a", "u").by(__.id_()).by(__.id_()).to_list())
+                        owner_of = {p.get("a"): p.get("u") for p in pairs}
+                    except Exception as e:
+                        logger.debug(f"Could not resolve txn counterparty owners for {user_id}: {e}")
+
+                owner_info: Dict[str, Dict[str, Any]] = {}
+                owner_ids = {uid for uid in owner_of.values() if uid}
+                if owner_ids:
+                    try:
+                        rows = (self.client.V(*list(owner_ids))
+                            .project("id", "name", "risk_score")
+                            .by(__.id_())
+                            .by(__.coalesce(__.values("name"), __.constant("")))
+                            .by(__.coalesce(__.values("risk_score"), __.constant(0)))
+                            .to_list())
+                        owner_info = {r["id"]: r for r in rows}
+                    except Exception as e:
+                        logger.debug(f"Could not resolve txn counterparty names for {user_id}: {e}")
+
                 for t in raw_txns:
+                    to_acct = t.get("to", "")
+                    owner_id = owner_of.get(to_acct, "")
+                    owner = owner_info.get(owner_id, {})
                     txns_list.append({
                         "txn": {
                             "txn_id": t.get("txn_id", ""),
@@ -359,9 +393,9 @@ class GraphService:
                             "status": "clean",
                         },
                         "other_party": {
-                            "id": t.get("to", ""),
-                            "name": "Unknown",
-                            "risk_score": 0,
+                            "id": owner_id or to_acct,
+                            "name": owner.get("name") or "Unknown",
+                            "risk_score": owner.get("risk_score", 0) or 0,
                         },
                     })
             except Exception as e:

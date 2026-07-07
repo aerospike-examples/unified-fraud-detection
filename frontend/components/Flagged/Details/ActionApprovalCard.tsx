@@ -45,8 +45,8 @@ export function ActionApprovalCard({
           Analyst Approval Required
         </CardTitle>
         <p className="text-sm text-amber-800">
-          The AI agent has paused and is requesting approval before taking a
-          destructive action on this account.
+          The AI agent has finished its investigation and is waiting for your approval
+          before enacting the recommended action on this account.
         </p>
       </CardHeader>
       <CardContent className="space-y-4">

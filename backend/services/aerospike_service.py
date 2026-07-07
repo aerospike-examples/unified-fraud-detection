@@ -342,11 +342,20 @@ class AerospikeService:
         
         return result
     
+    # Large single-call batch_read()s (~thousands of keys) have been observed to
+    # segfault the aerospike C client under concurrent load (e.g. while the
+    # scheduler thread / other requests are also using the shared client).
+    # Chunking keeps each native call small and dramatically reduces that risk,
+    # at the cost of a few extra round trips.
+    BATCH_CHUNK_SIZE = 500
+
     def batch_get(self, keys: List[tuple]) -> List[Optional[tuple]]:
         """
         Batch read multiple records from Aerospike.
         
         Works with both old (get_many) and new (batch_read) API versions.
+        Large key lists are split into smaller chunks (see BATCH_CHUNK_SIZE)
+        to avoid known stability issues with very large single batch_read calls.
         
         Args:
             keys: List of (namespace, set, key) tuples
@@ -358,7 +367,13 @@ class AerospikeService:
         """
         if not self.is_connected() or not keys:
             return [None] * len(keys)
-        
+
+        if len(keys) > self.BATCH_CHUNK_SIZE:
+            results: List[Optional[tuple]] = []
+            for i in range(0, len(keys), self.BATCH_CHUNK_SIZE):
+                results.extend(self.batch_get(keys[i:i + self.BATCH_CHUNK_SIZE]))
+            return results
+
         try:
             # Try new API first (aerospike >= 7.0.0)
             # batch_read(keys) returns BatchRecords with batch_records list
@@ -2278,6 +2293,13 @@ class AerospikeService:
         """
         Store a completed investigation result.
 
+        Every call writes the FULL current snapshot (never a partial patch), so
+        this uses a create-or-replace policy rather than the default put()
+        merge semantics — otherwise stale bins from an earlier state (e.g. a
+        ``pending_action`` from a since-resolved HITL pause) would silently
+        survive on the record forever, since Aerospike's default write only
+        adds/updates the bins given and leaves the rest of the record intact.
+
         Requires idx_inv_user_id on investigations.user_id (created on connect).
         """
         if not self.is_connected():
@@ -2286,7 +2308,13 @@ class AerospikeService:
         try:
             data["investigation_id"] = investigation_id
             data["stored_at"] = datetime.now().isoformat()
-            return self.put(SET_INVESTIGATIONS, investigation_id, data)
+            record_key = (self.namespace, SET_INVESTIGATIONS, investigation_id)
+            shortened_data = self._shorten_bin_names(data)
+            self.client.put(
+                record_key, shortened_data,
+                policy={"exists": aerospike.POLICY_EXISTS_CREATE_OR_REPLACE},
+            )
+            return True
         except Exception as e:
             logger.error(f"Error storing investigation {investigation_id}: {e}")
             return False

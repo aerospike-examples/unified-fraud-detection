@@ -8,12 +8,44 @@ import Label from '@/components/Label'
 
 const API_BASE_URL = process.env.BASE_URL || "http://localhost:8080/api"
 
+// Overall account disposition, mirroring the flagged-accounts workflow statuses
+// (kept in sync with frontend/app/flagged/page.tsx's statusConfig).
+const ACCOUNT_STATUS_CONFIG: Record<string, {
+	label: string
+	icon: 'check-circle' | 'alert-triangle' | 'shield' | 'clock' | 'x-circle'
+	color: 'green-600' | 'destructive' | 'blue-600' | 'indigo-600' | 'cyan-600' | 'amber-600'
+	badgeClassName: string
+}> = {
+	active: { label: 'Active', icon: 'check-circle', color: 'green-600', badgeClassName: 'bg-green-100 text-green-800' },
+	pending_review: { label: 'Pending Review', icon: 'alert-triangle', color: 'amber-600', badgeClassName: 'bg-amber-100 text-amber-800' },
+	under_investigation: { label: 'Under Investigation', icon: 'shield', color: 'blue-600', badgeClassName: 'bg-blue-100 text-blue-800' },
+	monitoring: { label: 'Monitoring', icon: 'shield', color: 'indigo-600', badgeClassName: 'bg-indigo-100 text-indigo-800' },
+	temporarily_frozen: { label: 'Temporarily Frozen', icon: 'clock', color: 'cyan-600', badgeClassName: 'bg-cyan-100 text-cyan-800' },
+	confirmed_fraud: { label: 'Confirmed Fraud', icon: 'x-circle', color: 'destructive', badgeClassName: 'bg-red-100 text-red-800' },
+	cleared: { label: 'Cleared', icon: 'check-circle', color: 'green-600', badgeClassName: 'bg-green-100 text-green-800' },
+}
+
 export default async function UserDetailPage({ params }: { params: Promise<{ id: string }>}) {
   	const { id: userId } = await params;
   	const response = await fetch(`${API_BASE_URL}/users/${userId}`, { cache: 'no-store' })
+
+	if (!response.ok) {
+		return (
+			<div className="flex flex-col items-center justify-center min-h-[400px] space-y-3 text-center">
+				<h1 className="text-2xl font-bold tracking-tight">User Not Found</h1>
+				<p className="text-muted-foreground max-w-md">
+					{userId?.startsWith('Account')
+						? `"${userId}" is an account ID, not a user ID — this profile only exists for users.`
+						: `No user found with ID "${userId}".`}
+				</p>
+			</div>
+		)
+	}
+
     const { user, risk_level, ...userDetails }: UserSummary = await response.json();
 	
 	const riskScore = user?.risk_score ?? 0;
+	const accountStatus = ACCOUNT_STATUS_CONFIG[user?.account_status ?? 'active'] ?? ACCOUNT_STATUS_CONFIG.active;
 
   	return (
     	<div className="space-y-6">
@@ -96,11 +128,12 @@ export default async function UserDetailPage({ params }: { params: Promise<{ id:
 							text={formatDate(user?.signup_date ?? '')} />
 						<Label
 							title='Account Status'
-							icon={user?.is_flagged ? 'alert-triangle' : 'check-circle'}
-							color={user?.is_flagged ? 'destructive' : 'green-600'}
+							icon={accountStatus.icon}
+							color={accountStatus.color}
 							badge={{
-								variant: user?.is_flagged ? 'destructive' : 'default',
-								text: user?.is_flagged ? 'Flagged' : 'Active'
+								variant: 'outline',
+								className: accountStatus.badgeClassName,
+								text: accountStatus.label
 							}} />
 					</CardContent>
 				</Card>

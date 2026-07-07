@@ -32,8 +32,10 @@ public final class LoadDriver {
         cp.maxConnsPerNode = Math.max(300, cfg.workers() * 8);
 
         GraphWriter graphWriter = null;
+        GremlinPool gremlinPool = null;
         if (cfg.writeMode().writesGraph()) {
-            graphWriter = new GraphWriter(cfg.graphHost(), cfg.graphPort(), cfg.workers() * 4);
+            gremlinPool = new GremlinPool(cfg.graphHost(), cfg.graphPort(), cfg.workers());
+            graphWriter = new GraphWriter(gremlinPool);
             try {
                 baselineTxns = GraphSummary.fetch(cfg.graphHost(), cfg.graphPort()).transacts();
                 log.info("baseline TRANSACTS from graph summary: {}", baselineTxns);
@@ -44,8 +46,9 @@ public final class LoadDriver {
 
         try (AerospikeClient client = cfg.writeMode().writesKv()
                 ? new AerospikeClient(cp, cfg.host(), cfg.port()) : null;
-             GraphWriter graph = graphWriter) {
+             GremlinPool gremlin = gremlinPool) {
 
+            final GraphWriter graph = graphWriter;
             KvWriter kvWriter = client != null
                     ? new KvWriter(client, cfg.namespace(), cfg.updateBalances()) : null;
             PairedWriter pairedWriter = (kvWriter != null && graph != null)
@@ -107,8 +110,8 @@ public final class LoadDriver {
                                         : gen.next();
                                 switch (cfg.writeMode()) {
                                     case kv -> kvWriter.writeTransaction(t);
-                                    case graph -> graph.writeEdge(t);
-                                    case paired -> pairedWriter.writeTransaction(t, pairExecutor);
+                                    case graph -> graph.writeEdge(t, workerIndex);
+                                    case paired -> pairedWriter.writeTransaction(t, pairExecutor, workerIndex);
                                 }
                                 if (t.fraud() && fraudInjector != null) {
                                     fraudInjector.flagOnDetection(t);
@@ -116,6 +119,7 @@ public final class LoadDriver {
                                 metrics.recordTxn();
                                 metrics.recordAmount(t.amountCents());
                                 if (t.fraud()) metrics.recordFraud();
+                                metrics.recordDisposition(t.fraud(), t.fraudScore());
                             } catch (Exception e) {
                                 metrics.recordError();
                                 if (metrics.errors() == 1) {
@@ -168,15 +172,34 @@ public final class LoadDriver {
      * Writes the optional `config:aggregate_stats` record the backend reads in
      * remote mode. Includes live txn count (baseline graph summary + this run) so
      * the dashboard updates during the demo without waiting for AGS metadata lag.
+     *
+     * blocked/review/clean aren't tracked historically (billions of past edges
+     * were never bucketed), so we extrapolate: this run's own blocked:review:clean
+     * ratio is applied to the full (baseline + run) txn count. That keeps the
+     * three figures always summing to `txns` instead of showing a tiny live-run
+     * count next to a billion-scale total.
      */
     private void writeAggregate(AerospikeClient client, String namespace) {
         try {
+            long totalTxns = baselineTxns + metrics.txns();
+            long runTxns = metrics.txns();
+            long blocked = 0;
+            long review = 0;
+            if (runTxns > 0) {
+                blocked = Math.round(totalTxns * (metrics.blockedTxns() / (double) runTxns));
+                review = Math.round(totalTxns * (metrics.reviewTxns() / (double) runTxns));
+            }
+            long clean = Math.max(0, totalTxns - blocked - review);
+
             WritePolicy wp = new WritePolicy(client.writePolicyDefault);
             Key key = new Key(namespace, "config", "aggregate_stats");
             client.put(wp, key,
                     new Bin("total_amount", Math.round(metrics.totalAmount() * 100.0) / 100.0),
                     new Bin("fraud_rate", Math.round(metrics.fraudRatePct() * 100.0) / 100.0),
-                    new Bin("txns", baselineTxns + metrics.txns()),
+                    new Bin("txns", totalTxns),
+                    new Bin("blocked", blocked),
+                    new Bin("review", review),
+                    new Bin("clean", clean),
                     new Bin("last_updated", Instant.now().toString()));
         } catch (Exception e) {
             log.debug("aggregate write failed: {}", e.toString());

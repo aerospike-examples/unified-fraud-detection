@@ -2,7 +2,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from './ui/skeleton';
 import Icon, { type IconName } from './Icon';
 import Label from './Label';
-export type Color = 'destructive' | 'warning' | 'foreground' | 'green-600' | 'blue-600' | 'yellow-600'
+export type Color = 'destructive' | 'warning' | 'foreground' | 'green-600' | 'blue-600' | 'yellow-600' | 'amber-600' | 'cyan-600' | 'indigo-600'
 
 export interface StatProps {
     color?: Color

@@ -109,6 +109,32 @@ class FlaggedAccountService:
         if account_id and account_id.startswith('A') and not account_id.startswith('Account') and len(account_id) > 3:
             return f"U{account_id[1:-2]}"
         return None
+
+    def _flagged_user_id(self, ident: str) -> Optional[str]:
+        """Resolve the flagged-record key (user_id) from EITHER an account id or a
+        user id. The investigation agent is inconsistent about which it passes to
+        an action (e.g. ``Account509977074`` vs ``User509977074``), so accept both.
+        """
+        if not ident:
+            return None
+        # Already a flagged user id?
+        if self._use_aerospike() and self._aerospike.get_flagged_account(ident):
+            return ident
+        # Resolve owner from an account id (graph OWNS edge, then legacy scheme).
+        owner = self._owner_user_id(ident)
+        if owner:
+            return owner
+        # Demo bulk-load convention: Account{n} <-> User{n}.
+        if ident.startswith("Account"):
+            return "User" + ident[len("Account"):]
+        return ident
+
+    def _account_id_for(self, ident: str) -> str:
+        """Resolve the account id to act on from EITHER an account or user id
+        (Account{n} <-> User{n} bulk-load convention)."""
+        if ident and ident.startswith("User"):
+            return "Account" + ident[len("User"):]
+        return ident
     
     def _load_data(self):
         """Load persisted data from files."""
@@ -893,9 +919,17 @@ class FlaggedAccountService:
         """Get paginated list of flagged accounts."""
         accounts = self._load_flagged_accounts()
         
-        # Filter by status
+        # Filter by status. "completed" is a pseudo-status aggregating every account
+        # whose investigation has been decided/resolved (i.e. left the pending/active
+        # queues) — monitoring, temporarily frozen, confirmed fraud, or cleared.
         if status and status != "all":
-            accounts = [a for a in accounts if a.get("status") == status]
+            if status == "completed":
+                completed_statuses = {
+                    "monitoring", "temporarily_frozen", "confirmed_fraud", "cleared",
+                }
+                accounts = [a for a in accounts if a.get("status") in completed_statuses]
+            else:
+                accounts = [a for a in accounts if a.get("status") == status]
         
         # Filter by search query
         if search:
@@ -981,6 +1015,9 @@ class FlaggedAccountService:
         Returns:
             Dictionary with resolution results
         """
+        # The agent may hand us either an account id or a user id — normalize to a
+        # canonical account id so graph/KV/device ops and owner resolution all work.
+        account_id = self._account_id_for(account_id)
         result = {
             "account_id": account_id,
             "resolution": resolution,
@@ -1150,11 +1187,13 @@ class FlaggedAccountService:
             "errors": [],
         }
         now = datetime.now().isoformat()
+        # The agent may hand us either an account id or a user id — normalize both.
+        acct_id = self._account_id_for(account_id)
         try:
             # Graph DB: set a reversible `frozen` property (NOT fraud_flag).
             if self.graph_service and self.graph_service.client:
                 try:
-                    self.graph_service.client.V(account_id) \
+                    self.graph_service.client.V(acct_id) \
                         .property("frozen", frozen) \
                         .property("frozen_reason", notes or f"Account {action} by analyst") \
                         .property("frozen_date", now) \
@@ -1166,12 +1205,12 @@ class FlaggedAccountService:
             # KV: mirror the frozen flag on the account-fact.
             if self._use_aerospike():
                 try:
-                    account_fact = self._aerospike.get_account_fact(account_id)
+                    account_fact = self._aerospike.get_account_fact(acct_id)
                     if account_fact:
                         account_fact["frozen"] = frozen
                         account_fact["frozen_reason"] = notes or f"Account {action} by analyst"
                         account_fact["frozen_date"] = now
-                        self._aerospike.update_account_fact(account_id, account_fact)
+                        self._aerospike.update_account_fact(acct_id, account_fact)
                         result["kv_updated"] = True
                 except Exception as e:
                     result["errors"].append(f"KV update error: {e}")
@@ -1179,7 +1218,7 @@ class FlaggedAccountService:
             # Move the user's flagged-account record to a reversible hold status.
             if self._use_aerospike():
                 try:
-                    user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else None
+                    user_id = self._flagged_user_id(account_id)
                     if user_id and self._aerospike.get_flagged_account(user_id):
                         self._aerospike.update_flagged_account(user_id, {
                             "status": "temporarily_frozen" if frozen else "pending_review",
@@ -1210,8 +1249,8 @@ class FlaggedAccountService:
             result["errors"].append("Aerospike unavailable")
             return result
         try:
-            user_id = f"U{account_id[1:-2]}" if account_id.startswith('A') else account_id
-            if self._aerospike.get_flagged_account(user_id):
+            user_id = self._flagged_user_id(account_id)
+            if user_id and self._aerospike.get_flagged_account(user_id):
                 self._aerospike.update_flagged_account(user_id, {
                     "status": "monitoring",
                     "resolution": "monitoring",

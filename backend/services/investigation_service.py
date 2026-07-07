@@ -531,6 +531,67 @@ class InvestigationService:
         async for ev in self._subscribe(investigation_id):
             yield ev
 
+    async def record_manual_decision(
+        self, investigation_id: str, decision: str, reason: str = "",
+    ) -> Dict[str, Any]:
+        """Directly enact (or change) a disposition on an investigation's account,
+        bypassing the agent confirmation flow entirely.
+
+        Lets an analyst make the first decision when the agent never proposed
+        one (e.g. the report was generated but the agent's action auto-executed
+        or the run predates this pause), or change a decision that was already
+        made — all without re-running the investigation. This mirrors what
+        ``resume_investigation_action`` enacts, just triggered directly instead
+        of via the agent's ``enact_decision`` tool.
+        """
+        from workflow.action_core import ALL_DECISIONS, execute_action
+
+        valid_decisions = ALL_DECISIONS | {"clear"}
+        if decision not in valid_decisions:
+            raise ValueError(f"Unknown decision '{decision}'. Valid: {sorted(valid_decisions)}")
+
+        raw_record: Optional[Dict[str, Any]] = None
+        if self.aerospike_service and self.aerospike_service.is_connected():
+            raw_record = self.aerospike_service.get_investigation(investigation_id)
+        if not raw_record:
+            cached = self._investigation_results.get(investigation_id)
+            if cached:
+                raw_record = {**(cached.get("state") or {}), "user_id": cached.get("user_id")}
+        if not raw_record:
+            raise LookupError(f"No investigation found for id {investigation_id}")
+
+        user_id = raw_record.get("user_id")
+        if not user_id:
+            raise ValueError("Investigation record has no user_id")
+
+        note = reason.strip() if reason and reason.strip() else f"Manual analyst decision: {decision}"
+        result = await asyncio.to_thread(execute_action, decision, user_id, note)
+
+        enacted = list(raw_record.get("enacted_actions") or [])
+        enacted.append(result)
+        raw_record["enacted_actions"] = enacted
+        raw_record["status"] = "completed"
+        raw_record.pop("pending_action", None)
+        raw_record["decided_at"] = datetime.now().isoformat()
+        raw_record["investigation_id"] = investigation_id
+        raw_record["user_id"] = user_id
+
+        # Clear any stale pause state and refresh the in-memory result cache so
+        # subsequent reads (including the SSE 'complete' fallback fetch) see it.
+        self._pending_confirmations.pop(investigation_id, None)
+        if investigation_id in self._active_investigations:
+            self._active_investigations[investigation_id]["status"] = "completed"
+        self._investigation_results[investigation_id] = {
+            "user_id": user_id,
+            "completed_at": raw_record.get("completed_at", datetime.now().isoformat()),
+            "state": self._restore_bin_names(dict(raw_record)),
+        }
+
+        if self.aerospike_service and self.aerospike_service.is_connected():
+            self.aerospike_service.put_investigation(investigation_id, raw_record)
+
+        return self._restore_bin_names(dict(raw_record))
+
     def get_investigation_record(self, investigation_id: str) -> Optional[Dict[str, Any]]:
         """Get a persisted investigation snapshot by ID (O(1) KV lookup)."""
         if self.aerospike_service and self.aerospike_service.is_connected():

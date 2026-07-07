@@ -359,12 +359,77 @@ def _risk_level_from_score(risk_score: float) -> str:
     return "CRITICAL"
 
 
+def _resolve_counterparty_user_id(account_id: str) -> Optional[str]:
+    """Resolve the owning user_id for a counterparty ACCOUNT id on a transaction.
+
+    Loadgen-written KV transactions only store the counterparty's account id
+    (``counterparty``), not its owning user id (``counterparty_user_id`` is
+    written by the Python transaction generator but not the Java loadgen) —
+    without this, the Transactions tab shows "Unknown" and links to a
+    nonexistent ``/users/Account{n}`` profile.
+    """
+    if not account_id:
+        return None
+    owner = flagged_account_service._owner_user_id(account_id)
+    if owner:
+        return owner
+    if account_id.startswith("Account"):
+        return "User" + account_id[len("Account"):]
+    return None
+
+
+def _compute_account_status(user_id: str, accounts: list) -> str:
+    """Resolve the user's overall account status for profile display.
+
+    ``is_flagged`` on the user vertex is never written anywhere in this
+    codebase (it's always false), so it can't be used to reflect real state.
+    Instead, prefer the flagged-account workflow record (pending_review,
+    under_investigation, monitoring, temporarily_frozen, confirmed_fraud,
+    cleared) — the authoritative source once an account has been reviewed —
+    and fall back to the per-account fraud/frozen flags set directly on the
+    graph/KV account records for accounts resolved outside that workflow.
+    """
+    flagged = flagged_account_service.get_flagged_account(user_id)
+    if flagged and flagged.get("status"):
+        return flagged["status"]
+    if any(a.get("fraud_flag") or a.get("is_fraud") for a in accounts):
+        return "confirmed_fraud"
+    if any(a.get("frozen") for a in accounts):
+        return "temporarily_frozen"
+    return "active"
+
+
+def _compute_user_risk_score(user_id: str, fallback: float = 0.0) -> float:
+    """Resolve the best-known risk score for the profile's Risk Assessment card.
+
+    The user vertex/record's ``risk_score`` field is only ever updated by the
+    local ML detection job (``update_user_evaluation`` / ``update_user_risk_score``)
+    — remote-mode and demo seeding paths flag accounts by writing straight to
+    the ``flagged_accounts`` record instead (see ``flag_account`` /
+    ``load_sample_flagged_accounts``), so that profile field is stuck at 0 for
+    most flagged users. Prefer the flagged-account record's score (computed at
+    flag time, and the same value the Flagged Accounts UI shows) and fall back
+    to the profile field otherwise.
+    """
+    flagged = flagged_account_service.get_flagged_account(user_id)
+    if flagged and flagged.get("risk_score"):
+        try:
+            return float(flagged["risk_score"])
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(fallback or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _user_profile_from_graph(user_id: str):
     """Build the /users/{id} response from the Graph. Returns None if absent."""
     profile = graph_service.get_user_profile(user_id)
     if not profile:
         return None
-    risk_score = profile["user"].get("risk_score", 0) or 0
+    risk_score = _compute_user_risk_score(user_id, profile["user"].get("risk_score", 0) or 0)
+    profile["user"]["risk_score"] = risk_score
     return {
         "user": profile["user"],
         "risk_level": _risk_level_from_score(risk_score),
@@ -388,6 +453,7 @@ def get_user(user_id: str):
             profile = _user_profile_from_graph(user_id)
             if not profile:
                 raise HTTPException(status_code=404, detail="User not found")
+            profile["user"]["account_status"] = _compute_account_status(user_id, profile.get("accounts", []))
             return profile
 
         user = aerospike_service.get_user(user_id)
@@ -395,11 +461,12 @@ def get_user(user_id: str):
             # Fall back to the graph if the KV record is missing
             profile = _user_profile_from_graph(user_id)
             if profile:
+                profile["user"]["account_status"] = _compute_account_status(user_id, profile.get("accounts", []))
                 return profile
             raise HTTPException(status_code=404, detail="User not found")
         
         # Calculate risk level from risk score
-        risk_score = user.get('risk_score', 0) or 0
+        risk_score = _compute_user_risk_score(user_id, user.get('risk_score', 0) or 0)
         if risk_score < 25:
             risk_level = "LOW"
         elif risk_score < 50:
@@ -415,7 +482,9 @@ def get_user(user_id: str):
         devices_map = user.get('devices', {})
         
         accounts_list = [
-            {'id': acc_id, **acc_data}
+            # `flag_account_in_user` writes `is_fraud` on the embedded map entry;
+            # normalize to `fraud_flag` so it matches the graph/API convention.
+            {'id': acc_id, **acc_data, 'fraud_flag': acc_data.get('fraud_flag', acc_data.get('is_fraud', False))}
             for acc_id, acc_data in accounts_map.items()
         ] if isinstance(accounts_map, dict) else []
         
@@ -423,7 +492,21 @@ def get_user(user_id: str):
             {'id': dev_id, **dev_data}
             for dev_id, dev_data in devices_map.items()
         ] if isinstance(devices_map, dict) else []
-        
+
+        # `temporary_freeze` writes the reversible hold to the separate
+        # account_fact record, not the embedded accounts map — overlay it here
+        # so the profile reflects a freeze/unfreeze without a schema migration.
+        for acc in accounts_list:
+            acc_id = acc.get('id', '')
+            if not acc_id:
+                continue
+            try:
+                fact = aerospike_service.get_account_fact(acc_id)
+                if fact and 'frozen' in fact:
+                    acc['frozen'] = bool(fact['frozen'])
+            except Exception as e:
+                logger.debug(f"Could not overlay account_fact frozen state for {acc_id}: {e}")
+
         # Fetch transactions from Aerospike KV for all user's accounts
         txns_list = []
         for acc in accounts_list:
@@ -436,8 +519,14 @@ def get_user(user_id: str):
                         if txn.get('direction') != 'out':
                             continue
                         
-                        # Get counterparty user info
-                        counterparty_user_id = txn.get('counterparty_user_id', '')
+                        # Get counterparty user info. Fall back to resolving the
+                        # counterparty ACCOUNT id when the KV record has no
+                        # counterparty_user_id (e.g. loadgen-written transactions).
+                        counterparty_user_id = (
+                            txn.get('counterparty_user_id', '')
+                            or _resolve_counterparty_user_id(txn.get('counterparty', ''))
+                            or ''
+                        )
                         other_party_name = 'Unknown'
                         other_party_risk = 0
                         
@@ -481,6 +570,7 @@ def get_user(user_id: str):
                 "signup_date": user.get('signup_date', ''),
                 "risk_score": risk_score,
                 "is_flagged": user.get('is_flagged', False),
+                "account_status": _compute_account_status(user_id, accounts_list),
             },
             "risk_level": risk_level,
             "accounts": accounts_list,
@@ -1786,6 +1876,40 @@ async def resume_investigation_action(
             yield {"event": "error", "data": json.dumps({"error": str(e)})}
 
     return EventSourceResponse(event_generator(), ping=10)
+
+
+class ManualDecisionRequest(BaseModel):
+    decision: str
+    reason: Optional[str] = None
+
+
+@app.post("/investigation/{investigation_id}/decide")
+async def manual_decide_investigation(
+    investigation_id: str = Path(..., description="Investigation ID to record a decision for"),
+    payload: ManualDecisionRequest = Body(...),
+):
+    """Directly set (or change) the disposition on an investigation's account.
+
+    Unlike ``/investigation/{id}/resume``, this does NOT require the agent to
+    have paused with a proposed action first — it lets an analyst make the
+    first decision when the agent never produced one (or it auto-executed a
+    non-destructive action), or change a decision that was already enacted.
+    No re-run required; the existing report and evidence are left untouched.
+    """
+    if not investigation_service:
+        raise HTTPException(status_code=503, detail="Investigation service not initialized")
+    try:
+        record = await investigation_service.record_manual_decision(
+            investigation_id, payload.decision, payload.reason or ""
+        )
+        return {"investigation": record}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Manual decision failed for {investigation_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to record decision: {e}")
 
 
 @app.post("/investigation/{user_id}/start")

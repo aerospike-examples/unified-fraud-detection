@@ -170,8 +170,8 @@ def _investigator_instruction(ctx: ReadonlyContext) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Action taker: enacts the decision AFTER the report is written. Destructive
-# actions pause here for analyst approval (ADK tool-confirmation).
+# Action taker: enacts the decision AFTER the report is written. All actions
+# pause here for analyst approval (ADK tool-confirmation).
 # ─────────────────────────────────────────────────────────────────────────────
 _ACTION_TAKER_SYSTEM = """You enforce a fraud decision that a senior analyst has ALREADY made and documented. Do NOT re-investigate, second-guess, or change the decision.
 
@@ -180,7 +180,7 @@ Call enact_decision EXACTLY ONCE with:
 - account_id: {account_id}  (if this is blank, use the PRIMARY flagged account from the evidence below)
 - reason: one concise sentence justifying the action (you may summarize this: {reason})
 
-Do not call any other tool. Destructive actions (temporary_freeze, full_block, escalate_compliance) will pause for a human analyst's approval before they take effect; non-destructive ones apply immediately. After enact_decision returns, stop.
+Do not call any other tool. Every decision pauses for a human analyst's approval before it takes effect. After enact_decision returns, stop.
 
 ## EVIDENCE (for the primary flagged account id, if needed)
 {evidence}

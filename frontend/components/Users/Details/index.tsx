@@ -29,6 +29,9 @@ export interface User {
     location: string
     risk_score: number
     is_flagged: boolean
+    /** Overall disposition (pending_review, under_investigation, monitoring,
+     * temporarily_frozen, confirmed_fraud, cleared, or "active" if never flagged). */
+    account_status?: string
     phone?: string
     occupation?: string
 }

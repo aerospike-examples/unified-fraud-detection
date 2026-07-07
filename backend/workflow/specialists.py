@@ -32,29 +32,34 @@ _SPECIALIST_SYSTEM = """You are a {role} on a fraud-investigation team. You are 
 _SPECIALIST_SPECS = {
     NETWORK_ANALYST_NAME: dict(
         role="NETWORK ANALYST",
-        max_calls=2,
+        max_calls=12,
         focus=(
-            "Counterparties and money-movement patterns. Use get_transaction_network "
-            "(hops=1) OR detect_fraud_ring (hops=1) — pick ONE, not both. Then vet at most "
-            "1-2 suspicious counterparties with get_counterparty_profile. Be fast and decisive."
+            "Counterparties and money-movement patterns — be THOROUGH. Start with "
+            "get_transaction_network (hops=1) to map the flow, then detect_fraud_ring "
+            "(hops=1) for ring structure. Then drill into the SUSPICIOUS counterparties: "
+            "call get_counterparty_profile on each notable counterparty (aim for 4-6), and "
+            "get_counterparty_transactions on any whose volume or balance looks anomalous. "
+            "If a ring or high-value chain appears, expand with get_transaction_network "
+            "(hops=2). Use as many tool calls as needed to fully map the network."
         ),
     ),
     DEVICE_ANALYST_NAME: dict(
         role="DEVICE & INFRASTRUCTURE ANALYST",
-        max_calls=1,
+        max_calls=4,
         focus=(
-            "Device and account infrastructure risk only. One call to get_account_risk_features "
-            "on the flagged account is usually enough. Add get_device_risk_features only if "
-            "devices are present in the evidence."
+            "Device and account infrastructure risk. Call get_account_risk_features on the "
+            "flagged account, then get_device_risk_features on each device present in the "
+            "evidence. Investigate shared-device links thoroughly if any surface."
         ),
     ),
     VELOCITY_ANALYST_NAME: dict(
         role="VELOCITY & TRANSACTION ANALYST",
-        max_calls=2,
+        max_calls=6,
         focus=(
             "Velocity and amount behavior. get_account_risk_features first, then "
-            "get_account_transactions (days=7) only if velocity scores look anomalous. "
-            "Quantify any burst in one line."
+            "get_account_transactions (days=7, then days=30 if a burst appears) to quantify "
+            "velocity, bursts, and amount anomalies. Pull enough windows to characterize the "
+            "pattern precisely."
         ),
     ),
 }

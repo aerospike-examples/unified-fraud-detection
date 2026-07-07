@@ -113,7 +113,7 @@ const statusConfig = {
 }
 
 export default function FlaggedAccountsPage() {
-    const [filter, setFilter] = useState<'all' | 'pending_review' | 'under_investigation'>('all')
+    const [filter, setFilter] = useState<'all' | 'pending_review' | 'under_investigation' | 'completed'>('all')
     const [searchQuery, setSearchQuery] = useState('')
     const [debouncedSearch, setDebouncedSearch] = useState('')
     const [page, setPage] = useState(1)
@@ -317,6 +317,7 @@ export default function FlaggedAccountsPage() {
                                 <TabsTrigger value="all">All</TabsTrigger>
                                 <TabsTrigger value="pending_review">Pending</TabsTrigger>
                                 <TabsTrigger value="under_investigation">Investigating</TabsTrigger>
+                                <TabsTrigger value="completed">Completed</TabsTrigger>
                             </TabsList>
                         </Tabs>
                     </div>

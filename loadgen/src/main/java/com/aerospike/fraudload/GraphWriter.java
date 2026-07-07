@@ -1,7 +1,6 @@
 package com.aerospike.fraudload;
 
 import org.apache.tinkerpop.gremlin.driver.Client;
-import org.apache.tinkerpop.gremlin.driver.Cluster;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,7 +10,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 /** Minimal TRANSACTS edge writer — one addE per transaction, no OWNS/USES lookups. */
-public final class GraphWriter implements AutoCloseable {
+public final class GraphWriter {
     private static final Logger log = LoggerFactory.getLogger(GraphWriter.class);
 
     private static final String ADD_EDGE =
@@ -28,17 +27,11 @@ public final class GraphWriter implements AutoCloseable {
                     + ".property('fraud_score', fraudScore)"
                     + ".property('gen_type', genType)";
 
-    private final Cluster cluster;
-    private final Client client;
+    private final GremlinPool pool;
 
-    public GraphWriter(String host, int port, int maxPoolSize) {
-        cluster = Cluster.build()
-                .addContactPoint(host)
-                .port(port)
-                .maxConnectionPoolSize(Math.max(8, maxPoolSize))
-                .create();
-        client = cluster.connect();
-        log.info("connected to Gremlin at {}:{}", host, port);
+    public GraphWriter(GremlinPool pool) {
+        this.pool = pool;
+        log.info("graph writer bound to shared Gremlin pool");
     }
 
     /** Resolves the owning user id for an account via in('OWNS'); null if none. */
@@ -47,7 +40,10 @@ public final class GraphWriter implements AutoCloseable {
             Map<String, Object> b = new HashMap<>();
             b.put("acct", accountId);
             List<org.apache.tinkerpop.gremlin.driver.Result> rs =
-                    client.submit("g.V(acct).in('OWNS').id().limit(1)", b).all().get(30, TimeUnit.SECONDS);
+                    pool.sharedClient()
+                            .submit("g.V(acct).in('OWNS').id().limit(1)", b)
+                            .all()
+                            .get(30, TimeUnit.SECONDS);
             return rs.isEmpty() ? null : String.valueOf(rs.get(0).getObject());
         } catch (Exception e) {
             log.debug("resolveOwner failed for {}: {}", accountId, e.toString());
@@ -55,7 +51,8 @@ public final class GraphWriter implements AutoCloseable {
         }
     }
 
-    public void writeEdge(Transaction t) throws Exception {
+    public void writeEdge(Transaction t, int workerIndex) throws Exception {
+        Client client = pool.clientForWorker(workerIndex);
         Map<String, Object> bindings = new HashMap<>();
         bindings.put("sender", t.senderAccountId());
         bindings.put("receiver", t.receiverAccountId());
@@ -73,15 +70,5 @@ public final class GraphWriter implements AutoCloseable {
 
         client.submit(ADD_EDGE, bindings).all().get(30, TimeUnit.SECONDS);
         // AGS often returns an empty result set for mutating traversals; that is still success.
-    }
-
-    @Override
-    public void close() {
-        if (client != null) {
-            client.close();
-        }
-        if (cluster != null) {
-            cluster.close();
-        }
     }
 }

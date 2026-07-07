@@ -17,7 +17,8 @@ public final class PairedWriter {
      * Uses the caller's pair executor (typically 2 threads per worker) so KV and graph
      * round-trips overlap without spawning threads per transaction.
      */
-    public void writeTransaction(Transaction t, java.util.concurrent.ExecutorService pairExecutor) throws Exception {
+    public void writeTransaction(Transaction t, java.util.concurrent.ExecutorService pairExecutor,
+                               int workerIndex) throws Exception {
         AtomicReference<Exception> failure = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(2);
 
@@ -32,7 +33,7 @@ public final class PairedWriter {
         });
         pairExecutor.execute(() -> {
             try {
-                graphWriter.writeEdge(t);
+                graphWriter.writeEdge(t, workerIndex);
             } catch (Exception e) {
                 failure.compareAndSet(null, e);
             } finally {
