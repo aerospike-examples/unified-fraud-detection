@@ -305,7 +305,11 @@ export interface InvestigationState {
   
   // Performance metrics
   performanceMetrics?: PerformanceMetrics;
-  
+
+  // SSE connection dropped mid-run; the run continues on the server and we are
+  // polling for the persisted result.
+  reconnecting?: boolean;
+
   // Error
   error?: string;
 }
@@ -329,7 +333,9 @@ export function useInvestigation() {
   const eventSourceRef = useRef<EventSource | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const investigationIdRef = useRef<string | undefined>(undefined);
+  const userIdRef = useRef<string | undefined>(undefined);
   const intentionallyClosedRef = useRef(false);
+  const recoveryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Latest pending action, kept in a ref so approveAction reads it without
   // stale-closure or in-updater side effects.
   const pendingActionRef = useRef<PendingAction | null>(null);
@@ -344,6 +350,10 @@ export function useInvestigation() {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
+    }
+    if (recoveryTimerRef.current) {
+      clearInterval(recoveryTimerRef.current);
+      recoveryTimerRef.current = null;
     }
   }, []);
 
@@ -369,6 +379,7 @@ export function useInvestigation() {
           console.log("[Investigation] Start event received:", event.data);
           const data = JSON.parse(event.data);
           investigationIdRef.current = data.investigation_id;
+          if (data.user_id) userIdRef.current = data.user_id;
           if (data.user_id && data.investigation_id) {
             saveInvPointer(data.user_id, data.investigation_id);
           }
@@ -655,11 +666,127 @@ export function useInvestigation() {
           }
         });
 
+        // Recover from a mid-run SSE drop. The investigation keeps running on the
+        // server (background task that persists to KV), so instead of hanging on a
+        // dead "running" spinner we poll the persisted record until it completes or
+        // pauses for approval, then restore from it.
+        const beginRecovery = () => {
+          if (recoveryTimerRef.current) return; // already recovering
+          const invId = investigationIdRef.current;
+          const uid = userIdRef.current;
+          setState((prev) =>
+            prev.status === "running" || prev.status === "connecting"
+              ? { ...prev, reconnecting: true }
+              : prev
+          );
+          let attempts = 0;
+          const maxAttempts = 40; // ~2 min at 3s
+          const stop = () => {
+            if (recoveryTimerRef.current) {
+              clearInterval(recoveryTimerRef.current);
+              recoveryTimerRef.current = null;
+            }
+          };
+          const poll = async () => {
+            attempts += 1;
+            try {
+              const res = invId
+                ? await fetch(`/api/investigation/record/${invId}`)
+                : uid
+                ? await fetch(`/api/investigation/user/${uid}/latest`)
+                : null;
+              if (res && res.ok) {
+                const body = await res.json();
+                const inv = body.investigation;
+                if (body.found && inv) {
+                  if (inv.status === "completed" && inv.report_markdown) {
+                    stop();
+                    setState((prev) => ({
+                      ...prev,
+                      status: "completed",
+                      reconnecting: false,
+                      investigation_id: inv.investigation_id,
+                      currentNode: "complete",
+                      currentPhase: "complete",
+                      completedSteps: ["alert_validation", "data_collection", "llm_agent", "report_generation"],
+                      report: inv.report_markdown,
+                      finalAssessment: inv.final_assessment ?? prev.finalAssessment,
+                      toolCalls: inv.tool_calls ?? prev.toolCalls,
+                      agentIterations: inv.agent_iterations ?? prev.agentIterations,
+                      specialistFindings: inv.specialist_findings ?? prev.specialistFindings,
+                      enactedActions: inv.enacted_actions ?? prev.enactedActions,
+                      pendingAction: undefined,
+                    }));
+                    return;
+                  }
+                  if (inv.status === "awaiting_confirmation") {
+                    const pending = inv.pending_action as PendingAction | undefined;
+                    if (pending) pendingActionRef.current = pending;
+                    stop();
+                    setState((prev) => ({
+                      ...prev,
+                      status: "awaiting_confirmation",
+                      reconnecting: false,
+                      investigation_id: inv.investigation_id,
+                      currentNode: "llm_agent",
+                      currentPhase: "awaiting_decision",
+                      pendingAction: pending ?? prev.pendingAction,
+                      report: inv.report_markdown ?? prev.report,
+                      finalAssessment: inv.final_assessment ?? prev.finalAssessment,
+                      toolCalls: inv.tool_calls ?? prev.toolCalls,
+                      specialistFindings: inv.specialist_findings ?? prev.specialistFindings,
+                    }));
+                    return;
+                  }
+                  if (inv.status === "error") {
+                    stop();
+                    setState((prev) => ({
+                      ...prev,
+                      status: "error",
+                      reconnecting: false,
+                      error: "The investigation failed on the server. Please run it again.",
+                    }));
+                    return;
+                  }
+                }
+              }
+            } catch {
+              // transient — keep polling
+            }
+            if (attempts >= maxAttempts) {
+              stop();
+              setState((prev) =>
+                prev.status === "completed" || prev.status === "awaiting_confirmation"
+                  ? prev
+                  : {
+                      ...prev,
+                      status: "error",
+                      reconnecting: false,
+                      error:
+                        "Connection lost and the investigation did not finish in time. Refresh to check for results.",
+                    }
+              );
+            }
+          };
+          recoveryTimerRef.current = setInterval(poll, 3000);
+          poll();
+        };
+
         eventSource.onerror = (error) => {
           console.error("[Investigation] SSE error:", error, "readyState:", eventSource.readyState);
           if (intentionallyClosedRef.current) {
             return;
           }
+          // Mid-run drop (we already saw the start event): the run continues on
+          // the server. Stop this stream and recover from the persisted record.
+          if (investigationIdRef.current) {
+            intentionallyClosedRef.current = true;
+            eventSource.close();
+            beginRecovery();
+            return;
+          }
+          // Not started yet — let EventSource auto-reconnect; only surface an
+          // error if the browser gave up entirely.
           if (eventSource.readyState === EventSource.CLOSED) {
             setState((prev) => {
               if (prev.status === "completed" || prev.status === "awaiting_confirmation") {
@@ -668,14 +795,9 @@ export function useInvestigation() {
               return {
                 ...prev,
                 status: "error",
-                error:
-                  prev.error ||
-                  "Connection lost — the investigation may still be running on the server. Wait a minute and refresh to load results.",
+                error: prev.error || "Could not connect to the investigation service.",
               };
             });
-          } else {
-            intentionallyClosedRef.current = true;
-            eventSource.close();
           }
         };
 
@@ -691,6 +813,7 @@ export function useInvestigation() {
       cleanup();
       intentionallyClosedRef.current = false;
       investigationIdRef.current = investigationId;
+      userIdRef.current = userId;
 
       setState({
         ...initialState,

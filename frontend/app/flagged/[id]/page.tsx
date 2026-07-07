@@ -246,6 +246,17 @@ export default function FlaggedAccountDetailsPage() {
                 </div>
             </div>
 
+            {/* Connection dropped mid-run — the investigation keeps running on the
+                server and we're waiting for the persisted result. */}
+            {investigation.reconnecting && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 flex items-center gap-2">
+                    <RefreshCw className="h-4 w-4 text-amber-600 animate-spin" />
+                    <p className="text-sm text-amber-800">
+                        Connection interrupted — the investigation is still running on the server. Waiting for results…
+                    </p>
+                </div>
+            )}
+
             {/* Main Content Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 {/* Left Column - Account Details */}

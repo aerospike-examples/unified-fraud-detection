@@ -20,6 +20,11 @@ services:
       - INVESTIGATION_ENGINE=${INVESTIGATION_ENGINE:-adk}
       - ADK_MODEL=${ADK_MODEL:-gemini-2.0-flash}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      # Graph/tool query bounds so a slow traversal can't hang an investigation.
+      - GRAPH_QUERY_TIMEOUT_MS=${GRAPH_QUERY_TIMEOUT_MS:-30000}
+      - GRAPH_READ_TIMEOUT_S=${GRAPH_READ_TIMEOUT_S:-45}
+      - GRAPH_WRITE_TIMEOUT_S=${GRAPH_WRITE_TIMEOUT_S:-20}
+      - TOOL_TIMEOUT_S=${TOOL_TIMEOUT_S:-90}
       - DATA_DIR=/data
     volumes:
       - ./data:/data

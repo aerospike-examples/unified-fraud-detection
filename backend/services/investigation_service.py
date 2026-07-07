@@ -7,9 +7,10 @@ Provides SSE streaming for real-time progress and human-in-the-loop approval.
 
 import os
 import uuid
+import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, Any, AsyncGenerator, Optional
+from typing import Dict, Any, AsyncGenerator, Callable, List, Optional
 
 from workflow.engines import get_engine, BaseInvestigationEngine
 from workflow.llm import LLMConfig
@@ -40,6 +41,17 @@ class InvestigationService:
         self._investigation_results: Dict[str, Dict[str, Any]] = {}
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
         self._checkpoint_persisted: set[str] = set()
+
+        # Decoupled run infrastructure: the investigation runs as a background
+        # task that persists progress to KV independent of any SSE client. SSE
+        # endpoints are subscribers that replay buffered events and can re-attach
+        # after a disconnect, so navigating away / losing the connection never
+        # kills the run — the report still gets written and a decision can be
+        # made later from the persisted state.
+        self._run_tasks: Dict[str, asyncio.Task] = {}
+        self._event_buffers: Dict[str, List[Dict[str, Any]]] = {}
+        self._subscribers: Dict[str, List[asyncio.Queue]] = {}
+        self._run_done: Dict[str, bool] = {}
 
         logger.info(
             "Investigation service initialized (engine=%s, llm_provider=%s)",
@@ -284,69 +296,184 @@ class InvestigationService:
         if investigation_id in self._active_investigations:
             self._active_investigations[investigation_id]["status"] = "completed"
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Decoupled run + pub/sub: the run task drives the engine to completion and
+    # persists to KV regardless of whether an SSE client is attached.
+    # ─────────────────────────────────────────────────────────────────────
+    _STREAM_SENTINEL = {"__stream_end__": True}
+    _MAX_BUFFERED_INVESTIGATIONS = 100
+    _MAX_BUFFER_EVENTS = 4000
+
+    def _publish(self, investigation_id: str, sse_event: Dict[str, Any]) -> None:
+        """Buffer an SSE event (for replay) and fan it out to live subscribers."""
+        buf = self._event_buffers.setdefault(investigation_id, [])
+        buf.append(sse_event)
+        if len(buf) > self._MAX_BUFFER_EVENTS:
+            del buf[: len(buf) - self._MAX_BUFFER_EVENTS]
+        for q in list(self._subscribers.get(investigation_id, [])):
+            q.put_nowait(sse_event)
+
+    def _trim_buffers(self) -> None:
+        """Drop the oldest finished investigation buffers to bound memory."""
+        if len(self._event_buffers) <= self._MAX_BUFFERED_INVESTIGATIONS:
+            return
+        done_ids = [i for i in self._event_buffers if self._run_done.get(i)]
+        for inv_id in done_ids[: len(self._event_buffers) - self._MAX_BUFFERED_INVESTIGATIONS]:
+            self._event_buffers.pop(inv_id, None)
+            self._run_done.pop(inv_id, None)
+
+    async def _run_and_broadcast(
+        self,
+        investigation_id: str,
+        user_id: str,
+        agen_factory: Callable[[], AsyncGenerator[Dict[str, Any], None]],
+        resumed: bool = False,
+    ) -> None:
+        """Drive the engine to completion INDEPENDENT of any SSE client, buffering
+        + broadcasting events. A client disconnect can never cancel this."""
+        self._publish(
+            investigation_id,
+            {
+                "event": "start",
+                "data": {
+                    "investigation_id": investigation_id,
+                    "user_id": user_id,
+                    "steps": self.get_workflow_steps(),
+                    "engine": self.engine.engine_name if self.engine else self.engine_name,
+                    **({"resumed": True} if resumed else {}),
+                },
+            },
+        )
+        try:
+            async for ev in self._consume(investigation_id, user_id, agen_factory()):
+                self._publish(investigation_id, ev)
+        except asyncio.CancelledError:
+            # Legitimate task cancellation (e.g. process shutdown) — let it propagate.
+            raise
+        except BaseException as e:  # noqa: BLE001
+            # Catches BaseExceptionGroup([GeneratorExit]) too — ADK's ParallelAgent
+            # can raise a *BaseException* group that a plain `except Exception`
+            # would miss, leaving the run crashed-but-never-finalized and the UI
+            # polling /record forever. Surface it and persist an error record.
+            logger.error("Background investigation %s crashed: %r", investigation_id, e)
+            self._publish(
+                investigation_id,
+                {
+                    "event": "error",
+                    "data": {
+                        "error": "The investigation failed and was stopped. Please try again.",
+                        "investigation_id": investigation_id,
+                    },
+                },
+            )
+            meta = self._active_investigations.get(investigation_id)
+            if meta:
+                meta["status"] = "error"
+                meta["error"] = str(e)
+            try:
+                self._persist_to_kv(
+                    investigation_id,
+                    user_id,
+                    {"error": str(e)[:500], "report_markdown": ""},
+                    status="error",
+                )
+            except Exception:
+                logger.warning("Could not persist error record for %s", investigation_id)
+        finally:
+            self._run_done[investigation_id] = True
+            self._run_tasks.pop(investigation_id, None)
+            for q in list(self._subscribers.get(investigation_id, [])):
+                q.put_nowait(self._STREAM_SENTINEL)
+
+    def _ensure_run_task(
+        self,
+        investigation_id: str,
+        user_id: str,
+        agen_factory: Callable[[], AsyncGenerator[Dict[str, Any], None]],
+        resumed: bool = False,
+    ) -> None:
+        """Start the background run task for this investigation if not already
+        running (and not already finished)."""
+        if investigation_id in self._run_tasks or self._run_done.get(investigation_id):
+            return
+        self._run_done[investigation_id] = False
+        self._event_buffers.setdefault(investigation_id, [])
+        self._trim_buffers()
+        task = asyncio.create_task(
+            self._run_and_broadcast(investigation_id, user_id, agen_factory, resumed=resumed)
+        )
+        self._run_tasks[investigation_id] = task
+
+    async def _subscribe(
+        self, investigation_id: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield buffered-then-live SSE events for an investigation. Disconnecting
+        from this generator only unsubscribes — it never stops the run task."""
+        q: asyncio.Queue = asyncio.Queue()
+        self._subscribers.setdefault(investigation_id, []).append(q)
+        try:
+            # Replay everything so far (a reconnecting client catches up in full).
+            for ev in list(self._event_buffers.get(investigation_id, [])):
+                yield ev
+            if self._run_done.get(investigation_id):
+                return
+            while True:
+                ev = await q.get()
+                if ev is self._STREAM_SENTINEL:
+                    break
+                yield ev
+        finally:
+            subs = self._subscribers.get(investigation_id)
+            if subs and q in subs:
+                subs.remove(q)
+            if subs is not None and not subs:
+                self._subscribers.pop(investigation_id, None)
+
     async def stream_investigation(
         self,
         user_id: str,
         investigation_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream investigation progress as SSE events (may pause for HITL approval)."""
-        if not investigation_id:
-            existing = self._running_investigation_for_user(user_id)
-            if existing:
-                logger.info(
-                    "Rejecting duplicate stream for %s — %s already running",
-                    user_id,
-                    existing,
-                )
-                yield {
-                    "event": "error",
-                    "data": {
-                        "error": "Investigation already in progress",
-                        "code": "already_running",
-                        "investigation_id": existing,
-                        "user_id": user_id,
-                    },
-                }
-                return
-            investigation_id = await self.start_investigation(user_id)
+        """Stream investigation progress as SSE events (may pause for HITL approval).
+
+        The run itself happens in a background task; this method just subscribes
+        (with full replay), so a client disconnect/reconnect never kills the run.
+        """
         if not self.engine:
             await self.initialize()
 
-        yield {
-            "event": "start",
-            "data": {
-                "investigation_id": investigation_id,
-                "user_id": user_id,
-                "steps": self.get_workflow_steps(),
-                "engine": self.engine.engine_name if self.engine else self.engine_name,
-            },
-        }
-
-        try:
-            async for ev in self._consume(
-                investigation_id,
-                user_id,
-                self.engine.run_investigation(user_id, investigation_id),
-            ):
-                yield ev
-        except Exception as e:
-            logger.error("Investigation error: %s", e)
-            yield {
-                "event": "error",
-                "data": {"error": str(e), "investigation_id": investigation_id},
-            }
-            if investigation_id in self._active_investigations:
-                self._active_investigations[investigation_id]["status"] = "error"
-                self._active_investigations[investigation_id]["error"] = str(e)
-        finally:
-            meta = self._active_investigations.get(investigation_id)
-            if meta and meta.get("status") == "running":
-                logger.info(
-                    "Investigation %s stream ended without completing — releasing lock",
+        if not investigation_id:
+            # Attach to an in-flight run for this user instead of starting a
+            # duplicate (this is also what a reconnecting EventSource lands on).
+            existing = self._running_investigation_for_user(user_id)
+            if existing:
+                logger.info("Attaching stream for %s to in-flight %s", user_id, existing)
+                investigation_id = existing
+            else:
+                investigation_id = await self.start_investigation(user_id)
+                self._ensure_run_task(
                     investigation_id,
+                    user_id,
+                    lambda iid=investigation_id: self.engine.run_investigation(user_id, iid),
                 )
-                meta["status"] = "error"
-                meta["error"] = meta.get("error") or "Stream closed before completion"
+        else:
+            # Explicit id: attach to a live run or replay its buffer. Never
+            # re-run an investigation that already finished/paused (its result is
+            # persisted — the client should load it via /investigation/record).
+            if investigation_id not in self._run_tasks and not self._run_done.get(investigation_id):
+                rec = self.get_investigation_record(investigation_id)
+                status = (rec or {}).get("status")
+                if status in ("completed", "awaiting_confirmation"):
+                    self._run_done[investigation_id] = True
+                else:
+                    self._ensure_run_task(
+                        investigation_id,
+                        user_id,
+                        lambda iid=investigation_id: self.engine.run_investigation(user_id, iid),
+                    )
+
+        async for ev in self._subscribe(investigation_id):
+            yield ev
 
     def has_pending_action(self, investigation_id: str) -> bool:
         """Whether the investigation is paused awaiting analyst approval."""
@@ -378,41 +505,31 @@ class InvestigationService:
         if investigation_id in self._active_investigations:
             self._active_investigations[investigation_id]["status"] = "running"
 
-        yield {
-            "event": "start",
-            "data": {
-                "investigation_id": investigation_id,
-                "user_id": user_id,
-                "steps": self.get_workflow_steps(),
-                "resumed": True,
-                "engine": self.engine.engine_name if self.engine else self.engine_name,
-            },
-        }
+        # Launch the resume as a fresh background run for the same id so it also
+        # survives a client disconnect. Clear the pre-pause buffer so a
+        # reconnecting client doesn't replay the old action_confirmation event.
+        self._event_buffers[investigation_id] = []
+        self._run_done[investigation_id] = False
 
-        try:
-            agen = self.engine.resume_investigation(
-                user_id,
-                investigation_id,
-                fc_id=pending.get("fc_id", "langgraph_interrupt"),
+        def _resume_agen(iid=investigation_id, uid=user_id, p=pending):
+            return self.engine.resume_investigation(
+                uid,
+                iid,
+                fc_id=p.get("fc_id", "langgraph_interrupt"),
                 approved=approved,
-                hint=pending.get("hint", ""),
+                hint=p.get("hint", ""),
                 payload={
-                    "decision": pending.get("decision"),
-                    "account_id": pending.get("account_id"),
-                    "reason": pending.get("reason"),
+                    "decision": p.get("decision"),
+                    "account_id": p.get("account_id"),
+                    "reason": p.get("reason"),
                 },
                 override=override,
             )
-            async for ev in self._consume(investigation_id, user_id, agen):
-                yield ev
-        except Exception as e:
-            logger.error("Resume investigation error: %s", e)
-            yield {
-                "event": "error",
-                "data": {"error": str(e), "investigation_id": investigation_id},
-            }
-            if investigation_id in self._active_investigations:
-                self._active_investigations[investigation_id]["status"] = "error"
+
+        self._ensure_run_task(investigation_id, user_id, _resume_agen, resumed=True)
+
+        async for ev in self._subscribe(investigation_id):
+            yield ev
 
     def get_investigation_record(self, investigation_id: str) -> Optional[Dict[str, Any]]:
         """Get a persisted investigation snapshot by ID (O(1) KV lookup)."""

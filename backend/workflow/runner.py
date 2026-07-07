@@ -14,6 +14,7 @@ Replaces the old LangGraph ``graph.py``:
   the existing node names.
 """
 
+import asyncio
 import logging
 import traceback
 from datetime import datetime
@@ -523,10 +524,14 @@ async def run_investigation(
             },
         }
 
-        # 2) Data collection
+        # 2) Data collection — run in a worker thread. It does blocking KV + gremlin
+        # work, and the gremlin transport (call_from_event_loop=False) drives its own
+        # loop, which cannot run on the main-loop thread. Offloading also keeps the
+        # event loop responsive (SSE keepalives) during hydration.
         yield _trace("data_collection", "node_start", {"user_id": user_id})
         metrics.start_node("data_collection")
-        dc = data_collection_node(
+        dc = await asyncio.to_thread(
+            data_collection_node,
             {"user_id": user_id, "investigation_id": investigation_id, "alert_evidence": seed_state["alert_evidence"]},
             inv_runner.aerospike_service,
             inv_runner.graph_service,

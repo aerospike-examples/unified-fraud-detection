@@ -56,7 +56,10 @@ async def lifespan(app: FastAPI):
     
     # Startup
     logger.info("Starting Fraud Detection API")
-    graph_service.connect()
+    # Run the (synchronous) gremlin connect off the main loop: the transport now
+    # uses call_from_event_loop=False and drives its own loop via run_until_complete,
+    # which cannot run on a thread that already has a running event loop.
+    await asyncio.to_thread(graph_service.connect)
     
     # Connect to Aerospike KV store
     if aerospike_service.connect():
@@ -1252,9 +1255,11 @@ async def bulk_load_upload(
                 detail="ZIP file must contain 'vertices' and 'edges' directories"
             )
         
-        # Load to Graph DB
+        # Load to Graph DB (off the main loop — gremlin drives its own loop now)
         if load_graph:
-            graph_result = graph_service.bulk_load_csv_data(vertices_path, edges_path)
+            graph_result = await asyncio.to_thread(
+                graph_service.bulk_load_csv_data, vertices_path, edges_path
+            )
             result["graph"] = graph_result
             
             if not graph_result["success"]:

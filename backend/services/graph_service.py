@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional
 import logging
 import os
 import re
+import threading
 import time
 
 from gremlin_python.driver.driver_remote_connection import DriverRemoteConnection
@@ -15,12 +16,26 @@ logger = logging.getLogger('fraud_detection.graph')
 
 _TXN_ACCOUNT_RE = re.compile(r'^txn-(\d+)-')
 
+# Query bounds so a slow/hanging graph traversal can never freeze an investigation.
+# evaluationTimeout aborts the query SERVER-SIDE (returns an error frame); the
+# transport read/write timeouts are a client-side backstop for network stalls.
+# read_timeout MUST be larger than the eval timeout so the server's timeout error
+# arrives before the client gives up (keeps the shared connection healthy).
+GRAPH_QUERY_TIMEOUT_MS = int(os.environ.get('GRAPH_QUERY_TIMEOUT_MS', '30000'))
+GRAPH_READ_TIMEOUT_S = int(os.environ.get('GRAPH_READ_TIMEOUT_S', '45'))
+GRAPH_WRITE_TIMEOUT_S = int(os.environ.get('GRAPH_WRITE_TIMEOUT_S', '20'))
+
 class GraphService:
     def __init__(self, host: str = os.environ.get('GRAPH_HOST_ADDRESS') or 'localhost', port: int = 8182):
         self.host = host
         self.port = port
         self.client = None
         self.connection = None
+        # The gremlin DriverRemoteConnection/AiohttpTransport is NOT safe for
+        # concurrent use (one websocket + one internal event loop). Tools now run
+        # in worker threads (so ADK's parallel specialists truly overlap), so any
+        # graph traversal must hold this lock for the duration of its request.
+        self.query_lock = threading.RLock()
         # Cached graph summary (used for billion-scale stats in remote mode)
         self._summary_cache: Optional[Dict[str, Any]] = None
         self._summary_cache_ts: float = 0.0
@@ -37,9 +52,35 @@ class GraphService:
             url = f'ws://{self.host}:{self.port}/gremlin'
             logger.info(f"🔄 Connecting to Aerospike Graph: {url}")
             
-            # Use the same approach as the working sample
-            self.connection = DriverRemoteConnection(url, "g", transport_factory=lambda:AiohttpTransport(call_from_event_loop=True))
-            self.client = traversal().with_remote(self.connection)
+            # Use the same approach as the working sample, but bound each request
+            # with client-side read/write timeouts so a stalled socket can't hang
+            # an investigation forever.
+            # call_from_event_loop=False is CRITICAL: it makes the gremlin
+            # AiohttpTransport own and drive its OWN internal event loop for the
+            # websocket I/O, so a synchronous .toList()/.next() can be called from
+            # a plain worker thread. With True, the transport re-enters whatever
+            # loop is running on the calling thread — and when a graph tool fires
+            # from inside ADK's ParallelAgent (which runs specialists in an
+            # asyncio.TaskGroup on the main loop), that re-entrancy corrupts the
+            # TaskGroup and blows up the whole run with a GeneratorExit /
+            # BaseExceptionGroup. Graph tools are therefore always executed OFF
+            # the main loop in worker threads (see investigation_tools_adk).
+            self.connection = DriverRemoteConnection(
+                url,
+                "g",
+                transport_factory=lambda: AiohttpTransport(
+                    call_from_event_loop=False,
+                    read_timeout=GRAPH_READ_TIMEOUT_S,
+                    write_timeout=GRAPH_WRITE_TIMEOUT_S,
+                ),
+            )
+            # evaluationTimeout bounds EVERY traversal spawned from this source on
+            # the server side (individual queries may override, e.g. bulk drop uses 0).
+            self.client = (
+                traversal()
+                .with_remote(self.connection)
+                .with_('evaluationTimeout', GRAPH_QUERY_TIMEOUT_MS)
+            )
             
             # Test connection using the same method as the sample
             test_result = self.client.inject(0).next()
