@@ -86,7 +86,7 @@ export default function UsersPage() {
 				<h1 className="text-3xl font-bold tracking-tight">User Explorer</h1>
 				<p className="text-muted-foreground">Browse and search user profiles with detailed information</p>
 			</div>
-			<div className="grid gap-4 md:grid-cols-4">
+			<div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
 				<UserStats />
 			</div>
 			<Results 

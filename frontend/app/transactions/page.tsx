@@ -1,13 +1,6 @@
 import Results, { type Option } from '@/components/ResultTable'
 import TransactionStats from '@/components/Transactions/Stats'
 
-export interface TransactionStats {
-	total_txns: number
-	total_blocked: number
-	total_review: number
-	total_clean: number
-}
-
 const options: Option[] = [
 	{
 		name: 'Transaction ID',

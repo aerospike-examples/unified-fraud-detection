@@ -30,6 +30,12 @@ public final class LoadDriver {
     public void run() throws InterruptedException {
         ClientPolicy cp = new ClientPolicy();
         cp.maxConnsPerNode = Math.max(300, cfg.workers() * 8);
+        // Same fix as GremlinPool: the Aerospike client otherwise opens KV
+        // connections lazily on demand, so a burst of concurrent workers at run
+        // start pays one-time connect latency inline on the first requests
+        // instead of it being paid up front. minConnsPerNode preallocates the
+        // full pool at client construction.
+        cp.minConnsPerNode = cp.maxConnsPerNode;
 
         GraphWriter graphWriter = null;
         GremlinPool gremlinPool = null;
@@ -139,6 +145,9 @@ public final class LoadDriver {
             if (aggregateWriter != null) {
                 aggregateWriter.interrupt();
                 writeAggregate(client, cfg.namespace()); // final snapshot
+            }
+            if (fraudInjector != null) {
+                fraudInjector.close(); // stops feed flusher + final fraud_feed snapshot
             }
             for (ExecutorService ex : pairExecutors) {
                 if (ex != null) {

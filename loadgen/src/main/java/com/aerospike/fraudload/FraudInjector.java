@@ -4,25 +4,39 @@ import com.aerospike.client.AerospikeClient;
 import com.aerospike.client.Bin;
 import com.aerospike.client.Key;
 import com.aerospike.client.Operation;
+import com.aerospike.client.Record;
 import com.aerospike.client.Value;
 import com.aerospike.client.cdt.ListOperation;
 import com.aerospike.client.policy.WritePolicy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.zip.CRC32;
 
 /**
  * Live fraud detection: flags accounts when fraudulent transactions are written.
  * Persists a durable review queue in flagged_accounts (key=user_id) plus a
  * persistent flagged_queue index for batch reads across loadgen restarts.
+ *
+ * <p>The queue index is sharded across {@link #QUEUE_SHARDS} keys
+ * ({@code index_0..index_N}) rather than one global list — a single shared
+ * key would otherwise be rewritten on every live fraud detection from every
+ * loadgen worker in the fleet, hot-spotting whichever Aerospike partition
+ * (and physical device) that one key happens to land on. The fraud_feed
+ * record is debounced instead of sharded: it's small and bounded, so the fix
+ * there is simply to stop rewriting it on every single detection and flush
+ * it periodically (see {@link #startFeedFlusher()}).
  */
 public final class FraudInjector {
     private static final Logger log = LoggerFactory.getLogger(FraudInjector.class);
@@ -34,6 +48,9 @@ public final class FraudInjector {
     public static final String FEED_KEY = "fraud_feed";
     private static final int RECENT_CAP = 100;
     private static final int QUEUE_CAP = 50_000;
+    /** Must match FLAGGED_QUEUE_SHARDS in backend/services/aerospike_service.py. */
+    private static final int QUEUE_SHARDS = 32;
+    private static final long FEED_FLUSH_INTERVAL_MS = 5000;
 
     private final AerospikeClient client;
     private final String namespace;
@@ -46,6 +63,14 @@ public final class FraudInjector {
     private final Set<String> flaggedUsers = ConcurrentHashMap.newKeySet();
     /** Users already in persistent queue index (loaded at beginRun). */
     private final Set<String> queuedUsers = ConcurrentHashMap.newKeySet();
+    /** Per-shard locks so concurrent appends to different shards don't serialize. */
+    private final Object[] queueLocks = new Object[QUEUE_SHARDS];
+
+    private final Object feedLock = new Object();
+    private final Deque<Map<String, Object>> recentEntries = new ArrayDeque<>();
+    private boolean feedDirty = false;
+    private String feedRunId;
+    private volatile Thread feedFlusher;
 
     public FraudInjector(AerospikeClient client, String namespace, GraphWriter graph,
                          String accountPrefix, String userPrefix) {
@@ -55,6 +80,9 @@ public final class FraudInjector {
         this.accountPrefix = accountPrefix;
         this.userPrefix = userPrefix;
         this.writePolicy = new WritePolicy(client.writePolicyDefault);
+        for (int i = 0; i < QUEUE_SHARDS; i++) {
+            queueLocks[i] = new Object();
+        }
     }
 
     /** Reset per-run fraud_feed counters; load persistent queue index into memory. */
@@ -64,6 +92,11 @@ public final class FraudInjector {
         queuedUsers.addAll(loadQueueUserIds());
 
         String runId = Instant.now().toString();
+        synchronized (feedLock) {
+            feedRunId = runId;
+            recentEntries.clear();
+            feedDirty = false;
+        }
         Key key = new Key(namespace, FEED_SET, FEED_KEY);
         client.put(writePolicy, key,
                 new Bin("total", 0),
@@ -71,8 +104,18 @@ public final class FraudInjector {
                 new Bin("run_id", runId),
                 new Bin("run_started", runId),
                 new Bin("last_updated", runId));
-        log.info("live fraud detection enabled (fraud_feed run {}, {} users in flagged_queue)",
-                runId, queuedUsers.size());
+        feedFlusher = startFeedFlusher();
+        log.info("live fraud detection enabled (fraud_feed run {}, {} users in flagged_queue, "
+                + "{} queue shards)", runId, queuedUsers.size(), QUEUE_SHARDS);
+    }
+
+    /** Stop the periodic feed flusher and persist final state. Call once at run shutdown. */
+    public void close() {
+        Thread flusher = feedFlusher;
+        if (flusher != null) {
+            flusher.interrupt();
+        }
+        flushFeed(true);
     }
 
     /**
@@ -125,7 +168,7 @@ public final class FraudInjector {
                 new Bin("created_at", now));
 
         appendQueueUserId(userId, now);
-        appendFeed(userId, accountId, risk, reason, now);
+        recordFeedEntry(userId, accountId, risk, reason, now);
     }
 
     private static String reasonFor(String typology) {
@@ -144,13 +187,30 @@ public final class FraudInjector {
         return graph != null ? graph.resolveOwner(accountId) : null;
     }
 
+    /** Deterministic user_id -> shard index, stable across JVMs/restarts. */
+    private static int shardFor(String userId) {
+        CRC32 crc = new CRC32();
+        crc.update(userId.getBytes(StandardCharsets.UTF_8));
+        return (int) (crc.getValue() % QUEUE_SHARDS);
+    }
+
+    private static String shardKey(int shard) {
+        return QUEUE_KEY + "_" + shard;
+    }
+
     @SuppressWarnings("unchecked")
     private List<String> loadQueueUserIds() {
         List<String> ids = new ArrayList<>();
         try {
-            Key key = new Key(namespace, QUEUE_SET, QUEUE_KEY);
-            var rec = client.get(null, key);
-            if (rec != null) {
+            Key[] keys = new Key[QUEUE_SHARDS];
+            for (int i = 0; i < QUEUE_SHARDS; i++) {
+                keys[i] = new Key(namespace, QUEUE_SET, shardKey(i));
+            }
+            Record[] recs = client.get(null, keys);
+            for (Record rec : recs) {
+                if (rec == null) {
+                    continue;
+                }
                 Object raw = rec.getValue("user_ids");
                 if (raw instanceof List<?> list) {
                     for (Object o : list) {
@@ -166,6 +226,12 @@ public final class FraudInjector {
         return ids;
     }
 
+    /**
+     * Appends to the user's shard of the flagged_queue index rather than one
+     * global key, so live-detection writes from the whole fleet spread across
+     * {@link #QUEUE_SHARDS} Aerospike partitions/devices instead of hot-spotting
+     * a single one.
+     */
     private void appendQueueUserId(String userId, String ts) {
         if (!queuedUsers.add(userId)) {
             return;
@@ -174,8 +240,9 @@ public final class FraudInjector {
             log.warn("flagged_queue cap {} reached; skipping index append for {}", QUEUE_CAP, userId);
             return;
         }
-        Key key = new Key(namespace, QUEUE_SET, QUEUE_KEY);
-        synchronized (this) {
+        int shard = shardFor(userId);
+        Key key = new Key(namespace, QUEUE_SET, shardKey(shard));
+        synchronized (queueLocks[shard]) {
             try {
                 client.operate(writePolicy, key,
                         ListOperation.append("user_ids", Value.get(userId)),
@@ -187,33 +254,68 @@ public final class FraudInjector {
         }
     }
 
-    private void appendFeed(String userId, String accountId, double risk, String reason, String ts) {
-        Key key = new Key(namespace, FEED_SET, FEED_KEY);
-        synchronized (this) {
-            try {
-                Map<String, Object> entry = new LinkedHashMap<>();
-                entry.put("user_id", userId);
-                entry.put("account_id", accountId);
-                entry.put("risk_score", risk);
-                entry.put("reason", reason);
-                entry.put("ts", ts);
+    /**
+     * Buffers a fraud_feed preview entry in memory instead of writing to
+     * Aerospike immediately — {@link #flushFeed} persists it on the next
+     * 5s tick (or at run shutdown via {@link #close()}). Without this, every
+     * fraud detection from every loadgen worker in the fleet rewrote the same
+     * single fraud_feed record, hot-spotting its partition.
+     */
+    private void recordFeedEntry(String userId, String accountId, double risk, String reason, String ts) {
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("user_id", userId);
+        entry.put("account_id", accountId);
+        entry.put("risk_score", risk);
+        entry.put("reason", reason);
+        entry.put("ts", ts);
 
-                int runTotal = flaggedUsers.size();
-                boolean keepInPreview = runTotal <= RECENT_CAP;
-
-                if (keepInPreview) {
-                    client.operate(writePolicy, key,
-                            Operation.add(new Bin("total", 1)),
-                            ListOperation.append("recent", Value.get(entry)),
-                            Operation.put(new Bin("last_updated", ts)));
-                } else {
-                    client.operate(writePolicy, key,
-                            Operation.add(new Bin("total", 1)),
-                            Operation.put(new Bin("last_updated", ts)));
-                }
-            } catch (Exception e) {
-                log.debug("feed append failed for {}: {}", userId, e.toString());
+        synchronized (feedLock) {
+            recentEntries.addLast(entry);
+            while (recentEntries.size() > RECENT_CAP) {
+                recentEntries.removeFirst();
             }
+            feedDirty = true;
+        }
+    }
+
+    private Thread startFeedFlusher() {
+        Thread t = new Thread(() -> {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    Thread.sleep(FEED_FLUSH_INTERVAL_MS);
+                    flushFeed(false);
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }, "fraud-feed-flusher");
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    /** Persists the buffered fraud_feed state. Skips no-op writes unless {@code force}. */
+    private void flushFeed(boolean force) {
+        List<Object> snapshot;
+        String runId;
+        synchronized (feedLock) {
+            if (!feedDirty && !force) {
+                return;
+            }
+            snapshot = new ArrayList<>(recentEntries);
+            runId = feedRunId;
+            feedDirty = false;
+        }
+        try {
+            Key key = new Key(namespace, FEED_SET, FEED_KEY);
+            client.put(writePolicy, key,
+                    new Bin("total", flaggedUsers.size()),
+                    new Bin("recent", Value.get(snapshot)),
+                    new Bin("run_id", runId),
+                    new Bin("run_started", runId),
+                    new Bin("last_updated", Instant.now().toString()));
+        } catch (Exception e) {
+            log.debug("fraud_feed flush failed: {}", e.toString());
         }
     }
 }

@@ -22,13 +22,18 @@ public final class GremlinPool implements AutoCloseable {
 
     public GremlinPool(String host, int port, int workers) {
         int w = Math.max(1, workers);
-        int maxPool = Math.max(16, w * 2);
-        int minPool = Math.max(8, w / 2);
+        // Fixed-size pool (min == max == workers): the driver otherwise starts at
+        // minConnectionPoolSize and grows lazily under load, so short runs (or
+        // any run right after a worker-count increase) spend part of the run
+        // just waiting for the pool to grow instead of pushing steady throughput.
+        // Pre-sizing to exactly the worker count means every worker's connection
+        // already exists before the first request, at the cost of a slightly
+        // longer startup (all `w` connections opened up front).
         cluster = Cluster.build()
                 .addContactPoint(host)
                 .port(port)
-                .minConnectionPoolSize(minPool)
-                .maxConnectionPoolSize(maxPool)
+                .minConnectionPoolSize(w)
+                .maxConnectionPoolSize(w)
                 // Multiplex several in-flight requests per websocket so we need
                 // fewer physical connections under 50k+ txn/s.
                 .maxInProcessPerConnection(32)
@@ -40,8 +45,8 @@ public final class GremlinPool implements AutoCloseable {
             // aliasing to loadgen-worker-N causes ResponseException on every submit.
             workerClients[i] = cluster.connect();
         }
-        log.info("Gremlin pool ready at {}:{} (workers={}, minPool={}, maxPool={}, maxInProcess=32)",
-                host, port, w, minPool, maxPool);
+        log.info("Gremlin pool ready at {}:{} (workers={}, pool(min=max)={}, maxInProcess=32)",
+                host, port, w, w);
     }
 
     public Client clientForWorker(int workerIndex) {

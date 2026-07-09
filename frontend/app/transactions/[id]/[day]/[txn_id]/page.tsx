@@ -13,7 +13,10 @@ import TxnDetails, { type TxnDetail } from "@/components/Transactions/Details"
 import Stat from '@/components/Stat'
 import Label from '@/components/Label'
 
-const API_BASE_URL = process.env.BASE_URL || "http://localhost:8080/api"
+// Call the backend container directly (not the /api rewrite proxy on our own
+// public port) — a server-side loopback through our own proxy would hit the
+// login-gate middleware with no session cookie and always 401.
+const API_BASE_URL = process.env.BACKEND_URL || process.env.BASE_URL || "http://localhost:8080/api"
 
 export default async function TransactionDetailPage({ 
 	params 

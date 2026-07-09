@@ -139,7 +139,7 @@ the billion-row dataset. It is a single record in the `fraud_feed` set (key
   "run_started": "2026-07-03T19:40:00Z",
   "last_updated": "2026-07-03T19:40:07Z",
   "total": 400,                          // accounts flagged this run
-  "recent": [                            // capped preview (newest first on read)
+  "recent": [                            // capped preview, most recent 100 (newest first on read)
     {"user_id": "User12", "account_id": "Account12", "risk_score": 88.1,
      "reason": "Rapid fan-out of high-value transfers", "ts": "..."}
   ]
@@ -149,9 +149,45 @@ the billion-row dataset. It is a single record in the `fraud_feed` set (key
 The backend exposes it at `GET /flagged-accounts/updates`
 (`aerospike_service.get_fraud_feed()`). The Flagged Accounts page polls this
 every 15s; when `run_id`/`total` change it shows a "new fraud detected" banner
-and revalidates the queue + stats. The `total` counter increments per flagged
-account; only the first 100 entries are kept in `recent` to keep the record
-small for large cohorts.
+and revalidates the queue + stats. The `total` counter tracks distinct flagged
+users this run; `recent` holds the most recent 100 detections.
+
+**Write path (loadgen, live mode):** `FraudInjector` buffers detections in
+memory and flushes this record at most once every 5 seconds (plus once more
+at run shutdown), rather than rewriting it on every single fraud transaction.
+Writing on every detection — across every worker on every loadgen node in a
+fleet — turned this one record into a hot Aerospike partition under load; the
+5s debounce keeps the UI just as responsive (it already only polls every 15s)
+while cutting the write rate by orders of magnitude.
+
+## Flagged review queue — `flagged_queue` set (sharded)
+
+`flagged_queue` is a pointer index of flagged `user_id`s, read via `batch_get`
+so the review queue never needs to scan `flagged_accounts`. It is **sharded
+across 32 keys** (`index_0` .. `index_31`) rather than one global list:
+
+```json
+// flagged_queue:index_7, one of 32 shard records
+{
+  "user_ids": ["User38", "User3861", ...],
+  "total": 2201,
+  "last_updated": "2026-07-08T22:59:51Z"
+}
+```
+
+Each `user_id` deterministically maps to one shard via `crc32(user_id) % 32`
+(`FraudInjector.shardFor` in the loadgen, `_queue_shard_for` in
+`aerospike_service.py` — the two must agree). Reads (`_read_flagged_queue_ids`)
+batch-get all 32 shard keys in one round trip and merge; writes
+(`_add_to_flagged_queue` / `appendQueueUserId`) touch only the one shard for
+that user. This exists because a single shared list gets rewritten on every
+flag from every loadgen worker in the fleet, which concentrates all of that
+churn onto whichever one Aerospike partition/device the key happens to hash
+to — sharding spreads it across 32.
+
+The pre-sharding single key (`flagged_queue:index`) is obsolete. Running
+`python scripts/rebuild-flagged-queue.py` migrates any old data into the
+sharded layout and deletes the legacy key.
 
 ## What the external pipeline is responsible for
 

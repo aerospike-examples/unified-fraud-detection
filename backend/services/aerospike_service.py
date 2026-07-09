@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import csv
+import zlib
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
@@ -54,8 +55,25 @@ IDX_USER_WF_STATUS = 'idx_user_wf_status'
 IDX_FLAGGED_STATUS = 'idx_flagged_status'
 
 # flagged_queue pointer list (loadgen contract — batch_get all flagged; not an Aerospike SI)
+#
+# Sharded across FLAGGED_QUEUE_SHARDS keys (index_0..index_N) instead of one
+# global "index" record: a single shared key gets rewritten on every live
+# fraud detection from every loadgen worker in the fleet, which concentrates
+# all of that churn onto whichever single Aerospike partition/device that one
+# key happens to hash to. Must match QUEUE_SHARDS in the Java loadgen's
+# FraudInjector. INDEX_LIST_KEY is kept only to clean up the pre-sharding key.
 INDEX_LIST_KEY = 'index'
+FLAGGED_QUEUE_SHARDS = 32
 FLAGGED_QUEUE_CAP = 50_000
+
+
+def _queue_shard_for(user_id: str) -> int:
+    """Deterministic user_id -> shard index. Must agree with FraudInjector.shardFor."""
+    return zlib.crc32(user_id.encode('utf-8')) % FLAGGED_QUEUE_SHARDS
+
+
+def _queue_shard_key(shard: int) -> str:
+    return f'{INDEX_LIST_KEY}_{shard}'
 
 # Aerospike bin name limit is 15 characters
 # Map long bin names to short versions
@@ -497,42 +515,96 @@ class AerospikeService:
     # ----------------------------------------------------------------------------------------------------------
 
     def _read_flagged_queue_ids(self) -> List[str]:
-        rec = self.get(SET_FLAGGED_QUEUE, INDEX_LIST_KEY) or {}
-        return [str(uid) for uid in (rec.get('user_ids') or []) if uid]
+        """Read the sharded flagged_queue index (FLAGGED_QUEUE_SHARDS keys) and merge.
+        One batch round trip across all shards — cheap, and spreads reads across
+        many partitions instead of a single hot key."""
+        keys = [(self.namespace, SET_FLAGGED_QUEUE, _queue_shard_key(i))
+                for i in range(FLAGGED_QUEUE_SHARDS)]
+        ids: List[str] = []
+        seen = set()
+        try:
+            for result in self.batch_get(keys):
+                if result is None:
+                    continue
+                _, _, bins = result
+                if not bins:
+                    continue
+                for uid in (bins.get('user_ids') or []):
+                    uid = str(uid)
+                    if uid and uid not in seen:
+                        seen.add(uid)
+                        ids.append(uid)
+        except Exception as e:
+            logger.error(f"Error reading sharded flagged_queue: {e}")
+        return ids
 
     def _write_flagged_queue_ids(self, user_ids: List[str], **extra: Any) -> bool:
+        """Full rebuild: redistributes user_ids across all shard keys.
+        Used only by rebuild_flagged_queue_index(); also cleans up the
+        pre-sharding legacy 'index' key so stale data doesn't linger."""
         now = datetime.now().isoformat()
-        payload: Dict[str, Any] = {
-            'user_ids': user_ids,
-            'total': len(user_ids),
-            'last_updated': now,
-            **extra,
-        }
-        return self.put(SET_FLAGGED_QUEUE, INDEX_LIST_KEY, payload)
+        shards: List[List[str]] = [[] for _ in range(FLAGGED_QUEUE_SHARDS)]
+        seen = set()
+        for uid in user_ids:
+            uid = str(uid)
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            shards[_queue_shard_for(uid)].append(uid)
+
+        ok = True
+        for shard, shard_ids in enumerate(shards):
+            payload: Dict[str, Any] = {
+                'user_ids': shard_ids,
+                'total': len(shard_ids),
+                'last_updated': now,
+                **extra,
+            }
+            ok = self.put(SET_FLAGGED_QUEUE, _queue_shard_key(shard), payload) and ok
+
+        try:
+            self.delete(SET_FLAGGED_QUEUE, INDEX_LIST_KEY)
+        except Exception:
+            pass
+        return ok
 
     def _add_to_flagged_queue(self, user_id: str) -> None:
-        """Append user_id to flagged_queue:index (same contract as loadgen FraudInjector)."""
+        """Append user_id to its flagged_queue shard (same sharding as loadgen
+        FraudInjector) instead of one global list — keeps each read/rewrite
+        cheap and spreads writes across FLAGGED_QUEUE_SHARDS partitions."""
         if not user_id:
             return
         user_id = str(user_id)
-        ids = self._read_flagged_queue_ids()
+        shard_key = _queue_shard_key(_queue_shard_for(user_id))
+        rec = self.get(SET_FLAGGED_QUEUE, shard_key) or {}
+        ids = [str(uid) for uid in (rec.get('user_ids') or []) if uid]
         if user_id in ids:
             return
-        if len(ids) >= FLAGGED_QUEUE_CAP:
-            logger.warning("flagged_queue cap %s reached; skipping %s", FLAGGED_QUEUE_CAP, user_id)
+        if len(ids) >= FLAGGED_QUEUE_CAP // FLAGGED_QUEUE_SHARDS:
+            logger.warning("flagged_queue shard %s cap reached; skipping %s", shard_key, user_id)
             return
         ids.append(user_id)
-        self._write_flagged_queue_ids(ids)
+        self.put(SET_FLAGGED_QUEUE, shard_key, {
+            'user_ids': ids,
+            'total': len(ids),
+            'last_updated': datetime.now().isoformat(),
+        })
 
     def _remove_from_flagged_queue(self, user_id: str) -> None:
         if not user_id:
             return
-        ids = self._read_flagged_queue_ids()
         user_id = str(user_id)
+        shard_key = _queue_shard_key(_queue_shard_for(user_id))
+        rec = self.get(SET_FLAGGED_QUEUE, shard_key) or {}
+        ids = [str(uid) for uid in (rec.get('user_ids') or []) if uid]
         if user_id not in ids:
             return
         ids.remove(user_id)
-        self._write_flagged_queue_ids(ids)
+        self.put(SET_FLAGGED_QUEUE, shard_key, {
+            'user_ids': ids,
+            'total': len(ids),
+            'last_updated': datetime.now().isoformat(),
+        })
 
     def truncate_set(self, set_name: str) -> bool:
         """Delete all records in a set."""
@@ -1455,10 +1527,15 @@ class AerospikeService:
 
     def rebuild_flagged_queue_index(self, limit: int = 100_000) -> int:
         """
-        One-time migration: scan flagged_accounts and rebuild flagged_queue:index.
-        Run with loadgen paused. Returns number of user_ids indexed.
+        One-time migration/repair: scan flagged_accounts (the real source of
+        truth) and rebuild the sharded flagged_queue index from scratch.
+
+        Deliberately uses scan_all() rather than get_all_flagged_accounts() —
+        the latter prefers the (possibly stale/incomplete) queue itself, which
+        would just re-copy whatever the queue already has instead of repairing
+        it. Run with loadgen paused. Returns number of user_ids indexed.
         """
-        accounts = self.get_all_flagged_accounts(limit=limit)
+        accounts = self.scan_all(SET_FLAGGED_ACCOUNTS, limit)
         user_ids: List[str] = []
         seen = set()
         for account in accounts:

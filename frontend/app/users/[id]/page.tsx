@@ -6,7 +6,10 @@ import { Badge } from '@/components/ui/badge'
 import Details, { type UserSummary } from '@/components/Users/Details';
 import Label from '@/components/Label'
 
-const API_BASE_URL = process.env.BASE_URL || "http://localhost:8080/api"
+// Call the backend container directly (not the /api rewrite proxy on our own
+// public port) — a server-side loopback through our own proxy would hit the
+// login-gate middleware with no session cookie and always 401.
+const API_BASE_URL = process.env.BACKEND_URL || process.env.BASE_URL || "http://localhost:8080/api"
 
 // Overall account disposition, mirroring the flagged-accounts workflow statuses
 // (kept in sync with frontend/app/flagged/page.tsx's statusConfig).

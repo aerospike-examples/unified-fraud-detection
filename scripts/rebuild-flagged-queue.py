@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Rebuild flagged_queue:index from the flagged_accounts KV set.
+Rebuild the sharded flagged_queue index (index_0..index_N) from the
+flagged_accounts KV set.
 
 Run with loadgen paused so the scan completes quickly. After this, the backend
-loads the review queue via batch_get on deterministic user_id keys — no feed
-index or set scan on every API request.
+loads the review queue via batch_get across the shard keys, then batch_get on
+deterministic user_id keys — no feed index or set scan on every API request.
+Also useful as a one-time migration off the pre-sharding single "index" key,
+which this deletes once the rebuild completes.
 
 Usage:
   python scripts/rebuild-flagged-queue.py
