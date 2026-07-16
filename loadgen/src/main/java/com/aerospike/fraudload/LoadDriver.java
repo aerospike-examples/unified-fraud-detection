@@ -100,7 +100,8 @@ public final class LoadDriver {
                 Thread thread = new Thread(() -> {
                     Random rnd = new Random(0x5DEECE66DL ^ workerIndex);
                     KeyShard shard = new KeyShard(workerIndex, cfg.workers(), cfg.accountPool().size());
-                    TransactionGenerator gen = new TransactionGenerator(cfg.accountPool(), shard, rnd);
+                    TransactionGenerator gen = new TransactionGenerator(cfg.accountPool(), shard, rnd,
+                            cfg.ringPoolSize(), cfg.ringRatio());
                     boolean fraudEnabled = cfg.fraudRatio() > 0.0;
                     long next = System.nanoTime();
                     try {

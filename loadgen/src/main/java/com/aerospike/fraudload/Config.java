@@ -15,5 +15,7 @@ public record Config(
         int graphPort,
         double fraudRatio,
         String accountPrefix,
-        String userPrefix) {
+        String userPrefix,
+        int ringPoolSize,
+        double ringRatio) {
 }

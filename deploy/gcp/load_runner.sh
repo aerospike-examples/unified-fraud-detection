@@ -21,6 +21,7 @@
 #   ./load_runner.sh create 10
 #   ./load_runner.sh start 10 paired 50000 3600 64 0
 #   MULES=200 FRAUDSTERS=200 FRAUD_RATIO=0.02 ./load_runner.sh start 10 paired 0 1800 64 500000
+#   RING_POOL_SIZE=12 RING_RATIO=0.4 FRAUD_RATIO=0.02 ./load_runner.sh start 10 paired 0 1800 64 500000
 #   ./load_runner.sh stop 10                 # stop loadgen + graph (original behavior)
 #   ./load_runner.sh stop 10 loadgen         # stop just the loadgen processes
 #   ./load_runner.sh report 10               # what tps is the fleet actually achieving?
@@ -318,6 +319,8 @@ ENVEOF
       [[ -n "${FRAUD_RATIO:-}" ]] && remote_cmd+=" export FRAUD_RATIO=${FRAUD_RATIO};"
       [[ -n "${MULES:-}" ]] && remote_cmd+=" export MULES=${MULES};"
       [[ -n "${FRAUDSTERS:-}" ]] && remote_cmd+=" export FRAUDSTERS=${FRAUDSTERS};"
+      [[ -n "${RING_POOL_SIZE:-}" ]] && remote_cmd+=" export RING_POOL_SIZE=${RING_POOL_SIZE};"
+      [[ -n "${RING_RATIO:-}" ]] && remote_cmd+=" export RING_RATIO=${RING_RATIO};"
       [[ -n "${ACCOUNT_PREFIX:-}" ]] && remote_cmd+=" export ACCOUNT_PREFIX=${ACCOUNT_PREFIX};"
       [[ -n "${USER_PREFIX:-}" ]] && remote_cmd+=" export USER_PREFIX=${USER_PREFIX};"
       remote_cmd+=" nohup ./run-loadgen.sh $(printf '%q ' "${loadgen_args[@]}") > loadgen.log 2>&1 < /dev/null & disown; sleep 1; echo started"

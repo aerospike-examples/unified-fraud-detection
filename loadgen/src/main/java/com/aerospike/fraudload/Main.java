@@ -37,6 +37,12 @@ public final class Main implements Callable<Integer> {
             description = "User id prefix for deterministic account->user mapping") String userPrefix;
     @Option(names = "--cohort-seed", defaultValue = "0", hidden = true,
             description = "Deprecated — no fixed cohort") long cohortSeed;
+    @Option(names = "--ring-pool-size", defaultValue = "12",
+            description = "Per-worker rotating cohort size that ring-mode fraud txns are drawn from; "
+                    + "0 disables ring bias entirely") int ringPoolSize;
+    @Option(names = "--ring-ratio", defaultValue = "0.4",
+            description = "Fraction (0..1) of fraud txns biased towards the ring pool (both sender and "
+                    + "receiver), vs. fully random sender/receiver anywhere in the shard") double ringRatio;
 
     @Override
     public Integer call() throws Exception {
@@ -46,7 +52,7 @@ public final class Main implements Callable<Integer> {
         }
         AccountPool pool = resolveAccountPool();
         Config cfg = new Config(host, port, namespace, pool, workers, rate, duration, balances,
-                mode, graphHost, graphPort, fraudRatio, accountPrefix, userPrefix);
+                mode, graphHost, graphPort, fraudRatio, accountPrefix, userPrefix, ringPoolSize, ringRatio);
         new LoadDriver(cfg).run();
         return 0;
     }
