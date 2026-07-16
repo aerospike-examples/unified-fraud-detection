@@ -31,6 +31,14 @@ services:
     ports:
       - "4000:4000"
     restart: unless-stopped
+    # Stays root (it writes to the ./data bind mount), so cut everything else
+    # a compromised process could use to escalate or pivot.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 8g
+    cpus: 4
 
   frontend:
     build:
@@ -48,3 +56,9 @@ services:
     ports:
       - "8080:8080"
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 2g
+    cpus: 2

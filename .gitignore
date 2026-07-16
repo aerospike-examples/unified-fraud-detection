@@ -48,6 +48,12 @@ data/
 .vscode/
 *.swp
 *.swo
+
+# Build artifacts
+*.tsbuildinfo
+
+# Personal scratch notes
+demo_day_scripts.txt
 *~
 .DS_Store
 

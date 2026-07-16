@@ -8,7 +8,11 @@ RUN mkdir /frontend
 COPY ./frontend /frontend
 WORKDIR /frontend
 
-RUN npm install
+RUN npm install && chown -R node:node /frontend
+
+# node:alpine ships an unprivileged "node" user (uid 1000) — no reason for
+# this process to run as root, it doesn't write outside /frontend.
+USER node
 
 # Bulk loading removed - use frontend Data Management page to load data
 CMD [ "npm", "run", "deploy" ]
