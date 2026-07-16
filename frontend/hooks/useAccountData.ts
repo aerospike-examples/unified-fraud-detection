@@ -456,10 +456,16 @@ export function useGraphData(userId: string) {
         setError(null)
         
         try {
-            // Fetch user data and connected users
-            const [userResponse, connectedResponse] = await Promise.all([
+            // Fetch user data, device-shared connections, and the transaction-partner
+            // network. The transaction network deliberately reuses the exact same
+            // traversal shape as the detect_fraud_ring investigation tool (see
+            // get_transaction_ring_network on the backend), so this view can't
+            // silently disagree with the Fraud Ring panel the way a separate,
+            // shallower "last 5 transactions" traversal used to.
+            const [userResponse, connectedResponse, txnNetworkResponse] = await Promise.all([
                 fetch(`/api/users/${userId}`),
-                fetch(`/api/users/${userId}/connected-devices`)
+                fetch(`/api/users/${userId}/connected-devices`),
+                fetch(`/api/users/${userId}/transaction-network`)
             ])
             
             if (!userResponse.ok) {
@@ -470,12 +476,19 @@ export function useGraphData(userId: string) {
             const user = userSummary.user || {}
             const accounts = userSummary.accounts || []
             const devices = userSummary.devices || []
-            const transactions = userSummary.txns || []
             
             let connectedUsers: any[] = []
             if (connectedResponse.ok) {
                 const connectedData = await connectedResponse.json()
                 connectedUsers = connectedData.connected_users || []
+            }
+
+            let txnNetworkNodes: any[] = []
+            let txnNetworkEdges: any[] = []
+            if (txnNetworkResponse.ok) {
+                const txnNetworkData = await txnNetworkResponse.json()
+                txnNetworkNodes = txnNetworkData.nodes || []
+                txnNetworkEdges = txnNetworkData.edges || []
             }
             
             // Helper to get ID from various formats
@@ -635,33 +648,39 @@ export function useGraphData(userId: string) {
                 }
             })
             
-            // Add transaction connections from recent transactions
-            transactions.slice(0, 5).forEach((txn: any, idx: number) => {
-                const otherParty = txn.other_party
-                const otherPartyId = getId(otherParty)
-                if (otherParty && otherPartyId !== 'Unknown') {
-                    addNode({
-                        id: otherPartyId,
-                        label: `${otherParty.name || 'User'}\n${otherPartyId}`,
-                        type: 'user',
-                        x: centerX + 200 + idx * 50,
-                        y: centerY + 100 + idx * 40,
-                        risk: (otherParty.risk_score || 0) >= 70 ? 'high' : 
-                              (otherParty.risk_score || 0) >= 40 ? 'medium' : 'low',
-                        details: {
-                            'User ID': otherPartyId,
-                            'Name': otherParty.name || 'Unknown',
-                            'Connection': `Transaction: ${formatCurrency(txn.txn?.amount || txn.amount || 0)}`
-                        }
-                    })
-                    
-                    // Find user's account and connect
-                    const sourceAccount = getId(uniqueAccounts[0]) || userId
+            // Add transaction-partner nodes/edges from the ring-consistent network
+            // endpoint: the target user plus every direct TRANSACTS partner, laid
+            // out in an outer ring, then any edges discovered BETWEEN those
+            // partners (the structure that makes something a ring rather than a
+            // star — a plain "recent transactions" list can't show this).
+            const partnerNodes = txnNetworkNodes.filter((n: any) => n.user_id !== userId)
+            partnerNodes.forEach((partner: any, idx: number) => {
+                const angle = (idx * 2 * Math.PI) / Math.max(partnerNodes.length, 1)
+                const radius = 300
+                addNode({
+                    id: partner.user_id,
+                    label: `${partner.name || 'User'}\n${partner.user_id}`,
+                    type: 'user',
+                    x: centerX + Math.cos(angle) * radius,
+                    y: centerY + Math.sin(angle) * radius,
+                    risk: (partner.risk_score || 0) >= 70 ? 'high' :
+                          (partner.risk_score || 0) >= 40 ? 'medium' : 'low',
+                    details: {
+                        'User ID': partner.user_id,
+                        'Name': partner.name || 'Unknown',
+                        'Risk Score': String(partner.risk_score || 0),
+                        'Connection': 'Transaction partner'
+                    }
+                })
+            })
+
+            txnNetworkEdges.forEach((edge: any) => {
+                if (nodeIds.has(edge.from) && nodeIds.has(edge.to)) {
                     addEdge({
-                        source: sourceAccount,
-                        target: otherPartyId,
+                        source: edge.from,
+                        target: edge.to,
                         type: 'transaction',
-                        label: formatCurrency(txn.txn?.amount || txn.amount || 0)
+                        label: 'transacts'
                     })
                 }
             })

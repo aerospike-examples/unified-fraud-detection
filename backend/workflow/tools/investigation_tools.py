@@ -1058,6 +1058,117 @@ class InvestigationTools:
     # ─────────────────────────────────────────────────────────────
     # TOOL 7: Get Transaction Network (Graph DB)
     # ─────────────────────────────────────────────────────────────
+    def get_transaction_ring_network(
+        self,
+        max_partners: int = 30,
+        max_inter_edges: int = 60
+    ) -> Dict[str, Any]:
+        """
+        Build a nodes+edges transaction graph around the user using the SAME
+        traversal shape as detect_fraud_ring: the user's direct transaction
+        partners, plus a bounded partner-to-partner scan for edges between
+        those partners. Returns a flat graph rather than a ring verdict.
+
+        This exists as a separate method from get_transaction_network
+        (which does true recursive multi-hop and is capped to hops=1 in
+        remote mode) specifically so a "connection graph" visualization can
+        show the exact same edges that detect_fraud_ring analyzed — using
+        get_transaction_network's 1-hop-only view instead would show a bare
+        star with none of the partner-to-partner edges that make something a
+        ring, silently disagreeing with the ring panel.
+
+        Args:
+            max_partners: Cap on direct transaction partners considered.
+            max_inter_edges: Cap on discovered partner-to-partner edges.
+        """
+        logger.info(f"[Tool] get_transaction_ring_network(max_partners={max_partners})")
+
+        try:
+            g = self.graph.client
+            if not g:
+                return {"success": False, "error": "Graph service not connected"}
+
+            from gremlin_python.process.graph_traversal import __
+
+            start = time.time()
+            txn_partners = (g.V(self.user_id)
+                .out("OWNS")
+                .bothE("TRANSACTS")
+                .bothV()
+                .hasLabel("account")
+                .in_("OWNS")
+                .hasLabel("user")
+                .where(__.not_(__.hasId(self.user_id)))
+                .dedup()
+                .limit(max_partners)
+                .project("user_id", "name", "risk_score")
+                .by(__.id_())
+                .by(__.coalesce(__.values("name"), __.constant("Unknown")))
+                .by(__.coalesce(__.values("risk_score"), __.constant(0)))
+                .to_list()
+            )
+            self._track_db_call("ring_network_partners", "Graph", (time.time() - start) * 1000)
+
+            partner_ids = {p["user_id"] for p in txn_partners}
+
+            nodes = [{
+                "user_id": self.user_id,
+                "name": "TARGET",
+                "risk_score": 0,
+                "is_investigated": True,
+            }]
+            for p in txn_partners:
+                nodes.append({
+                    "user_id": p["user_id"],
+                    "name": p.get("name", "Unknown"),
+                    "risk_score": p.get("risk_score", 0),
+                    "is_investigated": False,
+                })
+
+            edges = [{"from": self.user_id, "to": p["user_id"]} for p in txn_partners]
+
+            # Bounded partner-to-partner scan — identical shape to
+            # detect_fraud_ring's triangle detection, so the same edges that
+            # make it a "ring" there show up here too.
+            start = time.time()
+            seen_pairs = set()
+            for pid in list(partner_ids):
+                if len(seen_pairs) >= max_inter_edges:
+                    break
+                try:
+                    mutual = (g.V(pid)
+                        .out("OWNS")
+                        .bothE("TRANSACTS").bothV()
+                        .hasLabel("account")
+                        .in_("OWNS").hasLabel("user")
+                        .where(__.not_(__.hasId(pid)).not_(__.hasId(self.user_id)))
+                        .dedup().id_()
+                        .to_list()
+                    )
+                    for mid in mutual:
+                        if mid in partner_ids and mid != pid:
+                            pair = tuple(sorted([pid, mid]))
+                            if pair not in seen_pairs:
+                                seen_pairs.add(pair)
+                except Exception as e:
+                    logger.warning(f"ring network partner scan failed for {pid}: {e}")
+                    continue
+            self._track_db_call("ring_network_inter_edges", "Graph", (time.time() - start) * 1000)
+
+            for (a, b) in list(seen_pairs)[:max_inter_edges]:
+                edges.append({"from": a, "to": b})
+
+            return {
+                "success": True,
+                "nodes": nodes,
+                "edges": edges,
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+            }
+        except Exception as e:
+            logger.error(f"get_transaction_ring_network error: {e}")
+            return {"success": False, "error": str(e)}
+
     def get_transaction_network(
         self, 
         hops: int = 2,

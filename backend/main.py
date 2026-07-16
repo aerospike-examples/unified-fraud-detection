@@ -150,10 +150,18 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware for frontend communication
+# CORS middleware for frontend communication. The backend is reached directly
+# from the browser (see NEXT_PUBLIC_BACKEND_URL), typically via an IAP tunnel
+# to localhost on a port the operator chooses, so we can't pin one exact
+# origin — but a wildcard combined with allow_credentials is both rejected by
+# browsers in practice and an unnecessarily open default. Restrict to
+# loopback origins (covers local dev and IAP tunnels) plus an explicit
+# override for any other environment.
+_cors_extra_origins = [o for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_extra_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -612,6 +620,37 @@ def get_user_connected_devices(user_id: str = Path(..., description="User ID")):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get connected device users: {str(e)}")
+
+
+@app.get("/users/{user_id}/transaction-network")
+def get_user_transaction_network(user_id: str = Path(..., description="User ID")):
+    """
+    Transaction-partner graph around a user: direct TRANSACTS partners plus
+    any edges between those partners. Deliberately built with the SAME
+    traversal shape as the detect_fraud_ring investigation tool, so the
+    Graph tab shows the identical structure the fraud-ring detector analyzed
+    instead of a separate, shallower view that can silently disagree with it.
+    """
+    try:
+        if not graph_service.client:
+            return {"user_id": user_id, "nodes": [], "edges": [], "node_count": 0, "edge_count": 0}
+
+        from workflow.tools.investigation_tools import InvestigationTools
+        tools = InvestigationTools(aerospike_service, graph_service, user_id)
+        result = tools.get_transaction_ring_network()
+        if not result.get("success"):
+            logger.warning(f"transaction-network failed for {user_id}: {result.get('error')}")
+            return {"user_id": user_id, "nodes": [], "edges": [], "node_count": 0, "edge_count": 0}
+
+        return {
+            "user_id": user_id,
+            "nodes": result["nodes"],
+            "edges": result["edges"],
+            "node_count": result["node_count"],
+            "edge_count": result["edge_count"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get transaction network: {str(e)}")
 
 
 # ----------------------------------------------------------------------------------------------------------
