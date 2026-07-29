@@ -5,7 +5,7 @@
 # demo-amd-load-gen-1.
 #
 # Usage:
-#   ./load_runner.sh create  <count>
+#   ./load_runner.sh create  <count>                      # idempotent: tops up an existing fleet to <count> pairs
 #   ./load_runner.sh destroy <count>
 #   ./load_runner.sh start   <count> [loadgen-args...]   # forwarded to run-loadgen.sh
 #   ./load_runner.sh stop    <count> [loadgen|graph|all]  # default: all
@@ -22,6 +22,7 @@
 #   ./load_runner.sh start 10 paired 50000 3600 64 0
 #   MULES=200 FRAUDSTERS=200 FRAUD_RATIO=0.02 ./load_runner.sh start 10 paired 0 1800 64 500000
 #   RING_POOL_SIZE=12 RING_RATIO=0.4 FRAUD_RATIO=0.02 ./load_runner.sh start 10 paired 0 1800 64 500000
+#   KV_MODEL=flat BALANCES=false ./load_runner.sh start 20 kv 0 300 64 0   # max Aerospike throughput
 #   ./load_runner.sh stop 10                 # stop loadgen + graph (original behavior)
 #   ./load_runner.sh stop 10 loadgen         # stop just the loadgen processes
 #   ./load_runner.sh report 10               # what tps is the fleet actually achieving?
@@ -57,9 +58,40 @@ GRAPH_PREFIX="graph-demo-amd"
 LOADGEN_PREFIX="loadgen-amd-demo"
 
 SSH_FLAGS=(--tunnel-through-iap --project="${PROJECT}")
+# Cap concurrent SSH/SCP fan-out — 40 parallel gcloud compute ssh calls race on
+# ~/.ssh/google_compute_known_hosts and intermittently fail host-key verification.
+MAX_PARALLEL="${MAX_PARALLEL:-8}"
+# Seconds between successive instance launches. Each JVM opens its whole
+# Aerospike connection pool up front, so launching the fleet in lockstep hits
+# the cluster with one huge burst of connects; spacing them lets the ramp be
+# absorbed. Set to 0 to launch as fast as MAX_PARALLEL allows.
+START_STAGGER_SECS="${START_STAGGER_SECS:-2}"
 
 log() { echo "[load_runner] $*" >&2; }
 die() { echo "[load_runner] ERROR: $*" >&2; exit 1; }
+
+# Wait until fewer than MAX_PARALLEL background jobs are running.
+throttle_jobs() {
+  while (( $(jobs -pr 2>/dev/null | wc -l) >= MAX_PARALLEL )); do
+    wait -n 2>/dev/null || wait
+  done
+}
+
+# Sequential SSH to each fleet VM so google_compute_known_hosts is fully
+# populated before parallel start/stop/report — avoids "Host key verification
+# failed" when many gcloud compute ssh calls write the same file at once.
+warm_ssh_hosts() {
+  local n="$1" kind="${2:-loadgen}"
+  log "pre-warming SSH host keys for ${n} ${kind} instance(s)..."
+  local i name
+  for i in $(seq_1_to "${n}"); do
+    if [[ "${kind}" == graph ]]; then name="$(graph_name "${i}")"
+    else name="$(loadgen_name "${i}")"; fi
+    gcloud compute ssh "${SSH_FLAGS[@]}" --zone="${FLEET_ZONE}" "${name}" \
+      --command "true" >/dev/null 2>&1 \
+      || log "[${name}] ssh warm-up failed (will retry on operation)"
+  done
+}
 
 usage() {
   sed -n '2,33p' "$0"
@@ -165,42 +197,66 @@ cmd_create() {
   require_count "${n}"
   discover_aerospike
 
-  local graph_names=() loadgen_names=()
+  local all_graph_names=() all_loadgen_names=()
   for i in $(seq_1_to "${n}"); do
-    graph_names+=("$(graph_name "${i}")")
-    loadgen_names+=("$(loadgen_name "${i}")")
+    all_graph_names+=("$(graph_name "${i}")")
+    all_loadgen_names+=("$(loadgen_name "${i}")")
   done
+
+  # Idempotent "ensure fleet size >= n": skip any name (from either role) that
+  # already exists (any status), so `create 40` on top of an existing 10-pair
+  # fleet only creates the missing 11..40 instead of erroring on 1..10.
+  local existing; existing="$(gcloud compute instances list --project="${PROJECT}" \
+    --filter="name=(${all_graph_names[*]// / OR } OR ${all_loadgen_names[*]// / OR })" \
+    --format="value(name)")"
+
+  local graph_names=() loadgen_names=()
+  for name in "${all_graph_names[@]}"; do
+    grep -qx "${name}" <<<"${existing}" && log "skip ${name} (already exists)" || graph_names+=("${name}")
+  done
+  for name in "${all_loadgen_names[@]}"; do
+    grep -qx "${name}" <<<"${existing}" && log "skip ${name} (already exists)" || loadgen_names+=("${name}")
+  done
+
+  if [[ "${#graph_names[@]}" -eq 0 && "${#loadgen_names[@]}" -eq 0 ]]; then
+    log "fleet already has ${n} pair(s), nothing to create"
+    cmd_status
+    return 0
+  fi
 
   local tmpdir; tmpdir="$(mktemp -d)"
   trap 'rm -rf "${tmpdir}"' RETURN
   printf '%s' "${GRAPH_STARTUP_SCRIPT}" > "${tmpdir}/graph-startup.sh"
   printf '%s' "${LOADGEN_STARTUP_SCRIPT}" > "${tmpdir}/loadgen-startup.sh"
 
-  log "creating ${n} graph VM(s): ${graph_names[*]}"
-  log "creating ${n} loadgen VM(s): ${loadgen_names[*]}"
-
   local pids=() rc=0
-  (
-    gcloud compute instances create "${graph_names[@]}" \
-      --project="${PROJECT}" --zone="${AS_ZONE}" \
-      --machine-type="${MACHINE_TYPE}" \
-      --image-family="${IMAGE_FAMILY}" --image-project="${IMAGE_PROJECT}" \
-      --boot-disk-size="${BOOT_DISK_SIZE}" \
-      --network="${NETWORK}" --subnet="${SUBNET}" --no-address \
-      --labels="fleet=${FLEET_LABEL},role=graph" \
-      --metadata="as-seed-ip=${AS_SEED_IP},aerospike-namespace=${AEROSPIKE_NAMESPACE}" \
-      --metadata-from-file="startup-script=${tmpdir}/graph-startup.sh"
-  ) & pids+=($!)
-  (
-    gcloud compute instances create "${loadgen_names[@]}" \
-      --project="${PROJECT}" --zone="${AS_ZONE}" \
-      --machine-type="${MACHINE_TYPE}" \
-      --image-family="${IMAGE_FAMILY}" --image-project="${IMAGE_PROJECT}" \
-      --boot-disk-size="${BOOT_DISK_SIZE}" \
-      --network="${NETWORK}" --subnet="${SUBNET}" --no-address \
-      --labels="fleet=${FLEET_LABEL},role=loadgen" \
-      --metadata-from-file="startup-script=${tmpdir}/loadgen-startup.sh"
-  ) & pids+=($!)
+  if [[ "${#graph_names[@]}" -gt 0 ]]; then
+    log "creating ${#graph_names[@]} graph VM(s): ${graph_names[*]}"
+    (
+      gcloud compute instances create "${graph_names[@]}" \
+        --project="${PROJECT}" --zone="${AS_ZONE}" \
+        --machine-type="${MACHINE_TYPE}" \
+        --image-family="${IMAGE_FAMILY}" --image-project="${IMAGE_PROJECT}" \
+        --boot-disk-size="${BOOT_DISK_SIZE}" \
+        --network="${NETWORK}" --subnet="${SUBNET}" --no-address \
+        --labels="fleet=${FLEET_LABEL},role=graph" \
+        --metadata="as-seed-ip=${AS_SEED_IP},aerospike-namespace=${AEROSPIKE_NAMESPACE}" \
+        --metadata-from-file="startup-script=${tmpdir}/graph-startup.sh"
+    ) & pids+=($!)
+  fi
+  if [[ "${#loadgen_names[@]}" -gt 0 ]]; then
+    log "creating ${#loadgen_names[@]} loadgen VM(s): ${loadgen_names[*]}"
+    (
+      gcloud compute instances create "${loadgen_names[@]}" \
+        --project="${PROJECT}" --zone="${AS_ZONE}" \
+        --machine-type="${MACHINE_TYPE}" \
+        --image-family="${IMAGE_FAMILY}" --image-project="${IMAGE_PROJECT}" \
+        --boot-disk-size="${BOOT_DISK_SIZE}" \
+        --network="${NETWORK}" --subnet="${SUBNET}" --no-address \
+        --labels="fleet=${FLEET_LABEL},role=loadgen" \
+        --metadata-from-file="startup-script=${tmpdir}/loadgen-startup.sh"
+    ) & pids+=($!)
+  fi
 
   for pid in "${pids[@]}"; do wait "${pid}" || rc=1; done
   [[ "${rc}" -eq 0 ]] || die "one or more instance-create calls failed (see above)"
@@ -279,13 +335,16 @@ cmd_start() {
   [[ -f "${jar}" ]] || die "jar not found at ${jar} (build failed?)"
 
   log "starting ${n} loadgen instance(s) against their paired graph node, Aerospike seed=${AS_SEED_IP}"
-  log "loadgen args: ${loadgen_args[*]}"
+  log "loadgen args: ${loadgen_args[*]} (max_parallel=${MAX_PARALLEL})"
+
+  warm_ssh_hosts "${n}" loadgen
 
   local tmpdir; tmpdir="$(mktemp -d)"
   trap 'rm -rf "${tmpdir}"' RETURN
 
   local pids=() rc=0
   for i in $(seq_1_to "${n}"); do
+    throttle_jobs
     (
       local lg="$(loadgen_name "${i}")"
       local gr="$(graph_name "${i}")"
@@ -323,15 +382,29 @@ ENVEOF
       [[ -n "${RING_RATIO:-}" ]] && remote_cmd+=" export RING_RATIO=${RING_RATIO};"
       [[ -n "${ACCOUNT_PREFIX:-}" ]] && remote_cmd+=" export ACCOUNT_PREFIX=${ACCOUNT_PREFIX};"
       [[ -n "${USER_PREFIX:-}" ]] && remote_cmd+=" export USER_PREFIX=${USER_PREFIX};"
+      [[ -n "${KV_MODEL:-}" ]] && remote_cmd+=" export KV_MODEL=${KV_MODEL};"
+      [[ -n "${KV_MAX_CONNS:-}" ]] && remote_cmd+=" export KV_MAX_CONNS=${KV_MAX_CONNS};"
+      [[ -n "${BALANCES:-}" ]] && remote_cmd+=" export BALANCES=${BALANCES};"
+      [[ -n "${KV_TTL:-}" ]] && remote_cmd+=" export KV_TTL=${KV_TTL};"
+      [[ -n "${READ_RATIO:-}" ]] && remote_cmd+=" export READ_RATIO=${READ_RATIO};"
       remote_cmd+=" nohup ./run-loadgen.sh $(printf '%q ' "${loadgen_args[@]}") > loadgen.log 2>&1 < /dev/null & disown; sleep 1; echo started"
 
       log "[${lg}] launching loadgen"
-      gcloud compute ssh "${SSH_FLAGS[@]}" --zone="${FLEET_ZONE}" "${lg}" --command "${remote_cmd}"
+      ssh_retry "${lg}" "${remote_cmd}" || { log "[${lg}] launch failed"; exit 1; }
     ) & pids+=($!)
+    if [[ "${START_STAGGER_SECS}" != "0" ]]; then
+      sleep "${START_STAGGER_SECS}"
+    fi
   done
 
-  for pid in "${pids[@]}"; do wait "${pid}" || rc=1; done
-  [[ "${rc}" -eq 0 ]] || die "one or more loadgen instances failed to start (see above)"
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      rc=1
+    fi
+  done
+  if [[ "${rc}" -ne 0 ]]; then
+    die "one or more loadgen instances failed to start (see above)"
+  fi
   log "start complete: ${n} loadgen instance(s) running"
 }
 
@@ -346,10 +419,17 @@ cmd_stop() {
   esac
   discover_fleet_zone
 
-  log "stopping (target=${target}) on ${n} pair(s) — VMs stay running either way"
+  log "stopping (target=${target}) on ${n} pair(s) — VMs stay running either way (max_parallel=${MAX_PARALLEL})"
+  if [[ "${target}" == "loadgen" || "${target}" == "all" ]]; then
+    warm_ssh_hosts "${n}" loadgen
+  fi
+  if [[ "${target}" == "graph" || "${target}" == "all" ]]; then
+    warm_ssh_hosts "${n}" graph
+  fi
   local pids=() rc=0
   for i in $(seq_1_to "${n}"); do
     if [[ "${target}" == "loadgen" || "${target}" == "all" ]]; then
+      throttle_jobs
       (
         local lg="$(loadgen_name "${i}")"
         gcloud compute ssh "${SSH_FLAGS[@]}" --zone="${FLEET_ZONE}" "${lg}" --command \
@@ -358,6 +438,7 @@ cmd_stop() {
       ) & pids+=($!)
     fi
     if [[ "${target}" == "graph" || "${target}" == "all" ]]; then
+      throttle_jobs
       (
         local gr="$(graph_name "${i}")"
         gcloud compute ssh "${SSH_FLAGS[@]}" --zone="${FLEET_ZONE}" "${gr}" --command \
@@ -394,43 +475,51 @@ cmd_report() {
   require_count "${n}"
   discover_fleet_zone
 
-  log "sampling latest per-instance throughput from ${n} loadgen log(s)..."
+  log "sampling latest per-instance throughput from ${n} loadgen log(s) (max_parallel=${MAX_PARALLEL})..."
+  warm_ssh_hosts "${n}" loadgen
   local tmpdir; tmpdir="$(mktemp -d)"
   trap 'rm -rf "${tmpdir}"' RETURN
 
   local pids=()
   for i in $(seq_1_to "${n}"); do
+    throttle_jobs
     (
       local lg="$(loadgen_name "${i}")"
       local line
+      # Instances are launched staggered, so a run's last sample can be its
+      # final partial second while later instances are still at full speed.
+      # Report the peak second alongside it so a skewed tail doesn't read as a
+      # slow instance.
       line="$(gcloud compute ssh "${SSH_FLAGS[@]}" --zone="${FLEET_ZONE}" "${lg}" --command \
-        "grep 'c.a.f.Metrics' ~/fraud-loadgen/loadgen.log 2>/dev/null | tail -1" 2>/dev/null)"
+        'f=~/fraud-loadgen/loadgen.log; p=$(grep -oE "throughput=[0-9]+" "$f" 2>/dev/null | cut -d= -f2 | sort -rn | head -1); echo "peak_tps=${p:-0} $(grep "c.a.f.Metrics" "$f" 2>/dev/null | tail -1)"' 2>/dev/null)"
       echo "${lg} ${line}" > "${tmpdir}/${i}.out"
     ) & pids+=($!)
   done
   for pid in "${pids[@]}"; do wait "${pid}" || true; done
 
-  local total_tps=0 total_txns=0 total_errors=0 up=0
-  printf "%-22s %12s %14s %10s\n" "INSTANCE" "TXN/S" "TOTAL_TXNS" "ERRORS"
+  local total_tps=0 total_peak=0 total_txns=0 total_errors=0 up=0
+  printf "%-22s %12s %12s %14s %10s\n" "INSTANCE" "TXN/S" "PEAK_TXN/S" "TOTAL_TXNS" "ERRORS"
   for i in $(seq_1_to "${n}"); do
     local out; out="$(cat "${tmpdir}/${i}.out" 2>/dev/null)"
     local lg; lg="$(echo "${out}" | awk '{print $1}')"
-    local tps txns errs
-    tps="$(echo "${out}" | grep -oE 'throughput=[0-9]+' | cut -d= -f2)"
-    txns="$(echo "${out}" | grep -oE 'total=[0-9]+' | cut -d= -f2)"
-    errs="$(echo "${out}" | grep -oE 'errors=[0-9]+' | cut -d= -f2)"
+    local tps peak txns errs
+    peak="$(echo "${out}" | grep -oE 'peak_tps=[0-9]+' | cut -d= -f2 || true)"
+    tps="$(echo "${out}" | grep -oE 'throughput=[0-9]+' | cut -d= -f2 || true)"
+    txns="$(echo "${out}" | grep -oE 'total=[0-9]+' | cut -d= -f2 || true)"
+    errs="$(echo "${out}" | grep -oE 'errors=[0-9]+' | cut -d= -f2 || true)"
     if [[ -z "${tps}" ]]; then
-      printf "%-22s %12s %14s %10s\n" "${lg:-loadgen-amd-demo-${i}}" "no data" "-" "-"
+      printf "%-22s %12s %12s %14s %10s\n" "${lg:-loadgen-amd-demo-${i}}" "no data" "-" "-" "-"
       continue
     fi
-    printf "%-22s %12s %14s %10s\n" "${lg}" "${tps}" "${txns:-0}" "${errs:-0}"
+    printf "%-22s %12s %12s %14s %10s\n" "${lg}" "${tps}" "${peak:-0}" "${txns:-0}" "${errs:-0}"
     total_tps=$((total_tps + tps))
+    total_peak=$((total_peak + ${peak:-0}))
     total_txns=$((total_txns + ${txns:-0}))
     total_errors=$((total_errors + ${errs:-0}))
     up=$((up + 1))
   done
   echo "---"
-  log "fleet achieved: ${total_tps} txn/s across ${up}/${n} reporting instance(s), ${total_txns} total txns this run, ${total_errors} errors"
+  log "fleet achieved: ${total_tps} txn/s (sum of peak seconds: ${total_peak}) across ${up}/${n} reporting instance(s), ${total_txns} total txns this run, ${total_errors} errors"
 }
 
 # --- main ----------------------------------------------------------------
