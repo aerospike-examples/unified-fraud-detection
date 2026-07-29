@@ -24,7 +24,7 @@ class KvWriterIT {
     void writesMapEntryAndIncrementsBalance() {
         AerospikeClient client = connectOrSkip();
         try {
-            KvWriter writer = new KvWriter(client, "test", true);
+            KvWriter writer = new KvWriter(client, "test", true, KvModel.bucketed, 0);
             Instant ts = Instant.parse("2026-06-30T12:00:00Z");
             Transaction t = new Transaction("txn-it-1", "acct-1", "acct-2",
                     250_00L, "transfer", "Austin, TX", ts);

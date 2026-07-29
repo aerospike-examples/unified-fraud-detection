@@ -97,13 +97,20 @@ public final class FraudInjector {
             recentEntries.clear();
             feedDirty = false;
         }
+        // Best-effort, like the queue read above: resetting the feed counters is
+        // cosmetic, so a transient Aerospike error here must not take down a
+        // loadgen instance that is otherwise ready to push traffic.
         Key key = new Key(namespace, FEED_SET, FEED_KEY);
-        client.put(writePolicy, key,
-                new Bin("total", 0),
-                new Bin("recent", Value.get(new ArrayList<>())),
-                new Bin("run_id", runId),
-                new Bin("run_started", runId),
-                new Bin("last_updated", runId));
+        try {
+            client.put(writePolicy, key,
+                    new Bin("total", 0),
+                    new Bin("recent", Value.get(new ArrayList<>())),
+                    new Bin("run_id", runId),
+                    new Bin("run_started", runId),
+                    new Bin("last_updated", runId));
+        } catch (Exception e) {
+            log.warn("could not reset fraud_feed for this run: {}", e.toString());
+        }
         feedFlusher = startFeedFlusher();
         log.info("live fraud detection enabled (fraud_feed run {}, {} users in flagged_queue, "
                 + "{} queue shards)", runId, queuedUsers.size(), QUEUE_SHARDS);

@@ -17,5 +17,9 @@ public record Config(
         String accountPrefix,
         String userPrefix,
         int ringPoolSize,
-        double ringRatio) {
+        double ringRatio,
+        KvModel kvModel,
+        int kvMaxConns,
+        int kvTtlSeconds,
+        double readRatio) {
 }

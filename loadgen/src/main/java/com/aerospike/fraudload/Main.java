@@ -20,7 +20,8 @@ public final class Main implements Callable<Integer> {
     @Option(names = "--workers", defaultValue = "16", description = "Worker threads") int workers;
     @Option(names = "--rate", defaultValue = "0", description = "Target txn/s, 0 = unbounded") long rate;
     @Option(names = "--duration", defaultValue = "30", description = "Run duration in seconds") int duration;
-    @Option(names = "--balances", defaultValue = "true", description = "Atomic balance increments in KV") boolean balances;
+    @Option(names = "--balances", defaultValue = "true", arity = "1",
+            description = "Atomic balance increments in KV; false halves the KV ops per txn") boolean balances;
     @Option(names = "--mode", defaultValue = "kv",
             description = "Write path: kv, graph, or paired (parallel KV + graph)") WriteMode mode;
     @Option(names = "--graph-host", defaultValue = "localhost", description = "Gremlin/AGS host") String graphHost;
@@ -43,6 +44,18 @@ public final class Main implements Callable<Integer> {
     @Option(names = "--ring-ratio", defaultValue = "0.4",
             description = "Fraction (0..1) of fraud txns biased towards the ring pool (both sender and "
                     + "receiver), vs. fully random sender/receiver anywhere in the shard") double ringRatio;
+    @Option(names = "--kv-model", defaultValue = "bucketed",
+            description = "KV layout: bucketed (account:hour CDT map, demo-readable) or "
+                    + "flat (one constant-size record per txn, max throughput)") KvModel kvModel;
+    @Option(names = "--kv-max-conns", defaultValue = "0",
+            description = "Aerospike connections per node; 0 = auto (max(64, workers)). Every socket "
+                    + "counts against the server's proto-fd-max shared by the whole fleet") int kvMaxConns;
+    @Option(names = "--kv-ttl", defaultValue = "0",
+            description = "TTL in seconds for transaction records; 0 = server default. Strongly "
+                    + "recommended with --kv-model flat, which mints a new record per txn") int kvTtlSeconds;
+    @Option(names = "--read-ratio", defaultValue = "0.0",
+            description = "Fraction (0..1) of KV operations that are single-record reads of "
+                    + "previously written transactions; 0.5 gives a 50/50 mixed workload") double readRatio;
 
     @Override
     public Integer call() throws Exception {
@@ -52,7 +65,8 @@ public final class Main implements Callable<Integer> {
         }
         AccountPool pool = resolveAccountPool();
         Config cfg = new Config(host, port, namespace, pool, workers, rate, duration, balances,
-                mode, graphHost, graphPort, fraudRatio, accountPrefix, userPrefix, ringPoolSize, ringRatio);
+                mode, graphHost, graphPort, fraudRatio, accountPrefix, userPrefix, ringPoolSize, ringRatio,
+                kvModel, kvMaxConns, kvTtlSeconds, readRatio);
         new LoadDriver(cfg).run();
         return 0;
     }
