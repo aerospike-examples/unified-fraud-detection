@@ -21,6 +21,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { WorkflowStep as InvestigationStep, TraceEvent, ToolCall } from '@/hooks/useInvestigation'
+import { isStepCompleted } from '@/hooks/useInvestigation'
 
 type StepStatus = 'completed' | 'current' | 'upcoming' | 'ai_running'
 
@@ -151,16 +152,21 @@ const ReviewWorkflow = ({
         }
         
         // Check if AI steps for this workflow step are running
-        if (investigationStatus === 'running') {
-            // Step 3 (Human Decision) has no AI substeps - always upcoming during AI run
+        if (investigationStatus === 'running' || investigationStatus === 'connecting') {
             if (step.aiSteps.length === 0) return 'upcoming'
-            
-            const isAIRunning = step.aiSteps.some(aiStep => currentNode === aiStep)
-            if (isAIRunning) return 'ai_running'
-            
-            // Mark previous steps as completed during running
-            const allAICompleted = step.aiSteps.every(aiStep => 
-                completedInvestigationSteps.includes(aiStep)
+
+            const pipeline = ['alert_validation', 'data_collection', 'llm_agent', 'report_generation']
+            const effectiveNode =
+                currentNode ||
+                (investigationStatus === 'connecting' ? 'alert_validation' : '')
+            const currentIdx = pipeline.indexOf(effectiveNode)
+            const stepMaxIdx = Math.max(...step.aiSteps.map((id) => pipeline.indexOf(id)))
+
+            if (currentIdx > stepMaxIdx && currentIdx >= 0) return 'completed'
+            if (step.aiSteps.some((aiStep) => effectiveNode === aiStep)) return 'ai_running'
+
+            const allAICompleted = step.aiSteps.every((aiStep) =>
+                isStepCompleted(aiStep, completedInvestigationSteps, currentNode)
             )
             if (allAICompleted) return 'completed'
         }
@@ -173,8 +179,13 @@ const ReviewWorkflow = ({
 
     const getAISubStepStatus = (aiStepId: string): 'pending' | 'running' | 'completed' => {
         if (getStepStatus) return getStepStatus(aiStepId)
-        if (completedInvestigationSteps.includes(aiStepId)) return 'completed'
-        if (currentNode === aiStepId) return 'running'
+        const effectiveNode =
+            currentNode ||
+            (investigationStatus === 'running' || investigationStatus === 'connecting'
+                ? 'alert_validation'
+                : '')
+        if (isStepCompleted(aiStepId, completedInvestigationSteps, effectiveNode)) return 'completed'
+        if (effectiveNode === aiStepId) return 'running'
         return 'pending'
     }
 
@@ -267,9 +278,11 @@ const ReviewWorkflow = ({
                                         )}>
                                             {step.title}
                                         </h4>
-                                        <p className="text-sm text-slate-500 mt-1">{step.description}</p>
-
-                                        {/* Decision step reflects the agent's decision + approval */}
+                                        {index === 2 && isAIActive && currentNode === 'llm_agent' && (
+                                            <p className="mt-2 text-xs text-purple-600">
+                                                Three AI specialists (network, device, velocity) are analyzing in parallel…
+                                            </p>
+                                        )}
                                         {index === 3 && isAwaitingApproval && aiDecision && (
                                             <div className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-amber-50 border border-amber-200 px-2 py-1 text-xs font-medium text-amber-700">
                                                 <Loader2 className="w-3.5 h-3.5 animate-spin" />

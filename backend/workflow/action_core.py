@@ -25,8 +25,19 @@ def init_action_services(flagged_account_service: Any) -> None:
 
 
 def _user_id_for(account_id: str) -> str:
-    """Derive owning user_id from account_id (A000396803 -> U0003968)."""
-    return f"U{account_id[1:-2]}" if account_id.startswith("A") else account_id
+    """Resolve owning user_id from account_id.
+
+    Delegates to the flagged-account service's graph-backed resolver, which works
+    for both the Account{n}->User{n} bulk-load scheme and the legacy A{user}{suffix}
+    scheme. Falls back to the legacy derivation only if the service is unavailable.
+    """
+    if _flagged_account_service is not None:
+        owner = _flagged_account_service._flagged_user_id(account_id)
+        if owner:
+            return owner
+    if account_id.startswith("A") and not account_id.startswith("Account"):
+        return f"U{account_id[1:-2]}"
+    return account_id
 
 
 def execute_action(decision: str, account_id: str, reason: str) -> Dict[str, Any]:

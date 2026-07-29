@@ -134,6 +134,8 @@ const Results = ({
                                     // For transactions, construct URL with account_id/day/txn_id
                                     const detailUrl = pathname === '/transactions' && result.account_id && result.day
                                         ? `${pathname}/${encodeURIComponent(result.account_id)}/${encodeURIComponent(result.day)}/${encodeURIComponent(result.id)}`
+                                        : pathname === '/transactions' && (result.account_id || result.sender)
+                                        ? `${pathname}/${encodeURIComponent(result.account_id || result.sender)}/txn/${encodeURIComponent(result.id)}`
                                         : `${pathname}/${encodeURIComponent(result.id)}`;
                                     
                                     return (

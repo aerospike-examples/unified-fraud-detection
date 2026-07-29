@@ -95,6 +95,9 @@ services:
     environment:
       - BACKEND_URL=http://asgraph-backend:4000
       - NEXT_PUBLIC_BACKEND_URL=http://localhost:4000
+      # Optional login gate — set both to require sign-in; leave both unset to disable.
+      - AUTH_USERNAME=${AUTH_USERNAME:-}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
     networks:
       - asgraph_net
     ports:

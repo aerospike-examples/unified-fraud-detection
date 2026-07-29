@@ -10,6 +10,7 @@ from workflow.llm import LLMConfig, resolve_adk_model
 from workflow.runner import (
     build_runner,
     get_workflow_steps,
+    load_investigation_snapshot,
     run_investigation,
     resume_investigation,
 )
@@ -85,3 +86,12 @@ class AdkEngine(BaseInvestigationEngine):
             override=override,
         ):
             yield event
+
+    async def load_investigation_snapshot(
+        self, user_id: str, investigation_id: str
+    ) -> Optional[Dict[str, Any]]:
+        if not self._runner:
+            await self.initialize()
+        return await load_investigation_snapshot(
+            self._runner, user_id, investigation_id
+        )

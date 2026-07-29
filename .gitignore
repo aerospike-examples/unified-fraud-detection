@@ -48,6 +48,12 @@ data/
 .vscode/
 *.swp
 *.swo
+
+# Build artifacts
+*.tsbuildinfo
+
+# Personal scratch notes
+demo_day_scripts.txt
 *~
 .DS_Store
 
@@ -57,6 +63,9 @@ data/
 .env.development.local
 .env.test.local
 .env.production.local
+
+# Maven shade plugin build artifact
+loadgen/dependency-reduced-pom.xml
 
 # Docker
 docker-compose.override.yml

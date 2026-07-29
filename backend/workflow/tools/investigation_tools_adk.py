@@ -19,8 +19,12 @@ Conventions
 - Per-investigation DB-call metrics are recorded via ``get_collector``.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
+import asyncio
 import logging
+import os
+from datetime import date, datetime
+from decimal import Decimal
 
 from google.adk.tools import ToolContext
 
@@ -28,6 +32,11 @@ from workflow.tools.investigation_tools import InvestigationTools
 from workflow.metrics import get_collector
 
 logger = logging.getLogger('investigation.tools_adk')
+
+# Hard cap on any single tool call. This is a backstop ABOVE the graph server's
+# evaluationTimeout + the transport read timeout, so it should almost never fire;
+# it exists so a wedged tool can never stall an investigation indefinitely.
+TOOL_TIMEOUT_S = float(os.environ.get('TOOL_TIMEOUT_S', '90'))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Service binding (set once at startup)
@@ -52,10 +61,79 @@ def _engine(tool_context: ToolContext) -> InvestigationTools:
     return InvestigationTools(_aerospike_service, _graph_service, user_id, metrics)
 
 
+def _json_safe(obj: Any) -> Any:
+    """Coerce a tool result into types ADK's Aerospike session store can persist.
+
+    The graph value-maps can surface datetimes/Decimals (e.g. a counterparty's
+    signup_date), and the Aerospike client can't serialize those — a single such
+    value in a tool response makes ADK's session append_event fail and aborts the
+    whole investigation ("Unable to serialize unknown Python native type"). We
+    normalize to str/float/list/dict/primitives so persistence always succeeds.
+    """
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return bytes(obj).decode("utf-8", "replace")
+        except Exception:
+            return str(obj)
+    return str(obj)
+
+
+async def _run_tool_in_thread(name: str, fn: Callable[[], dict]) -> dict:
+    """Run a blocking tool body in a worker thread so it does NOT block (or, for
+    graph tools, RE-ENTER) the asyncio event loop.
+
+    This is what lets ADK's ParallelAgent specialists genuinely overlap instead
+    of serializing on every lookup, AND — critically for the graph tools — keeps
+    the synchronous gremlin driver off the main loop entirely. The gremlin
+    transport is built with call_from_event_loop=False, so it owns its own loop
+    and is safe to drive from a plain worker thread; driving it on the main loop
+    (call_from_event_loop=True) re-enters ADK's ParallelAgent TaskGroup and
+    crashes the run with a GeneratorExit. Both the Aerospike client and (under
+    the graph query lock) the gremlin connection are safe to use this way.
+    """
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(fn), timeout=TOOL_TIMEOUT_S)
+        return _json_safe(result)
+    except asyncio.TimeoutError:
+        logger.warning("[Tool] %s exceeded %ss — returning timeout error", name, TOOL_TIMEOUT_S)
+        return {"success": False, "error": f"{name} timed out after {int(TOOL_TIMEOUT_S)}s", "timed_out": True}
+    except Exception as e:  # noqa: BLE001 — surface any failure to the agent, don't crash the run
+        logger.exception("[Tool] %s failed", name)
+        return {"success": False, "error": str(e)}
+
+
+# Backwards-compatible alias for KV-only tools.
+_run_kv_tool = _run_tool_in_thread
+
+
+async def _run_graph_tool(name: str, fn: Callable[[], dict]) -> dict:
+    """Run a gremlin-backed tool body off the main loop, serialized by the graph
+    query lock (one shared websocket connection driving its own internal loop)."""
+    lock = getattr(_graph_service, "query_lock", None)
+
+    def _locked() -> dict:
+        if lock is not None:
+            with lock:
+                return fn()
+        return fn()
+
+    return await _run_tool_in_thread(name, _locked)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Evidence-gathering tools (KV + Graph)
 # ─────────────────────────────────────────────────────────────────────────────
-def get_account_transactions(account_id: str, tool_context: ToolContext, days: int = 30) -> dict:
+async def get_account_transactions(account_id: str, tool_context: ToolContext, days: int = 30) -> dict:
     """Pull the transaction ledger for a specific account. Use this to analyze
     spending patterns, velocity, amounts, counterparties, and detect unusual
     behavior. Each transaction includes the counterparty_user_id which you can
@@ -65,10 +143,14 @@ def get_account_transactions(account_id: str, tool_context: ToolContext, days: i
         account_id: The account ID to pull transactions for (e.g. A527001).
         days: Days to look back, 1-90 (default 30).
     """
-    return _engine(tool_context).get_account_transactions(account_id=account_id, days=days)
+    eng = _engine(tool_context)
+    return await _run_graph_tool(
+        "get_account_transactions",
+        lambda: eng.get_account_transactions(account_id=account_id, days=days),
+    )
 
 
-def get_counterparty_profile(user_id: str, tool_context: ToolContext) -> dict:
+async def get_counterparty_profile(user_id: str, tool_context: ToolContext) -> dict:
     """Get the profile of a user the suspect has been transacting with. Returns
     their name, location, signup date, risk score, accounts (with balances and
     fraud flags), and devices. Use this after seeing suspicious transactions to
@@ -77,10 +159,14 @@ def get_counterparty_profile(user_id: str, tool_context: ToolContext) -> dict:
     Args:
         user_id: The counterparty's user_id (from transaction data).
     """
-    return _engine(tool_context).get_counterparty_profile(user_id=user_id)
+    eng = _engine(tool_context)
+    return await _run_graph_tool(
+        "get_counterparty_profile",
+        lambda: eng.get_counterparty_profile(user_id=user_id),
+    )
 
 
-def get_counterparty_transactions(user_id: str, tool_context: ToolContext, days: int = 30) -> dict:
+async def get_counterparty_transactions(user_id: str, tool_context: ToolContext, days: int = 30) -> dict:
     """Get all transactions across all accounts of a counterparty. Use this to
     build a behavioral profile: are they receiving money from many sources (mule
     pattern)? Making rapid transfers? What is their transaction volume?
@@ -89,10 +175,14 @@ def get_counterparty_transactions(user_id: str, tool_context: ToolContext, days:
         user_id: The counterparty's user_id.
         days: Days to look back, 1-90 (default 30).
     """
-    return _engine(tool_context).get_counterparty_transactions(user_id=user_id, days=days)
+    eng = _engine(tool_context)
+    return await _run_graph_tool(
+        "get_counterparty_transactions",
+        lambda: eng.get_counterparty_transactions(user_id=user_id, days=days),
+    )
 
 
-def get_account_risk_features(account_id: str, tool_context: ToolContext) -> dict:
+async def get_account_risk_features(account_id: str, tool_context: ToolContext) -> dict:
     """Get pre-computed ML risk features for an account. Returns velocity (txn
     count, peak hour activity), amount patterns (total, average, z-score),
     counterparty spread (unique recipients, new recipient ratio, entropy), device
@@ -101,10 +191,14 @@ def get_account_risk_features(account_id: str, tool_context: ToolContext) -> dic
     Args:
         account_id: The account ID to get risk features for.
     """
-    return _engine(tool_context).get_account_risk_features(account_id=account_id)
+    eng = _engine(tool_context)
+    return await _run_kv_tool(
+        "get_account_risk_features",
+        lambda: eng.get_account_risk_features(account_id=account_id),
+    )
 
 
-def get_device_risk_features(device_id: str, tool_context: ToolContext) -> dict:
+async def get_device_risk_features(device_id: str, tool_context: ToolContext) -> dict:
     """Get pre-computed risk features for a device. Returns shared account count
     (how many accounts use this device), flagged account count, average and max
     account risk scores, and new account rate. High shared_account_count or
@@ -113,10 +207,14 @@ def get_device_risk_features(device_id: str, tool_context: ToolContext) -> dict:
     Args:
         device_id: The device ID to get risk features for.
     """
-    return _engine(tool_context).get_device_risk_features(device_id=device_id)
+    eng = _engine(tool_context)
+    return await _run_kv_tool(
+        "get_device_risk_features",
+        lambda: eng.get_device_risk_features(device_id=device_id),
+    )
 
 
-def detect_fraud_ring(tool_context: ToolContext, hops: int = 2) -> dict:
+async def detect_fraud_ring(tool_context: ToolContext, hops: int = 1) -> dict:
     """Detect whether the investigated user is part of a coordinated fraud ring by
     analyzing the network graph. Checks shared devices, flagged entities,
     device+transaction overlap, transaction triangles/cycles, reciprocal money
@@ -126,10 +224,11 @@ def detect_fraud_ring(tool_context: ToolContext, hops: int = 2) -> dict:
     Args:
         hops: Network traversal depth, 1-3 (default 2).
     """
-    return _engine(tool_context).detect_fraud_ring(hops=hops)
+    eng = _engine(tool_context)
+    return await _run_graph_tool("detect_fraud_ring", lambda: eng.detect_fraud_ring(hops=hops))
 
 
-def get_transaction_network(tool_context: ToolContext, hops: int = 2, min_amount: float = 0) -> dict:
+async def get_transaction_network(tool_context: ToolContext, hops: int = 1, min_amount: float = 0) -> dict:
     """Visualize the money-flow network around the user. Multi-hop traversal
     through transaction edges showing who sent money to whom, total amounts,
     transaction counts, and which accounts on the path are flagged. Use this to
@@ -139,7 +238,11 @@ def get_transaction_network(tool_context: ToolContext, hops: int = 2, min_amount
         hops: Network traversal depth, 1-3 (default 2).
         min_amount: Only include edges with total amount above this threshold.
     """
-    return _engine(tool_context).get_transaction_network(hops=hops, min_amount=min_amount)
+    eng = _engine(tool_context)
+    return await _run_graph_tool(
+        "get_transaction_network",
+        lambda: eng.get_transaction_network(hops=hops, min_amount=min_amount),
+    )
 
 
 async def recall_similar_investigations(query: str, tool_context: ToolContext) -> dict:
@@ -170,7 +273,7 @@ async def recall_similar_investigations(query: str, tool_context: ToolContext) -
             "timestamp": getattr(mem, "timestamp", None),
             "text": " ".join(text_parts)[:1000],
         })
-    return {"success": True, "found": bool(results), "count": len(results), "memories": results[:10]}
+    return _json_safe({"success": True, "found": bool(results), "count": len(results), "memories": results[:10]})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

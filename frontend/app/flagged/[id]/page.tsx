@@ -23,7 +23,8 @@ import {
     Shield,
     Smartphone,
     Globe,
-    RefreshCw
+    RefreshCw,
+    FileText,
 } from 'lucide-react'
 import ReviewWorkflow from '@/components/Flagged/Details/ReviewWorkflow'
 import GraphVisualization from '@/components/Flagged/Details/GraphVisualization'
@@ -112,6 +113,12 @@ export default function FlaggedAccountDetailsPage() {
     const [loadedExisting, setLoadedExisting] = useState(false)
     // Review-report-and-decide dialog (opens when the agent pauses for approval)
     const [reviewOpen, setReviewOpen] = useState(false)
+    const [reportDialogMode, setReportDialogMode] = useState<'decide' | 'view'>('decide')
+    
+    const openReportDialog = (mode: 'decide' | 'view') => {
+        setReportDialogMode(mode)
+        setReviewOpen(true)
+    }
     
     // Fetch real account data
     const { data: account, loading, error, refetch } = useAccountData(accountId)
@@ -119,30 +126,42 @@ export default function FlaggedAccountDetailsPage() {
     // Investigation hook
     const investigation = useInvestigation()
 
-    // Load existing investigation on mount
+    // Load saved investigation on mount and when opening the Investigation tab
+    useEffect(() => {
+        setLoadedExisting(false)
+    }, [account?.user_id])
+
     useEffect(() => {
         const loadExisting = async () => {
-            if (account?.user_id && investigation.status === 'idle' && !loadedExisting) {
-                setLoadedExisting(true)
-                const found = await investigation.loadExistingInvestigation(account.user_id)
-                if (found) {
-                    console.log('[Page] Loaded existing investigation')
-                }
+            if (!account?.user_id) return
+            if (investigation.status === 'running' || investigation.status === 'connecting' || investigation.status === 'awaiting_confirmation') {
+                return
             }
+            if (loadedExisting && investigation.report) return
+            const ok = await investigation.loadExistingInvestigation(account.user_id)
+            if (ok) setLoadedExisting(true)
         }
         loadExisting()
-    }, [account?.user_id, investigation.status, loadedExisting])
+    }, [account?.user_id, investigation.status, investigation.report, loadedExisting])
+
+    // Re-fetch persisted report when user opens the Investigation tab
+    useEffect(() => {
+        if (activeTab !== 'investigation' || !account?.user_id) return
+        if (investigation.status === 'running' || investigation.status === 'connecting') return
+        if (!investigation.report && investigation.status !== 'awaiting_confirmation') {
+            investigation.loadExistingInvestigation(account.user_id)
+        }
+    }, [activeTab, account?.user_id, investigation.status, investigation.report])
 
     // When the agent pauses for approval, open the review-and-decide dialog so the
     // analyst reads the full report before approving/rejecting.
     useEffect(() => {
-        if (investigation.status === 'awaiting_confirmation') {
+        if (investigation.status === 'awaiting_confirmation' && investigation.pendingAction) {
             setActiveTab('investigation')
+            setReportDialogMode('decide')
             setReviewOpen(true)
-        } else {
-            setReviewOpen(false)
         }
-    }, [investigation.status])
+    }, [investigation.status, investigation.pendingAction])
 
     // Refresh the account once the run completes so the flagged status reflects
     // whatever disposition was enacted (approve or override).
@@ -232,6 +251,17 @@ export default function FlaggedAccountDetailsPage() {
                     </div>
                 </div>
             </div>
+
+            {/* Connection dropped mid-run — the investigation keeps running on the
+                server and we're waiting for the persisted result. */}
+            {investigation.reconnecting && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 flex items-center gap-2">
+                    <RefreshCw className="h-4 w-4 text-amber-600 animate-spin" />
+                    <p className="text-sm text-amber-800">
+                        Connection interrupted — the investigation is still running on the server. Waiting for results…
+                    </p>
+                </div>
+            )}
 
             {/* Main Content Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -417,6 +447,28 @@ export default function FlaggedAccountDetailsPage() {
                         <TabsContent value="investigation" className="mt-6 space-y-6">
                             <PriorCasesPanel priorCases={investigation.priorCases} />
 
+                            {investigation.report && investigation.status !== 'running' && investigation.status !== 'connecting' && (
+                                <div className="flex flex-wrap gap-2">
+                                    <Button
+                                        variant="outline"
+                                        onClick={() => openReportDialog('view')}
+                                        className="border-slate-300"
+                                    >
+                                        <FileText className="h-4 w-4 mr-2" />
+                                        {investigation.enactedActions.length > 0 ? 'View report' : 'View report & decide'}
+                                    </Button>
+                                    {investigation.status === 'awaiting_confirmation' && investigation.pendingAction && (
+                                        <Button
+                                            onClick={() => openReportDialog('decide')}
+                                            className="bg-amber-600 hover:bg-amber-700 text-white"
+                                        >
+                                            <Shield className="h-4 w-4 mr-2" />
+                                            Review &amp; decide
+                                        </Button>
+                                    )}
+                                </div>
+                            )}
+
                             <EvidenceSpecialists
                                 specialistFindings={investigation.specialistFindings}
                                 toolCalls={investigation.toolCalls}
@@ -426,6 +478,7 @@ export default function FlaggedAccountDetailsPage() {
 
                             <InvestigationReport
                                 userId={accountId}
+                                investigationActive={investigation.status === 'running' || investigation.status === 'connecting'}
                                 finalAssessment={investigation.finalAssessment}
                                 toolCalls={investigation.toolCalls}
                                 agentIterations={investigation.agentIterations}
@@ -679,8 +732,23 @@ export default function FlaggedAccountDetailsPage() {
                             pendingAction={investigation.pendingAction}
                             onApprove={() => investigation.approveAction(true)}
                             onOverride={(d) => investigation.approveAction(false, d)}
-                            onReview={() => setReviewOpen(true)}
+                            onReview={() => openReportDialog('decide')}
                         />
+                    )}
+
+                    {investigation.report && investigation.status === 'completed' && (
+                        <Card className="bg-white border-slate-200 shadow-sm">
+                            <CardContent className="pt-6">
+                                <Button
+                                    variant="outline"
+                                    onClick={() => openReportDialog('view')}
+                                    className="w-full border-slate-300"
+                                >
+                                    <FileText className="h-4 w-4 mr-2" />
+                                    {investigation.enactedActions.length > 0 ? 'View investigation report' : 'View report & decide'}
+                                </Button>
+                            </CardContent>
+                        </Card>
                     )}
 
                     <ReviewWorkflow
@@ -705,15 +773,26 @@ export default function FlaggedAccountDetailsPage() {
                 </div>
             </div>
 
-            {/* Review the full report, then approve/reject — opens at the approval pause */}
-            {investigation.status === 'awaiting_confirmation' && investigation.pendingAction && (
+            {/* Review the full report, then approve/reject — or view a saved report
+                and make/change the decision directly without re-running anything. */}
+            {investigation.report && (
                 <DecisionReviewDialog
                     open={reviewOpen}
                     onOpenChange={setReviewOpen}
+                    mode={reportDialogMode}
                     pendingAction={investigation.pendingAction}
+                    enactedActions={investigation.enactedActions}
                     report={investigation.report}
                     onApprove={() => { setReviewOpen(false); investigation.approveAction(true) }}
                     onOverride={(d) => { setReviewOpen(false); investigation.approveAction(false, d) }}
+                    onManualDecide={
+                        investigation.investigation_id
+                            ? async (decision, reason) => {
+                                  const ok = await investigation.manualDecide(investigation.investigation_id!, decision, reason)
+                                  if (ok) refetch()
+                              }
+                            : undefined
+                    }
                 />
             )}
         </div>

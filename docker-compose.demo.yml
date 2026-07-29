@@ -1,0 +1,64 @@
+# Demo deployment: app only — Aerospike KV + AGS run on separate GCP VMs.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend.Dockerfile
+    container_name: fraud-demo-backend
+    environment:
+      - AEROSPIKE_HOST=${AEROSPIKE_HOST:-10.50.15.198}
+      - AEROSPIKE_KV_PORT=${AEROSPIKE_KV_PORT:-3000}
+      - AEROSPIKE_NAMESPACE=${AEROSPIKE_NAMESPACE:-test}
+      - GRAPH_HOST_ADDRESS=${GRAPH_HOST_ADDRESS:-10.128.0.41}
+      # local = KV-backed counts + full Admin pipeline; remote = graph-summary
+      # counts, externally-loaded data, Admin write ops disabled.
+      - DATA_SOURCE_MODE=${DATA_SOURCE_MODE:-remote}
+      - LLM_PROVIDER=${LLM_PROVIDER:-gemini}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-${GEMINI_API_KEY:-}}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI:-FALSE}
+      - INVESTIGATION_ENGINE=${INVESTIGATION_ENGINE:-adk}
+      - ADK_MODEL=${ADK_MODEL:-gemini-2.0-flash}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.0-flash}
+      # Graph/tool query bounds so a slow traversal can't hang an investigation.
+      - GRAPH_QUERY_TIMEOUT_MS=${GRAPH_QUERY_TIMEOUT_MS:-30000}
+      - GRAPH_READ_TIMEOUT_S=${GRAPH_READ_TIMEOUT_S:-45}
+      - GRAPH_WRITE_TIMEOUT_S=${GRAPH_WRITE_TIMEOUT_S:-20}
+      - TOOL_TIMEOUT_S=${TOOL_TIMEOUT_S:-90}
+      - DATA_DIR=/data
+    volumes:
+      - ./data:/data
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+    # Stays root (it writes to the ./data bind mount), so cut everything else
+    # a compromised process could use to escalate or pivot.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 8g
+    cpus: 4
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    container_name: fraud-demo-frontend
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:4000
+      - NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL:-http://localhost:4000}
+      # Optional login gate — set both to require sign-in; leave both unset to disable.
+      - AUTH_USERNAME=${AUTH_USERNAME:-}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 2g
+    cpus: 2

@@ -32,33 +32,34 @@ _SPECIALIST_SYSTEM = """You are a {role} on a fraud-investigation team. You are 
 _SPECIALIST_SPECS = {
     NETWORK_ANALYST_NAME: dict(
         role="NETWORK ANALYST",
-        max_calls=5,
+        max_calls=12,
         focus=(
-            "Counterparties and the money-movement graph: who the flagged account transacts with, "
-            "fan-out / fan-in patterns, repeated counterparties, mule chains, and coordinated fraud "
-            "rings. Use detect_fraud_ring and get_transaction_network to map the network, and "
-            "get_counterparty_profile / get_counterparty_transactions to vet the 2-3 most suspicious "
-            "counterparties (highest volume, newest, highest risk, or most repeated)."
+            "Counterparties and money-movement patterns — be THOROUGH. Start with "
+            "get_transaction_network (hops=1) to map the flow, then detect_fraud_ring "
+            "(hops=1) for ring structure. Then drill into the SUSPICIOUS counterparties: "
+            "call get_counterparty_profile on each notable counterparty (aim for 4-6), and "
+            "get_counterparty_transactions on any whose volume or balance looks anomalous. "
+            "If a ring or high-value chain appears, expand with get_transaction_network "
+            "(hops=2). Use as many tool calls as needed to fully map the network."
         ),
     ),
     DEVICE_ANALYST_NAME: dict(
         role="DEVICE & INFRASTRUCTURE ANALYST",
         max_calls=4,
         focus=(
-            "Devices and account infrastructure risk: devices shared across multiple accounts, "
-            "device risk/spoofing signals, and account-level infrastructure risk features. Use "
-            "get_device_risk_features on the account's devices and get_account_risk_features on the "
-            "flagged/suspicious accounts. Flag any device tied to many accounts or with high risk."
+            "Device and account infrastructure risk. Call get_account_risk_features on the "
+            "flagged account, then get_device_risk_features on each device present in the "
+            "evidence. Investigate shared-device links thoroughly if any surface."
         ),
     ),
     VELOCITY_ANALYST_NAME: dict(
         role="VELOCITY & TRANSACTION ANALYST",
-        max_calls=5,
+        max_calls=6,
         focus=(
-            "Transaction velocity and amount behavior: bursts of activity, transaction velocity vs "
-            "baseline, unusual amounts, new-recipient ratio, and structuring/timing patterns. Use "
-            "get_account_transactions to pull history and get_account_risk_features for pre-computed "
-            "velocity/amount anomaly scores. Quantify the burst (count, window, total amount)."
+            "Velocity and amount behavior. get_account_risk_features first, then "
+            "get_account_transactions (days=7, then days=30 if a burst appears) to quantify "
+            "velocity, bursts, and amount anomalies. Pull enough windows to characterize the "
+            "pattern precisely."
         ),
     ),
 }

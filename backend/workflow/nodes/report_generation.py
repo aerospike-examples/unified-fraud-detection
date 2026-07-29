@@ -123,6 +123,59 @@ def finalize_report(response: str, state: Dict[str, Any]) -> str:
     return _clean_report(response, state)
 
 
+async def _call_gemini(prompt: str) -> str:
+    """Call Google Gemini API using native generateContent endpoint."""
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+    
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable is required for Gemini provider")
+    
+    logger.info(f"[Report] Calling Gemini API with model {model}")
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        response = await client.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key
+            },
+            json={
+                "contents": [
+                    {
+                        "parts": [{"text": prompt}]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.4,
+                    "maxOutputTokens": 1500
+                }
+            }
+        )
+        response.raise_for_status()
+        result = response.json()
+        
+        candidates = result.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            if parts:
+                return parts[0].get("text", "")
+        
+        return ""
+
+
+async def _call_llm(prompt: str) -> str:
+    """Call the configured LLM provider (Gemini or Ollama)."""
+    provider = os.environ.get("LLM_PROVIDER", "ollama").lower()
+    
+    if provider == "gemini":
+        return await _call_gemini(prompt)
+    return await _call_ollama(prompt)
+
+
 def generate_fallback_report(state: Dict[str, Any]) -> str:
     """Public entry point: fully deterministic report when the LLM is unavailable."""
     return _generate_fallback_report(state)

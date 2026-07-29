@@ -14,6 +14,8 @@ from typing import Dict, Any, List, Optional, TYPE_CHECKING
 import logging
 import time
 
+import settings
+
 if TYPE_CHECKING:
     from workflow.metrics import MetricsCollector
 
@@ -123,6 +125,27 @@ class InvestigationTools:
         """Track a database call if metrics collector is available."""
         if self.metrics:
             self.metrics.track_db_call(operation, target, duration_ms, success)
+
+    def _graph_hops(self, hops: int) -> int:
+        """Cap Gremlin depth — remote demo graph is billion-scale."""
+        hops = min(3, max(1, int(hops or 1)))
+        if settings.is_remote_mode():
+            return 1
+        return hops
+
+    @staticmethod
+    def _fget(facts: Dict[str, Any], *keys: str, default: Any = 0) -> Any:
+        """
+        Read a fact value accepting multiple key spellings.
+
+        Feature records are written with SHORT names (e.g. `txn_out_7d`), but this
+        module historically read LONG names (e.g. `txn_out_count_7d`). Accept both
+        so features aren't silently zeroed regardless of which writer produced them.
+        """
+        for k in keys:
+            if k in facts and facts[k] is not None:
+                return facts[k]
+        return default
     
     def execute_tool(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool by name with given parameters."""
@@ -211,8 +234,13 @@ class InvestigationTools:
         
         try:
             start = time.time()
-            transactions = self.aerospike.get_transactions_for_account(account_id, days=days)
-            self._track_db_call("get_transactions_for_account", "KV", (time.time() - start) * 1000)
+            if settings.is_remote_mode():
+                # No KV transactions in remote mode; read the ledger from the graph.
+                transactions = self.graph.get_account_transactions_from_graph(account_id, limit=200)
+                self._track_db_call("get_account_transactions", "Graph", (time.time() - start) * 1000)
+            else:
+                transactions = self.aerospike.get_transactions_for_account(account_id, days=days)
+                self._track_db_call("get_transactions_for_account", "KV", (time.time() - start) * 1000)
             
             if not transactions:
                 return {
@@ -280,6 +308,14 @@ class InvestigationTools:
         logger.info(f"[Tool] get_counterparty_profile(user_id={user_id})")
         
         try:
+            # In remote mode counterparties aren't in KV (only the flagged user is
+            # hydrated); build the profile from the graph instead.
+            if settings.is_remote_mode():
+                start = time.time()
+                result = self._counterparty_profile_from_graph(user_id)
+                self._track_db_call("get_counterparty_profile", "Graph", (time.time() - start) * 1000)
+                return result
+
             # Get user profile
             start = time.time()
             user_data = self.aerospike.get_user(user_id)
@@ -351,6 +387,62 @@ class InvestigationTools:
             logger.error(f"get_counterparty_profile error: {e}")
             return {"success": False, "error": str(e)}
     
+    def _counterparty_profile_from_graph(self, user_id: str) -> Dict[str, Any]:
+        """Build a counterparty profile from the graph (remote mode) in the same
+        shape get_counterparty_profile returns from KV."""
+        profile = self.graph.get_user_profile(user_id)
+        if not profile or not profile.get("user"):
+            return {
+                "success": True,
+                "found": False,
+                "message": f"User {user_id} not found in graph"
+            }
+        u = profile["user"]
+        account_list = [{
+            "account_id": a.get("id", ""),
+            "type": a.get("type", "unknown"),
+            "balance": a.get("balance", 0),
+            "status": a.get("status", "active"),
+            "is_fraud": bool(a.get("fraud_flag", False)),
+        } for a in profile.get("accounts", [])]
+        device_list = [{
+            "device_id": d.get("id", ""),
+            "type": d.get("type", "unknown"),
+            "os": d.get("os", "unknown"),
+            "is_fraud": bool(d.get("fraud_flag", False)),
+        } for d in profile.get("devices", [])]
+
+        account_age_days = 0
+        signup_date = u.get("signup_date", "")
+        if signup_date:
+            try:
+                signup_dt = datetime.fromisoformat(str(signup_date).replace("Z", "+00:00"))
+                account_age_days = (datetime.now(signup_dt.tzinfo) - signup_dt).days
+            except Exception:
+                pass
+
+        total_balance = sum(a.get("balance", 0) for a in account_list)
+        has_flagged_account = any(a.get("is_fraud") for a in account_list)
+
+        return {
+            "success": True,
+            "found": True,
+            "user_id": user_id,
+            "name": u.get("name", "Unknown"),
+            "email": u.get("email", ""),
+            "location": u.get("location", "Unknown"),
+            "occupation": u.get("occupation", "Unknown"),
+            "signup_date": signup_date,
+            "account_age_days": account_age_days,
+            "risk_score": u.get("risk_score", 0),
+            "accounts": account_list,
+            "account_count": len(account_list),
+            "total_balance": round(total_balance, 2),
+            "has_flagged_account": has_flagged_account,
+            "devices": device_list,
+            "device_count": len(device_list),
+        }
+    
     # ─────────────────────────────────────────────────────────────
     # TOOL 3: Get Counterparty Transactions (KV Store)
     # ─────────────────────────────────────────────────────────────
@@ -375,24 +467,35 @@ class InvestigationTools:
         days = min(90, max(1, days))
         
         try:
-            # Get the counterparty's accounts
+            # Get the counterparty's accounts (KV in local mode, graph in remote).
             start = time.time()
-            accounts = self.aerospike.get_user_accounts(user_id)
-            self._track_db_call("get_counterparty_accounts", "KV", (time.time() - start) * 1000)
+            if settings.is_remote_mode():
+                profile = self.graph.get_user_profile(user_id)
+                account_ids = [a.get("id") for a in (profile.get("accounts") if profile else []) if a.get("id")]
+                self._track_db_call("get_counterparty_accounts", "Graph", (time.time() - start) * 1000)
+            else:
+                accounts = self.aerospike.get_user_accounts(user_id)
+                account_ids = list(accounts.keys()) if accounts else []
+                self._track_db_call("get_counterparty_accounts", "KV", (time.time() - start) * 1000)
             
-            if not accounts:
+            if not account_ids:
                 return {
                     "success": True,
                     "found": False,
                     "message": f"No accounts found for user {user_id}"
                 }
             
-            account_ids = list(accounts.keys())
-            
-            # Batch get transactions for all accounts
+            # Fetch transactions for all accounts (KV batch, or per-account graph reads).
             start = time.time()
-            all_txns = self.aerospike.batch_get_transactions(account_ids, days=days)
-            self._track_db_call("batch_get_counterparty_transactions", "KV", (time.time() - start) * 1000)
+            if settings.is_remote_mode():
+                all_txns = {
+                    aid: self.graph.get_account_transactions_from_graph(aid, limit=100)
+                    for aid in account_ids[:25]
+                }
+                self._track_db_call("get_counterparty_transactions", "Graph", (time.time() - start) * 1000)
+            else:
+                all_txns = self.aerospike.batch_get_transactions(account_ids, days=days)
+                self._track_db_call("batch_get_counterparty_transactions", "KV", (time.time() - start) * 1000)
             
             # Aggregate across all accounts
             all_transactions = []
@@ -484,36 +587,36 @@ class InvestigationTools:
                 "last_computed": facts.get("last_computed", "unknown"),
                 "features": {
                     # Velocity features
-                    "txn_out_count_7d": facts.get("txn_out_count_7d", 0),
-                    "txn_out_count_24h_peak": facts.get("txn_out_count_24h_peak", 0),
-                    "avg_txn_per_day_7d": facts.get("avg_txn_per_day_7d", 0),
-                    "max_txn_per_hour_7d": facts.get("max_txn_per_hour_7d", 0),
-                    "transaction_zscore": facts.get("transaction_zscore", 0),
+                    "txn_out_count_7d": self._fget(facts, "txn_out_7d", "txn_out_count_7d"),
+                    "txn_out_count_24h_peak": self._fget(facts, "txn_24h_peak", "txn_out_count_24h_peak"),
+                    "avg_txn_per_day_7d": self._fget(facts, "avg_txn_day", "avg_txn_per_day_7d"),
+                    "max_txn_per_hour_7d": self._fget(facts, "max_txn_hr", "max_txn_per_hour_7d"),
+                    "transaction_zscore": self._fget(facts, "txn_zscore", "transaction_zscore"),
                     # Amount features
-                    "total_out_amount_7d": facts.get("total_out_amount_7d", 0),
-                    "avg_out_amount_7d": facts.get("avg_out_amount_7d", 0),
-                    "max_out_amount_7d": facts.get("max_out_amount_7d", 0),
-                    "amount_zscore_7d": facts.get("amount_zscore_7d", 0),
+                    "total_out_amount_7d": self._fget(facts, "out_amt_7d", "total_out_amount_7d"),
+                    "avg_out_amount_7d": self._fget(facts, "avg_out_amt", "avg_out_amount_7d"),
+                    "max_out_amount_7d": self._fget(facts, "max_out_amt", "max_out_amount_7d"),
+                    "amount_zscore_7d": self._fget(facts, "amt_zscore", "amount_zscore_7d"),
                     # Counterparty features
-                    "unique_recipients_7d": facts.get("unique_recipients_7d", 0),
-                    "new_recipient_ratio_7d": facts.get("new_recipient_ratio_7d", 0),
-                    "recipient_entropy_7d": facts.get("recipient_entropy_7d", 0),
+                    "unique_recipients_7d": self._fget(facts, "uniq_recip", "unique_recipients_7d"),
+                    "new_recipient_ratio_7d": self._fget(facts, "new_recip_rat", "new_recipient_ratio_7d"),
+                    "recipient_entropy_7d": self._fget(facts, "recip_entropy", "recipient_entropy_7d"),
                     # Device features
-                    "device_count_7d": facts.get("device_count_7d", 0),
-                    "shared_device_account_count_7d": facts.get("shared_device_account_count_7d", 0),
+                    "device_count_7d": self._fget(facts, "dev_count", "device_count_7d"),
+                    "shared_device_account_count_7d": self._fget(facts, "shared_dev_ct", "shared_device_account_count_7d"),
                     # Lifecycle features
-                    "account_age_days": facts.get("account_age_days", 0),
-                    "first_txn_delay_days": facts.get("first_txn_delay_days", 0),
-                    "historical_txn_mean": facts.get("historical_txn_mean", 0),
-                    "historical_amt_mean": facts.get("historical_amt_mean", 0),
-                    "historical_amt_std": facts.get("historical_amt_std", 0),
+                    "account_age_days": self._fget(facts, "acct_age_days", "account_age_days"),
+                    "first_txn_delay_days": self._fget(facts, "first_txn_dly", "first_txn_delay_days"),
+                    "historical_txn_mean": self._fget(facts, "hist_txn_mean", "historical_txn_mean"),
+                    "historical_amt_mean": self._fget(facts, "hist_amt_mean", "historical_amt_mean"),
+                    "historical_amt_std": self._fget(facts, "hist_amt_std", "historical_amt_std"),
                 },
                 "interpretation": {
-                    "velocity_anomaly": facts.get("transaction_zscore", 0) > 2.0,
-                    "amount_anomaly": facts.get("amount_zscore_7d", 0) > 2.0,
-                    "high_new_recipient_ratio": facts.get("new_recipient_ratio_7d", 0) > 0.5,
-                    "device_shared": facts.get("shared_device_account_count_7d", 0) > 1,
-                    "new_account": facts.get("account_age_days", 365) < 30,
+                    "velocity_anomaly": self._fget(facts, "txn_zscore", "transaction_zscore") > 2.0,
+                    "amount_anomaly": self._fget(facts, "amt_zscore", "amount_zscore_7d") > 2.0,
+                    "high_new_recipient_ratio": self._fget(facts, "new_recip_rat", "new_recipient_ratio_7d") > 0.5,
+                    "device_shared": self._fget(facts, "shared_dev_ct", "shared_device_account_count_7d") > 1,
+                    "new_account": self._fget(facts, "acct_age_days", "account_age_days", default=365) < 30,
                 }
             }
             
@@ -557,17 +660,17 @@ class InvestigationTools:
                 "found": True,
                 "last_computed": facts.get("last_computed", "unknown"),
                 "features": {
-                    "shared_account_count_7d": facts.get("shared_account_count_7d", 0),
-                    "flagged_account_count": facts.get("flagged_account_count", 0),
-                    "avg_account_risk_score": facts.get("avg_account_risk_score", 0),
-                    "max_account_risk_score": facts.get("max_account_risk_score", 0),
-                    "new_account_rate_7d": facts.get("new_account_rate_7d", 0),
+                    "shared_account_count_7d": self._fget(facts, "shared_acct_ct", "shared_account_count_7d"),
+                    "flagged_account_count": self._fget(facts, "flag_acct_ct", "flagged_account_count"),
+                    "avg_account_risk_score": self._fget(facts, "avg_acct_risk", "avg_account_risk_score"),
+                    "max_account_risk_score": self._fget(facts, "max_acct_risk", "max_account_risk_score"),
+                    "new_account_rate_7d": self._fget(facts, "new_acct_7d", "new_account_rate_7d"),
                 },
                 "interpretation": {
-                    "shared_device": facts.get("shared_account_count_7d", 0) > 2,
-                    "has_flagged_accounts": facts.get("flagged_account_count", 0) > 0,
-                    "high_avg_risk": facts.get("avg_account_risk_score", 0) > 50,
-                    "high_new_account_rate": facts.get("new_account_rate_7d", 0) > 0.3,
+                    "shared_device": self._fget(facts, "shared_acct_ct", "shared_account_count_7d") > 2,
+                    "has_flagged_accounts": self._fget(facts, "flag_acct_ct", "flagged_account_count") > 0,
+                    "high_avg_risk": self._fget(facts, "avg_acct_risk", "avg_account_risk_score") > 50,
+                    "high_new_account_rate": self._fget(facts, "new_acct_7d", "new_account_rate_7d") > 0.3,
                 }
             }
             
@@ -599,7 +702,7 @@ class InvestigationTools:
         """
         logger.info(f"[Tool] detect_fraud_ring(hops={hops})")
         
-        hops = min(3, max(1, hops))
+        hops = self._graph_hops(hops)
         g = self.graph.client
         
         try:
@@ -955,6 +1058,117 @@ class InvestigationTools:
     # ─────────────────────────────────────────────────────────────
     # TOOL 7: Get Transaction Network (Graph DB)
     # ─────────────────────────────────────────────────────────────
+    def get_transaction_ring_network(
+        self,
+        max_partners: int = 30,
+        max_inter_edges: int = 60
+    ) -> Dict[str, Any]:
+        """
+        Build a nodes+edges transaction graph around the user using the SAME
+        traversal shape as detect_fraud_ring: the user's direct transaction
+        partners, plus a bounded partner-to-partner scan for edges between
+        those partners. Returns a flat graph rather than a ring verdict.
+
+        This exists as a separate method from get_transaction_network
+        (which does true recursive multi-hop and is capped to hops=1 in
+        remote mode) specifically so a "connection graph" visualization can
+        show the exact same edges that detect_fraud_ring analyzed — using
+        get_transaction_network's 1-hop-only view instead would show a bare
+        star with none of the partner-to-partner edges that make something a
+        ring, silently disagreeing with the ring panel.
+
+        Args:
+            max_partners: Cap on direct transaction partners considered.
+            max_inter_edges: Cap on discovered partner-to-partner edges.
+        """
+        logger.info(f"[Tool] get_transaction_ring_network(max_partners={max_partners})")
+
+        try:
+            g = self.graph.client
+            if not g:
+                return {"success": False, "error": "Graph service not connected"}
+
+            from gremlin_python.process.graph_traversal import __
+
+            start = time.time()
+            txn_partners = (g.V(self.user_id)
+                .out("OWNS")
+                .bothE("TRANSACTS")
+                .bothV()
+                .hasLabel("account")
+                .in_("OWNS")
+                .hasLabel("user")
+                .where(__.not_(__.hasId(self.user_id)))
+                .dedup()
+                .limit(max_partners)
+                .project("user_id", "name", "risk_score")
+                .by(__.id_())
+                .by(__.coalesce(__.values("name"), __.constant("Unknown")))
+                .by(__.coalesce(__.values("risk_score"), __.constant(0)))
+                .to_list()
+            )
+            self._track_db_call("ring_network_partners", "Graph", (time.time() - start) * 1000)
+
+            partner_ids = {p["user_id"] for p in txn_partners}
+
+            nodes = [{
+                "user_id": self.user_id,
+                "name": "TARGET",
+                "risk_score": 0,
+                "is_investigated": True,
+            }]
+            for p in txn_partners:
+                nodes.append({
+                    "user_id": p["user_id"],
+                    "name": p.get("name", "Unknown"),
+                    "risk_score": p.get("risk_score", 0),
+                    "is_investigated": False,
+                })
+
+            edges = [{"from": self.user_id, "to": p["user_id"]} for p in txn_partners]
+
+            # Bounded partner-to-partner scan — identical shape to
+            # detect_fraud_ring's triangle detection, so the same edges that
+            # make it a "ring" there show up here too.
+            start = time.time()
+            seen_pairs = set()
+            for pid in list(partner_ids):
+                if len(seen_pairs) >= max_inter_edges:
+                    break
+                try:
+                    mutual = (g.V(pid)
+                        .out("OWNS")
+                        .bothE("TRANSACTS").bothV()
+                        .hasLabel("account")
+                        .in_("OWNS").hasLabel("user")
+                        .where(__.not_(__.hasId(pid)).not_(__.hasId(self.user_id)))
+                        .dedup().id_()
+                        .to_list()
+                    )
+                    for mid in mutual:
+                        if mid in partner_ids and mid != pid:
+                            pair = tuple(sorted([pid, mid]))
+                            if pair not in seen_pairs:
+                                seen_pairs.add(pair)
+                except Exception as e:
+                    logger.warning(f"ring network partner scan failed for {pid}: {e}")
+                    continue
+            self._track_db_call("ring_network_inter_edges", "Graph", (time.time() - start) * 1000)
+
+            for (a, b) in list(seen_pairs)[:max_inter_edges]:
+                edges.append({"from": a, "to": b})
+
+            return {
+                "success": True,
+                "nodes": nodes,
+                "edges": edges,
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+            }
+        except Exception as e:
+            logger.error(f"get_transaction_ring_network error: {e}")
+            return {"success": False, "error": str(e)}
+
     def get_transaction_network(
         self, 
         hops: int = 2,
@@ -973,7 +1187,7 @@ class InvestigationTools:
         """
         logger.info(f"[Tool] get_transaction_network(hops={hops}, min_amount={min_amount})")
         
-        hops = min(3, max(1, hops))
+        hops = self._graph_hops(hops)
         
         try:
             if not self.graph.client:

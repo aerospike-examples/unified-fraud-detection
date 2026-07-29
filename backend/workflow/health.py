@@ -19,12 +19,12 @@ logger = logging.getLogger('investigation.health')
 
 async def check_gemini_access(model: str) -> Dict[str, Any]:
     """Ping the Gemini API once. Returns {ok, error, hint}. Never raises."""
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         return {
             "ok": False,
             "error": "GOOGLE_API_KEY is not set",
-            "hint": "Set GOOGLE_API_KEY in your .env (get one at https://aistudio.google.com/apikey).",
+            "hint": "Set GOOGLE_API_KEY (or GEMINI_API_KEY) in your .env — get one at https://aistudio.google.com/apikey.",
         }
 
     try:

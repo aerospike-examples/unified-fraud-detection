@@ -14,6 +14,7 @@ Replaces the old LangGraph ``graph.py``:
   the existing node names.
 """
 
+import asyncio
 import logging
 import traceback
 from datetime import datetime
@@ -172,6 +173,61 @@ async def _read_state(inv_runner: InvestigationRunner, user_id: str, investigati
     if session is None:
         return {}
     return session.state.to_dict() if hasattr(session.state, "to_dict") else dict(session.state)
+
+
+async def load_investigation_snapshot(
+    inv_runner: InvestigationRunner,
+    user_id: str,
+    investigation_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Rebuild investigation fields from ADK session state (and report artifact if needed)."""
+    final_state = await _read_state(inv_runner, user_id, investigation_id)
+    if not final_state:
+        return None
+
+    report_markdown = final_state.get("report_markdown") or ""
+    if not report_markdown:
+        try:
+            artifact = await inv_runner.artifact_service.load_artifact(
+                app_name=APP_NAME,
+                user_id=user_id,
+                session_id=investigation_id,
+                filename="investigation_report.md",
+            )
+            if artifact and getattr(artifact, "text", None):
+                report_markdown = artifact.text
+        except Exception as e:
+            logger.debug("[%s] No ADK report artifact: %s", investigation_id, e)
+
+    if not report_markdown and not final_state.get("final_assessment"):
+        return None
+
+    specialist_calls = []
+    for name in SPECIALIST_NAMES:
+        specialist_calls.extend(final_state.get(f"specialist_tool_calls_{name}", []))
+
+    return {
+        "investigation_id": investigation_id,
+        "user_id": user_id,
+        "status": "completed",
+        "initial_evidence": final_state.get("initial_evidence", {}),
+        "final_assessment": final_state.get("final_assessment", {}),
+        "tool_calls": specialist_calls + final_state.get("tool_calls", []),
+        "specialist_findings": {
+            name: (final_state.get(SPECIALIST_OUTPUT_KEYS[name]) or "")
+            for name in SPECIALIST_NAMES
+        },
+        "prior_cases": final_state.get("prior_cases", []),
+        "enacted_actions": final_state.get("enacted_actions", []),
+        "agent_iterations": final_state.get("agent_iterations", 0),
+        "report_markdown": report_markdown,
+        "completed_steps": [
+            "alert_validation",
+            "data_collection",
+            "llm_agent",
+            "report_generation",
+        ],
+    }
 
 
 async def _drive_agent(
@@ -449,24 +505,41 @@ async def run_investigation(
             "report_markdown": "",
         }
 
-        # 1) Alert validation
+        # 1) Alert validation — emit node_start before blocking work so the UI advances immediately
+        yield _trace("alert_validation", "node_start", {"user_id": user_id})
         metrics.start_node("alert_validation")
         av = alert_validation_node({"user_id": user_id}, inv_runner.aerospike_service)
         seed_state["alert_evidence"] = av.get("alert_evidence")
         for ev in av.get("trace_events", []):
-            yield {"type": "trace", "event": ev}
+            if ev.get("type") != "node_start":
+                yield {"type": "trace", "event": ev}
         metrics.end_node("alert_validation")
 
-        # 2) Data collection
+        yield {
+            "type": "state_update",
+            "data": {
+                "alert_evidence": seed_state["alert_evidence"],
+                "current_phase": "validation",
+                "node": "data_collection",
+            },
+        }
+
+        # 2) Data collection — run in a worker thread. It does blocking KV + gremlin
+        # work, and the gremlin transport (call_from_event_loop=False) drives its own
+        # loop, which cannot run on the main-loop thread. Offloading also keeps the
+        # event loop responsive (SSE keepalives) during hydration.
+        yield _trace("data_collection", "node_start", {"user_id": user_id})
         metrics.start_node("data_collection")
-        dc = data_collection_node(
+        dc = await asyncio.to_thread(
+            data_collection_node,
             {"user_id": user_id, "investigation_id": investigation_id, "alert_evidence": seed_state["alert_evidence"]},
             inv_runner.aerospike_service,
             inv_runner.graph_service,
         )
         seed_state["initial_evidence"] = dc.get("initial_evidence")
         for ev in dc.get("trace_events", []):
-            yield {"type": "trace", "event": ev}
+            if ev.get("type") != "node_start":
+                yield {"type": "trace", "event": ev}
         metrics.end_node("data_collection")
 
         # ── Cross-case memory recall (ADK MemoryService) ─────────────────────
@@ -489,12 +562,31 @@ async def run_investigation(
                 "initial_evidence": seed_state["initial_evidence"],
                 "prior_cases": prior_cases,
                 "current_phase": "llm_reasoning",
+                "node": "llm_agent",
             },
         }
 
         await inv_runner.session_service.create_session(
             app_name=APP_NAME, user_id=user_id, session_id=investigation_id, state=seed_state,
         )
+
+        # Enter the ADK agent phase immediately so the UI advances past Initial Review
+        # before the first Gemini response (parallel specialists can think 30-60s).
+        metrics.start_node("llm_agent")
+        yield _trace("llm_agent", "node_start", {
+            "user_id": user_id,
+            "subphase": "parallel_specialists",
+        })
+        yield {
+            "type": "state_update",
+            "data": {
+                "node": "llm_agent",
+                "current_phase": "llm_reasoning",
+                "specialist_status": "running",
+                "initial_evidence": seed_state["initial_evidence"],
+                "alert_evidence": seed_state["alert_evidence"],
+            },
+        }
 
         new_message = types.Content(role="user", parts=[types.Part(text=(
             "Investigate this flagged account using the available tools, then submit your "

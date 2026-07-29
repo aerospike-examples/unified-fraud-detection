@@ -1,5 +1,6 @@
 'use server'
 
+import { notFound } from 'next/navigation'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { 
@@ -13,14 +14,23 @@ import TxnDetails, { type TxnDetail } from "@/components/Transactions/Details"
 import Stat from '@/components/Stat'
 import Label from '@/components/Label'
 
-const API_BASE_URL = process.env.BASE_URL || "http://localhost:8080/api"
+const API_BASE_URL = process.env.BACKEND_URL
+	? `${process.env.BACKEND_URL}`
+	: (process.env.BASE_URL || "http://localhost:8080/api")
 
 export default async function TransactionsPage({ params }: { params: Promise<{ id: string }>}) {
 	const { id: transactionId } = await params;
 	const encodedID = encodeURIComponent(transactionId)
   	
 	const response = await fetch(`${API_BASE_URL}/transaction/${encodedID}`, { cache: 'no-store' })
-    const { txn, src, dest }: TxnDetail = await response.json() 
+	if (!response.ok) {
+		notFound()
+	}
+    const data = await response.json()
+	const { txn, src, dest }: TxnDetail = data
+	if (!txn) {
+		notFound()
+	}
 	
   	const calculateOverallRisk = (fraud_score: number = 0) => {
     	const riskLevel = getRiskLevel(fraud_score)
@@ -76,7 +86,7 @@ export default async function TransactionsPage({ params }: { params: Promise<{ i
 					}} />
         		<Stat
 					title='Fraud Rules'
-					stat={txn.is_fraud ? txn.details!.length : 0}
+					stat={txn.is_fraud ? (txn.details?.length ?? 0) : 0}
 					icon='shield' />
       		</div>
 			<div className="grid gap-4 md:grid-cols-2">

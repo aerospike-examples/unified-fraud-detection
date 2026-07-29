@@ -29,7 +29,7 @@ import os
 import logging
 from typing import Any
 
-from google.adk.agents import LlmAgent, SequentialAgent, ParallelAgent
+from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.agents.callback_context import CallbackContext
 from google.genai import types
@@ -170,8 +170,8 @@ def _investigator_instruction(ctx: ReadonlyContext) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Action taker: enacts the decision AFTER the report is written. Destructive
-# actions pause here for analyst approval (ADK tool-confirmation).
+# Action taker: enacts the decision AFTER the report is written. All actions
+# pause here for analyst approval (ADK tool-confirmation).
 # ─────────────────────────────────────────────────────────────────────────────
 _ACTION_TAKER_SYSTEM = """You enforce a fraud decision that a senior analyst has ALREADY made and documented. Do NOT re-investigate, second-guess, or change the decision.
 
@@ -180,7 +180,7 @@ Call enact_decision EXACTLY ONCE with:
 - account_id: {account_id}  (if this is blank, use the PRIMARY flagged account from the evidence below)
 - reason: one concise sentence justifying the action (you may summarize this: {reason})
 
-Do not call any other tool. Destructive actions (temporary_freeze, full_block, escalate_compliance) will pause for a human analyst's approval before they take effect; non-destructive ones apply immediately. After enact_decision returns, stop.
+Do not call any other tool. Every decision pauses for a human analyst's approval before it takes effect. After enact_decision returns, stop.
 
 ## EVIDENCE (for the primary flagged account id, if needed)
 {evidence}
@@ -235,7 +235,7 @@ def _build_specialist(name: str, model: str) -> LlmAgent:
         instruction=_make_specialist_instruction(name),
         tools=_ADK_SPECIALIST_TOOLS[name],
         output_key=SPECIALIST_OUTPUT_KEYS[name],
-        generate_content_config=types.GenerateContentConfig(temperature=0.3),
+        generate_content_config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=800),
         # Leaf agents in the ParallelAgent — no transfer.
         disallow_transfer_to_parent=True,
         disallow_transfer_to_peers=True,
@@ -247,11 +247,23 @@ def build_investigation_agent(model: str = None) -> SequentialAgent:
     (parallel evidence collection → investigator synthesis → report)."""
     model = model or DEFAULT_MODEL
 
-    # Stage 1: three specialists investigate concurrently (ADK ParallelAgent).
-    evidence_collection = ParallelAgent(
+    # Stage 1: three specialists investigate the flagged account, each writing a
+    # findings summary to session state via its output_key; the investigator then
+    # reads all three.
+    #
+    # NOTE: this is a SequentialAgent, not a ParallelAgent. ADK's ParallelAgent
+    # runs the sub-agents inside an asyncio.TaskGroup, and on graph-heavy accounts
+    # (where the network analyst's gremlin traversals are slow) the group is torn
+    # down while a branch is still in flight. ADK's OpenTelemetry span context
+    # tokens then get detached in the wrong asyncio context ("Token was created in
+    # a different Context"), and the resulting GeneratorExit blows the TaskGroup up
+    # as a BaseExceptionGroup — killing the whole run ("stuck at N tool calls").
+    # Running the specialists sequentially removes that TaskGroup entirely, which
+    # is the only reliable way to avoid the crash with the current ADK version.
+    evidence_collection = SequentialAgent(
         name=EVIDENCE_COLLECTION_NAME,
         sub_agents=[_build_specialist(n, model) for n in SPECIALIST_NAMES],
-        description="Concurrently gather network, device, and velocity evidence on the flagged account.",
+        description="Gather network, device, and velocity evidence on the flagged account.",
     )
 
     investigator = LlmAgent(
@@ -259,7 +271,7 @@ def build_investigation_agent(model: str = None) -> SequentialAgent:
         model=model,
         instruction=_investigator_instruction,
         tools=INVESTIGATION_TOOLS,  # assesses only; enacting happens later
-        generate_content_config=types.GenerateContentConfig(temperature=0.3),
+        generate_content_config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=800),
         # The investigator owns its turn; no transfer to peers/parent.
         disallow_transfer_to_parent=True,
         disallow_transfer_to_peers=True,
@@ -293,5 +305,5 @@ def build_investigation_agent(model: str = None) -> SequentialAgent:
         sub_agents=[evidence_collection, investigator, report_writer, action_taker],
         description="Gather evidence in parallel, assess, write the report, then enact the decision.",
     )
-    logger.info(f"Built ADK investigation agent (model={model}, parallel evidence + post-report action)")
+    logger.info(f"Built ADK investigation agent (model={model}, sequential evidence + post-report action)")
     return agent

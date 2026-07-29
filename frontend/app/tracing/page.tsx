@@ -1,5 +1,7 @@
+// Use the same-origin `/zipkin` rewrite (next.config.js -> ZIPKIN_URL) so the
+// iframe works on remote deployments where Zipkin is not on the viewer's host.
 const TracingPage = () => (
-    <iframe src="http://localhost:9411/zipkin" className="iframe" style={{ width: "100%", height: "calc(100vh - 129px)" }} />
+    <iframe src="/zipkin" className="iframe" style={{ width: "100%", height: "calc(100vh - 129px)" }} />
 )
 
 export default TracingPage;

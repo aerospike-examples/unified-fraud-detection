@@ -2,11 +2,43 @@
 
 import { useState, useCallback, useRef, useEffect } from "react";
 
-// Connect directly to backend to avoid Next.js proxy buffering SSE
-// In production, this would be configured via environment variable
-const BACKEND_URL = typeof window !== 'undefined' 
-  ? (process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000")
-  : "http://localhost:4000";
+// SSE base URL: connect DIRECTLY to the backend, never through the Next.js
+// /api rewrite. The Next proxy buffers the entire SSE response body and only
+// flushes when the stream closes, so trace/progress events would all arrive at
+// once at the end (Review Workflow appears frozen until the run finishes).
+// A direct cross-origin EventSource streams incrementally (backend sets
+// permissive CORS + X-Accel-Buffering: no).
+function getBackendStreamUrl(): string {
+  if (typeof window === 'undefined') {
+    return process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:4000";
+  }
+  return process.env.NEXT_PUBLIC_BACKEND_URL || `${window.location.origin}/api`;
+}
+
+const INV_POINTER_KEY = "fraud_inv_by_user";
+
+function saveInvPointer(userId: string, investigationId: string) {
+  if (typeof window === "undefined") return;
+  try {
+    const raw = sessionStorage.getItem(INV_POINTER_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    map[userId] = investigationId;
+    sessionStorage.setItem(INV_POINTER_KEY, JSON.stringify(map));
+  } catch {
+    /* ignore */
+  }
+}
+
+function getInvPointer(userId: string): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = sessionStorage.getItem(INV_POINTER_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    return map[userId];
+  } catch {
+    return undefined;
+  }
+}
 
 // Types for investigation state
 export interface WorkflowStep {
@@ -100,6 +132,60 @@ export const SPECIALISTS: { id: SpecialistName; label: string }[] = [
   { id: "velocity_analyst", label: "Velocity Analyst" },
 ];
 
+/** Backend investigation node order — used to infer completed steps when SSE events were missed. */
+export const INVESTIGATION_NODE_ORDER = [
+  "alert_validation",
+  "data_collection",
+  "llm_agent",
+  "report_generation",
+] as const;
+
+export function markStepsThrough(
+  completed: string[],
+  node: string,
+): string[] {
+  const idx = INVESTIGATION_NODE_ORDER.indexOf(node as (typeof INVESTIGATION_NODE_ORDER)[number]);
+  if (idx < 0) return completed;
+  const next = [...completed];
+  for (let i = 0; i <= idx; i++) {
+    const step = INVESTIGATION_NODE_ORDER[i];
+    if (!next.includes(step)) next.push(step);
+  }
+  return next;
+}
+
+/** Mark every step before `node` as done (used on node_start). */
+export function markPriorSteps(completed: string[], node: string): string[] {
+  const idx = INVESTIGATION_NODE_ORDER.indexOf(node as (typeof INVESTIGATION_NODE_ORDER)[number]);
+  if (idx <= 0) return completed;
+  const next = [...completed];
+  for (let i = 0; i < idx; i++) {
+    const step = INVESTIGATION_NODE_ORDER[i];
+    if (!next.includes(step)) next.push(step);
+  }
+  return next;
+}
+
+export function isStepCompleted(
+  stepId: string,
+  completedSteps: string[],
+  currentNode: string,
+): boolean {
+  if (completedSteps.includes(stepId)) return true;
+  const cur = INVESTIGATION_NODE_ORDER.indexOf(currentNode as (typeof INVESTIGATION_NODE_ORDER)[number]);
+  const step = INVESTIGATION_NODE_ORDER.indexOf(stepId as (typeof INVESTIGATION_NODE_ORDER)[number]);
+  return cur >= 0 && step >= 0 && cur > step;
+}
+
+export function isStepRunning(
+  stepId: string,
+  completedSteps: string[],
+  currentNode: string,
+): boolean {
+  if (isStepCompleted(stepId, completedSteps, currentNode)) return false;
+  return currentNode === stepId;
+}
+
 // Human-in-the-loop: a destructive action the agent has paused on, awaiting
 // analyst approval before it is enforced.
 export interface PendingAction {
@@ -117,6 +203,7 @@ export interface PendingAction {
 export const DISPOSITIONS: { id: string; label: string }[] = [
   { id: "clear", label: "Clear (not fraud)" },
   { id: "allow_monitor", label: "Allow & Monitor" },
+  { id: "step_up_auth", label: "Step-up Authentication" },
   { id: "temporary_freeze", label: "Temporary Freeze" },
   { id: "full_block", label: "Full Block (Confirm Fraud)" },
   { id: "escalate_compliance", label: "Escalate to Compliance" },
@@ -219,7 +306,11 @@ export interface InvestigationState {
   
   // Performance metrics
   performanceMetrics?: PerformanceMetrics;
-  
+
+  // SSE connection dropped mid-run; the run continues on the server and we are
+  // polling for the persisted result.
+  reconnecting?: boolean;
+
   // Error
   error?: string;
 }
@@ -242,12 +333,17 @@ export function useInvestigation() {
   const [state, setState] = useState<InvestigationState>(initialState);
   const eventSourceRef = useRef<EventSource | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const investigationIdRef = useRef<string | undefined>(undefined);
+  const userIdRef = useRef<string | undefined>(undefined);
+  const intentionallyClosedRef = useRef(false);
+  const recoveryTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Latest pending action, kept in a ref so approveAction reads it without
   // stale-closure or in-updater side effects.
   const pendingActionRef = useRef<PendingAction | null>(null);
 
   // Cleanup function
   const cleanup = useCallback(() => {
+    intentionallyClosedRef.current = true;
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
@@ -255,6 +351,10 @@ export function useInvestigation() {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
+    }
+    if (recoveryTimerRef.current) {
+      clearInterval(recoveryTimerRef.current);
+      recoveryTimerRef.current = null;
     }
   }, []);
 
@@ -271,6 +371,7 @@ export function useInvestigation() {
           setState((prev) => ({
             ...prev,
             status: "running",
+            currentNode: prev.currentNode || "alert_validation",
           }));
         };
 
@@ -278,12 +379,18 @@ export function useInvestigation() {
         eventSource.addEventListener("start", (event) => {
           console.log("[Investigation] Start event received:", event.data);
           const data = JSON.parse(event.data);
+          investigationIdRef.current = data.investigation_id;
+          if (data.user_id) userIdRef.current = data.user_id;
+          if (data.user_id && data.investigation_id) {
+            saveInvPointer(data.user_id, data.investigation_id);
+          }
           setState((prev) => ({
             ...prev,
             investigation_id: data.investigation_id,
             user_id: data.user_id,
             steps: data.steps || [],
             status: "running",
+            currentNode: "alert_validation",
           }));
         });
 
@@ -292,7 +399,7 @@ export function useInvestigation() {
           const trace: TraceEvent = JSON.parse(event.data);
           console.log(`[Investigation] Trace: ${trace.type} - ${trace.node}`, trace.data);
           setState((prev) => {
-            const newCompletedSteps = [...prev.completedSteps];
+            let newCompletedSteps = [...prev.completedSteps];
             const newToolCalls = [...prev.toolCalls];
             let newIterations = prev.agentIterations;
             let newAssessment = prev.finalAssessment;
@@ -301,6 +408,9 @@ export function useInvestigation() {
             if (trace.type === "node_complete" && !newCompletedSteps.includes(trace.node)) {
               newCompletedSteps.push(trace.node);
               console.log(`[Investigation] Step completed: ${trace.node}`);
+            }
+            if (trace.type === "node_start") {
+              newCompletedSteps = markPriorSteps(newCompletedSteps, trace.node);
             }
             
             // Track tool calls from agent
@@ -368,9 +478,33 @@ export function useInvestigation() {
           const data = JSON.parse(event.data);
           
           setState((prev) => {
+            let completedSteps = [...prev.completedSteps];
+            if (data.alert_evidence) {
+              completedSteps = markStepsThrough(completedSteps, "alert_validation");
+            }
+            if (data.initial_evidence) {
+              completedSteps = markStepsThrough(completedSteps, "data_collection");
+            }
+            if (data.final_assessment) {
+              completedSteps = markStepsThrough(completedSteps, "llm_agent");
+            }
+            if (data.report_markdown) {
+              completedSteps = markStepsThrough(completedSteps, "report_generation");
+            }
+
+            let currentNode = data.node || prev.currentNode;
+            if (data.phase === "llm_reasoning" || data.initial_evidence) {
+              currentNode = "llm_agent";
+            } else if (data.phase === "report" || data.report_markdown) {
+              currentNode = "report_generation";
+            } else if (data.phase === "awaiting_decision") {
+              currentNode = "llm_agent";
+            }
+
             const updates: Partial<InvestigationState> = {
-              currentNode: data.node || prev.currentNode,
+              currentNode,
               currentPhase: data.phase || prev.currentPhase,
+              completedSteps,
             };
 
             // Update evidence based on node
@@ -397,6 +531,14 @@ export function useInvestigation() {
             }
             if (data.report_markdown) {
               updates.report = data.report_markdown;
+            }
+
+            const nextCompleted = [...completedSteps];
+            if (data.report_markdown && !nextCompleted.includes("report_generation")) {
+              nextCompleted.push("report_generation");
+            }
+            if (nextCompleted.length !== prev.completedSteps.length) {
+              updates.completedSteps = nextCompleted;
             }
             
             // Handle new agentic workflow data
@@ -427,16 +569,22 @@ export function useInvestigation() {
         });
 
         // Handle 'action_confirmation_required' event (human-in-the-loop).
-        // The agent has paused on a destructive action; surface it for approval.
+        // The agent has paused before enacting; surface the report + decision for approval.
         eventSource.addEventListener("action_confirmation_required", (event) => {
           const data = JSON.parse(event.data) as PendingAction;
           console.log("[Investigation] Action confirmation required:", data);
+          intentionallyClosedRef.current = true;
           eventSource.close();
           pendingActionRef.current = data;
           setState((prev) => ({
             ...prev,
             status: "awaiting_confirmation",
             pendingAction: data,
+            currentNode: "llm_agent",
+            currentPhase: "awaiting_decision",
+            completedSteps: prev.completedSteps.includes("report_generation")
+              ? prev.completedSteps
+              : markStepsThrough(prev.completedSteps, "report_generation"),
           }));
         });
 
@@ -451,45 +599,205 @@ export function useInvestigation() {
         });
 
         // Handle 'complete' event
-        eventSource.addEventListener("complete", (event) => {
+        eventSource.addEventListener("complete", async (event) => {
           const data = JSON.parse(event.data);
-          setState((prev) => ({
-            ...prev,
-            status: "completed",
-            investigation_id: data.investigation_id,
-            pendingAction: undefined,
-          }));
+          intentionallyClosedRef.current = true;
+          eventSource.close();
+          const allSteps = ["alert_validation", "data_collection", "llm_agent", "report_generation"];
+          let reloadUserId: string | undefined = data.user_id;
+          setState((prev) => {
+            reloadUserId = reloadUserId || prev.user_id;
+            return {
+              ...prev,
+              status: "completed",
+              investigation_id: data.investigation_id,
+              currentNode: "complete",
+              currentPhase: "complete",
+              completedSteps: allSteps,
+              pendingAction: undefined,
+            };
+          });
+          if (reloadUserId) {
+            try {
+              const invId = data.investigation_id;
+              const res = invId
+                ? await fetch(`/api/investigation/record/${invId}`)
+                : await fetch(`/api/investigation/user/${reloadUserId}/latest`);
+              if (res.ok) {
+                const body = await res.json();
+                const inv = body.investigation;
+                if (body.found && inv?.report_markdown) {
+                  setState((prev) => ({
+                    ...prev,
+                    report: inv.report_markdown,
+                    finalAssessment: inv.final_assessment ?? prev.finalAssessment,
+                    toolCalls: inv.tool_calls ?? prev.toolCalls,
+                    agentIterations: inv.agent_iterations ?? prev.agentIterations,
+                    specialistFindings: inv.specialist_findings ?? prev.specialistFindings,
+                  }));
+                }
+              }
+            } catch (e) {
+              console.warn("[Investigation] Could not load persisted report:", e);
+            }
+          }
           eventSource.close();
         });
 
-        // Handle 'error' event
+        // Handle 'error' event from the server
         eventSource.addEventListener("error", (event) => {
-          // Check if it's a custom error event or connection error
           if (event instanceof MessageEvent && event.data) {
             try {
               const data = JSON.parse(event.data);
+              if (data.code === "already_running") {
+                intentionallyClosedRef.current = true;
+                eventSource.close();
+                return;
+              }
+              intentionallyClosedRef.current = true;
+              eventSource.close();
               setState((prev) => ({
                 ...prev,
                 status: "error",
                 error: data.error || "Unknown error",
               }));
             } catch {
-              // Not a custom error, likely connection issue
+              // Not a custom error payload
             }
           }
         });
 
-        // Handle connection errors
+        // Recover from a mid-run SSE drop. The investigation keeps running on the
+        // server (background task that persists to KV), so instead of hanging on a
+        // dead "running" spinner we poll the persisted record until it completes or
+        // pauses for approval, then restore from it.
+        const beginRecovery = () => {
+          if (recoveryTimerRef.current) return; // already recovering
+          const invId = investigationIdRef.current;
+          const uid = userIdRef.current;
+          setState((prev) =>
+            prev.status === "running" || prev.status === "connecting"
+              ? { ...prev, reconnecting: true }
+              : prev
+          );
+          let attempts = 0;
+          const maxAttempts = 40; // ~2 min at 3s
+          const stop = () => {
+            if (recoveryTimerRef.current) {
+              clearInterval(recoveryTimerRef.current);
+              recoveryTimerRef.current = null;
+            }
+          };
+          const poll = async () => {
+            attempts += 1;
+            try {
+              const res = invId
+                ? await fetch(`/api/investigation/record/${invId}`)
+                : uid
+                ? await fetch(`/api/investigation/user/${uid}/latest`)
+                : null;
+              if (res && res.ok) {
+                const body = await res.json();
+                const inv = body.investigation;
+                if (body.found && inv) {
+                  if (inv.status === "completed" && inv.report_markdown) {
+                    stop();
+                    setState((prev) => ({
+                      ...prev,
+                      status: "completed",
+                      reconnecting: false,
+                      investigation_id: inv.investigation_id,
+                      currentNode: "complete",
+                      currentPhase: "complete",
+                      completedSteps: ["alert_validation", "data_collection", "llm_agent", "report_generation"],
+                      report: inv.report_markdown,
+                      finalAssessment: inv.final_assessment ?? prev.finalAssessment,
+                      toolCalls: inv.tool_calls ?? prev.toolCalls,
+                      agentIterations: inv.agent_iterations ?? prev.agentIterations,
+                      specialistFindings: inv.specialist_findings ?? prev.specialistFindings,
+                      enactedActions: inv.enacted_actions ?? prev.enactedActions,
+                      pendingAction: undefined,
+                    }));
+                    return;
+                  }
+                  if (inv.status === "awaiting_confirmation") {
+                    const pending = inv.pending_action as PendingAction | undefined;
+                    if (pending) pendingActionRef.current = pending;
+                    stop();
+                    setState((prev) => ({
+                      ...prev,
+                      status: "awaiting_confirmation",
+                      reconnecting: false,
+                      investigation_id: inv.investigation_id,
+                      currentNode: "llm_agent",
+                      currentPhase: "awaiting_decision",
+                      pendingAction: pending ?? prev.pendingAction,
+                      report: inv.report_markdown ?? prev.report,
+                      finalAssessment: inv.final_assessment ?? prev.finalAssessment,
+                      toolCalls: inv.tool_calls ?? prev.toolCalls,
+                      specialistFindings: inv.specialist_findings ?? prev.specialistFindings,
+                    }));
+                    return;
+                  }
+                  if (inv.status === "error") {
+                    stop();
+                    setState((prev) => ({
+                      ...prev,
+                      status: "error",
+                      reconnecting: false,
+                      error: "The investigation failed on the server. Please run it again.",
+                    }));
+                    return;
+                  }
+                }
+              }
+            } catch {
+              // transient — keep polling
+            }
+            if (attempts >= maxAttempts) {
+              stop();
+              setState((prev) =>
+                prev.status === "completed" || prev.status === "awaiting_confirmation"
+                  ? prev
+                  : {
+                      ...prev,
+                      status: "error",
+                      reconnecting: false,
+                      error:
+                        "Connection lost and the investigation did not finish in time. Refresh to check for results.",
+                    }
+              );
+            }
+          };
+          recoveryTimerRef.current = setInterval(poll, 3000);
+          poll();
+        };
+
         eventSource.onerror = (error) => {
           console.error("[Investigation] SSE error:", error, "readyState:", eventSource.readyState);
+          if (intentionallyClosedRef.current) {
+            return;
+          }
+          // Mid-run drop (we already saw the start event): the run continues on
+          // the server. Stop this stream and recover from the persisted record.
+          if (investigationIdRef.current) {
+            intentionallyClosedRef.current = true;
+            eventSource.close();
+            beginRecovery();
+            return;
+          }
+          // Not started yet — let EventSource auto-reconnect; only surface an
+          // error if the browser gave up entirely.
           if (eventSource.readyState === EventSource.CLOSED) {
             setState((prev) => {
-              // Don't clobber a clean stop: completed runs and HITL pauses both
-              // close the stream on purpose.
               if (prev.status === "completed" || prev.status === "awaiting_confirmation") {
                 return prev;
               }
-              return { ...prev, status: "error", error: "Connection lost" };
+              return {
+                ...prev,
+                status: "error",
+                error: prev.error || "Could not connect to the investigation service.",
+              };
             });
           }
         };
@@ -504,17 +812,21 @@ export function useInvestigation() {
   const startInvestigation = useCallback(
     async (userId: string, investigationId?: string) => {
       cleanup();
+      intentionallyClosedRef.current = false;
+      investigationIdRef.current = investigationId;
+      userIdRef.current = userId;
 
-      setState((prev) => ({
+      setState({
         ...initialState,
         status: "connecting",
         user_id: userId,
         investigation_id: investigationId,
-      }));
+        currentNode: "alert_validation",
+      });
 
       try {
-        // Build SSE URL - connect directly to backend
-        let url = `${BACKEND_URL}/investigation/${userId}/stream`;
+        const base = getBackendStreamUrl();
+        let url = `${base}/investigation/${userId}/stream`;
         if (investigationId) {
           url += `?investigation_id=${investigationId}`;
         }
@@ -544,7 +856,8 @@ export function useInvestigation() {
 
       cleanup();
       pendingActionRef.current = null;
-      let url = `${BACKEND_URL}/investigation/${pending.investigation_id}/resume?approved=${approved}`;
+      intentionallyClosedRef.current = false;
+      let url = `${getBackendStreamUrl()}/investigation/${pending.investigation_id}/resume?approved=${approved}`;
       if (!approved && override) url += `&override=${encodeURIComponent(override)}`;
       console.log("[Investigation] Resuming with decision:", { approved, override, url });
 
@@ -564,6 +877,45 @@ export function useInvestigation() {
     [cleanup, attachStreamListeners]
   );
 
+  // Directly set (or change) the disposition on an investigation, without
+  // requiring the agent to have paused with a proposed action first. Used by
+  // the "view report" flow so an analyst can make the first decision when the
+  // agent never produced one, or change a decision that was already enacted.
+  const manualDecide = useCallback(
+    async (investigationId: string, decision: string, reason?: string): Promise<boolean> => {
+      try {
+        const res = await fetch(`/api/investigation/${investigationId}/decide`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision, reason }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.detail || "Failed to record decision");
+        }
+        const body = await res.json();
+        const inv = body.investigation;
+        pendingActionRef.current = null;
+        setState((prev) => ({
+          ...prev,
+          status: "completed",
+          pendingAction: undefined,
+          enactedActions: inv?.enacted_actions ?? prev.enactedActions,
+          report: inv?.report_markdown ?? prev.report,
+        }));
+        return true;
+      } catch (error) {
+        console.error("[Investigation] Manual decision failed:", error);
+        setState((prev) => ({
+          ...prev,
+          error: error instanceof Error ? error.message : "Failed to record decision",
+        }));
+        return false;
+      }
+    },
+    []
+  );
+
   // Stop investigation
   const stopInvestigation = useCallback(() => {
     cleanup();
@@ -580,12 +932,21 @@ export function useInvestigation() {
     setState(initialState);
   }, [cleanup]);
 
-  // Load existing investigation from KV store
-  const loadExistingInvestigation = useCallback(async (userId: string): Promise<boolean> => {
+  // Load existing investigation from KV store (does not clobber an active run).
+  const loadExistingInvestigation = useCallback(async (userId: string, force = false): Promise<boolean> => {
     try {
       console.log(`[Investigation] Checking for existing investigation for user ${userId}`);
-      
-      const response = await fetch(`/api/investigation/user/${userId}/latest`);
+
+      const pointerId = getInvPointer(userId);
+      let response: Response;
+      if (pointerId) {
+        response = await fetch(`/api/investigation/record/${pointerId}`);
+        if (!response.ok) {
+          response = await fetch(`/api/investigation/user/${userId}/latest`);
+        }
+      } else {
+        response = await fetch(`/api/investigation/user/${userId}/latest`);
+      }
       if (!response.ok) {
         console.log("[Investigation] No existing investigation found (API error)");
         return false;
@@ -600,34 +961,50 @@ export function useInvestigation() {
       
       const inv = data.investigation;
       console.log(`[Investigation] Found existing investigation: ${inv.investigation_id}`);
-      
-      // Restore state from saved investigation
-      setState({
-        investigation_id: inv.investigation_id,
-        user_id: inv.user_id,
-        status: "completed",
-        currentNode: "report_generation",
-        currentPhase: "complete",
-        steps: [
-          { id: "alert_validation", name: "Alert Validation", description: "Validate initial alert", phase: "validation" },
-          { id: "data_collection", name: "Data Collection", description: "Collect evidence", phase: "collection" },
-          { id: "llm_agent", name: "AI Agent Investigation", description: "AI analysis", phase: "analysis" },
-          { id: "report_generation", name: "Report Generation", description: "Generate report", phase: "reporting" },
-        ],
-        completedSteps: inv.completed_steps || ["alert_validation", "data_collection", "llm_agent", "report_generation"],
-        initialEvidence: inv.initial_evidence,
-        finalAssessment: inv.final_assessment,
-        toolCalls: inv.tool_calls || [],
-        traceEvents: [],
-        report: inv.report_markdown,
-        agentIterations: inv.agent_iterations || 0,
-        enactedActions: inv.enacted_actions || [],
-        specialistFindings: inv.specialist_findings || {},
-        priorCases: inv.prior_cases || [],
+
+      const restoredStatus =
+        inv.status === "awaiting_confirmation" ? "awaiting_confirmation" : "completed";
+
+      let loaded = false;
+      setState((prev) => {
+        if (!force && (prev.status === "running" || prev.status === "connecting" || prev.status === "awaiting_confirmation")) {
+          return prev;
+        }
+        loaded = true;
+        const pending = inv.pending_action as PendingAction | undefined;
+        if (pending) {
+          pendingActionRef.current = pending;
+        }
+        return {
+          investigation_id: inv.investigation_id,
+          user_id: inv.user_id,
+          status: restoredStatus,
+          currentNode: restoredStatus === "completed" ? "report_generation" : "llm_agent",
+          currentPhase: restoredStatus === "completed" ? "complete" : "awaiting_decision",
+          steps: [
+            { id: "alert_validation", name: "Alert Validation", description: "Validate initial alert", phase: "validation" },
+            { id: "data_collection", name: "Data Collection", description: "Collect evidence", phase: "collection" },
+            { id: "llm_agent", name: "AI Agent Investigation", description: "AI analysis", phase: "analysis" },
+            { id: "report_generation", name: "Report Generation", description: "Generate report", phase: "reporting" },
+          ],
+          completedSteps: inv.completed_steps || ["alert_validation", "data_collection", "llm_agent", "report_generation"],
+          initialEvidence: inv.initial_evidence,
+          finalAssessment: inv.final_assessment,
+          toolCalls: inv.tool_calls || [],
+          traceEvents: [],
+          report: inv.report_markdown,
+          agentIterations: inv.agent_iterations || 0,
+          enactedActions: inv.enacted_actions || [],
+          specialistFindings: inv.specialist_findings || {},
+          priorCases: inv.prior_cases || [],
+          pendingAction: pending,
+        };
       });
       
-      console.log("[Investigation] Restored existing investigation state");
-      return true;
+      if (loaded) {
+        console.log("[Investigation] Restored existing investigation state");
+      }
+      return loaded;
       
     } catch (error) {
       console.error("[Investigation] Error loading existing investigation:", error);
@@ -638,10 +1015,10 @@ export function useInvestigation() {
   // Get step status
   const getStepStatus = useCallback(
     (stepId: string): "pending" | "running" | "completed" => {
-      if (state.completedSteps.includes(stepId)) {
+      if (isStepCompleted(stepId, state.completedSteps, state.currentNode)) {
         return "completed";
       }
-      if (state.currentNode === stepId) {
+      if (isStepRunning(stepId, state.completedSteps, state.currentNode)) {
         return "running";
       }
       return "pending";
@@ -660,6 +1037,7 @@ export function useInvestigation() {
     startInvestigation,
     stopInvestigation,
     approveAction,
+    manualDecide,
     reset,
     getStepStatus,
     loadExistingInvestigation,

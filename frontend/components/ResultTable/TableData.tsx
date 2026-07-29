@@ -29,13 +29,13 @@ export default function TableData({ item, type, className, label, result }: Prop
     
     let risk = { level: "low", color: "success" }
 
-    if(type === 'risk') risk = getRiskLevel(result?.risk_score ?? result?.fraud_score ?? 0)
-    else if(type === 'date') value = formatDate(value);
-    else if(type === 'datetime') value = formatDateTime(value);
-    else if(type === 'currency') value = formatCurrency(value);
+    if(type === 'risk') risk = getRiskLevel(Number(result?.risk_score ?? result?.fraud_score ?? 0))
+    else if(type === 'date') value = value ? formatDate(String(value)) : '—';
+    else if(type === 'datetime') value = value ? formatDateTime(String(value)) : '—';
+    else if(type === 'currency') value = formatCurrency(Number(value ?? 0));
 
     return (
-        <td key={item} className={clsx('p-3', className)}>
+        <td key={item} className={clsx('p-3 overflow-hidden', className)}>
             {type !== 'fraud' ? (
                 <Label
                     {...label}
@@ -45,7 +45,7 @@ export default function TableData({ item, type, className, label, result }: Prop
                     {...label?.badge && type === 'risk' && { 
                         badge: { 
                             ...label.badge, 
-                            text: `${risk.level} ${(value as number ?? 0).toFixed(1)}`,
+                            text: `${risk.level} ${Number(value ?? 0).toFixed(1)}`,
                             variant: risk.color as any
                         }
                     }} />
@@ -66,12 +66,17 @@ export default function TableData({ item, type, className, label, result }: Prop
                             <TooltipContent>
                                 {value === 'review' ? (
                                     <span className="text-xs text-muted-foreground">Connected to 1 flagged account(s)</span>
+                                ) : result?.details?.length > 1 ? (
+                                    <span className="text-xs text-muted-foreground">Multiple fraud triggers - check analysis</span>
                                 ) : (
-                                    result?.details?.length > 1 ? (
-                                        <span className="text-xs text-muted-foreground">Multiple fraud triggers - check analysis</span>
-                                    ) : (
-                                        <span className="text-xs text-muted-foreground">{JSON.parse(result?.details ?? "{}")?.reason ?? "Undefined reason"}</span>
-                                    )
+                                    <span className="text-xs text-muted-foreground">{(() => {
+                                        try {
+                                            const parsed = JSON.parse(result?.details ?? '{}')
+                                            return parsed?.reason ?? 'Undefined reason'
+                                        } catch {
+                                            return 'Undefined reason'
+                                        }
+                                    })()}</span>
                                 )}
                             </TooltipContent>
                         </Tooltip>

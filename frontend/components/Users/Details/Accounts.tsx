@@ -1,6 +1,6 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { AlertTriangle, Calendar, CreditCard } from 'lucide-react'
+import { AlertTriangle, Calendar, CreditCard, Snowflake } from 'lucide-react'
 import { formatCurrency, formatDate } from '@/lib/utils'
 
 export interface Account {
@@ -11,6 +11,8 @@ export interface Account {
     bank_name?: string
 	created_date?: string
 	fraud_flag?: boolean
+    /** Reversible hold from a temporary_freeze disposition (not fraud). */
+    frozen?: boolean
     status?: string
 }
 
@@ -42,6 +44,12 @@ const Accounts = ({ accounts }: { accounts: Account[] }) => {
                                     <Badge variant="destructive" className="text-xs flex items-center gap-1">
                                     <AlertTriangle className="h-3 w-3" />
                                         FRAUD
+                                    </Badge>
+                                )}
+                                {!account.fraud_flag && account.frozen && (
+                                    <Badge className="text-xs flex items-center gap-1 bg-cyan-100 text-cyan-800">
+                                    <Snowflake className="h-3 w-3" />
+                                        FROZEN
                                     </Badge>
                                 )}
                                 </div>

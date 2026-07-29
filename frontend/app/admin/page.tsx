@@ -7,11 +7,15 @@ import Performance from '@/components/Admin/Performance'
 import Generation from '@/components/Admin/Generation'
 import DataManagement from '@/components/Admin/DataManagement'
 import FraudDetection from '@/components/Admin/FraudDetection'
+import { useAppConfig } from '@/hooks/useAppConfig'
 
 export default function AdminPage() {
 	const [active, setActive] = useState('data');
 	const [isGenerating, setIsGenerating] = useState(false);
-	
+	const { config } = useAppConfig();
+	// RT generation is unavailable when data is loaded externally (remote mode)
+	const showGeneration = config.capabilities.rtGeneration;
+
 	return (
     	<div className="space-y-6">
       		<div className="flex items-center justify-between">
@@ -21,21 +25,25 @@ export default function AdminPage() {
 						Manage transaction generation and fraud detection scenarios
 					</p>
 				</div>
-				<h3 className="text-xl font-medium tracking-tight flex gap-4 items-center mr-2">
-					Generating:
-					{isGenerating ? <RefreshCw className='w-6 h-6 animate-spin text-green-600' /> : <div className='w-6 h-6'>🛑</div>}
-				</h3>
+				{showGeneration && (
+					<h3 className="text-xl font-medium tracking-tight flex gap-4 items-center mr-2">
+						Generating:
+						{isGenerating ? <RefreshCw className='w-6 h-6 animate-spin text-green-600' /> : <div className='w-6 h-6'>🛑</div>}
+					</h3>
+				)}
       		</div>
 			<Tabs value={active} onValueChange={setActive} className="space-y-4">
-				<TabsList className="grid w-full grid-cols-4">
+				<TabsList className={`grid w-full ${showGeneration ? 'grid-cols-4' : 'grid-cols-3'}`}>
 				<TabsTrigger value="data" className="flex items-center space-x-2">
 						<Database className="w-4 h-4" />
 						<span>Data Management</span>
 					</TabsTrigger>
-					<TabsTrigger value="generation" className="flex items-center space-x-2">
-						<Activity className="w-4 h-4" />
-						<span>RT Transaction Generation</span>
-					</TabsTrigger>
+					{showGeneration && (
+						<TabsTrigger value="generation" className="flex items-center space-x-2">
+							<Activity className="w-4 h-4" />
+							<span>RT Transaction Generation</span>
+						</TabsTrigger>
+					)}
 					<TabsTrigger value="fraud-detection" className="flex items-center space-x-2">
 						<Shield className="w-4 h-4" />
 						<span>Fraud Detection Rules</span>
@@ -49,9 +57,11 @@ export default function AdminPage() {
 			<TabsContent forceMount value="data" className={`space-y-4 ${active !== 'data' ? 'hidden' : ''}`}>
 				<DataManagement />
 			</TabsContent>
-			<TabsContent forceMount value="generation" className={`space-y-4 ${active !== 'generation' ? 'hidden' : ''}`}>
-				<Generation isGenerating={isGenerating} setIsGenerating={setIsGenerating} />
-			</TabsContent>
+			{showGeneration && (
+				<TabsContent forceMount value="generation" className={`space-y-4 ${active !== 'generation' ? 'hidden' : ''}`}>
+					<Generation isGenerating={isGenerating} setIsGenerating={setIsGenerating} />
+				</TabsContent>
+			)}
 			<TabsContent forceMount value="fraud-detection" className={`space-y-4 ${active !== 'fraud-detection' ? 'hidden' : ''}`}>
 				<FraudDetection />
 			</TabsContent>

@@ -92,10 +92,27 @@ async def test_persists_to_kv_when_connected(
         mock_action.return_value = {"status": "executed", "action": "allow_monitor"}
         await collect_async(svc.stream_investigation("U0001234", "inv_kv_persist"))
 
-    fake_aerospike.put_investigation.assert_called_once()
+    fake_aerospike.put_investigation.assert_called()
     args = fake_aerospike.put_investigation.call_args[0]
     assert args[0] == "inv_kv_persist"
     assert args[1]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_hitl_persists_report_to_kv(
+    fake_aerospike, fake_graph, action_services_bound, high_risk_pipeline,
+):
+    svc = InvestigationService(fake_aerospike, fake_graph, engine_name="mock")
+    await svc.initialize()
+    fake_aerospike.is_connected.return_value = True
+
+    await collect_async(svc.stream_investigation("U0001234", "inv_kv_hitl"))
+
+    assert fake_aerospike.put_investigation.called
+    args = fake_aerospike.put_investigation.call_args[0]
+    assert args[0] == "inv_kv_hitl"
+    assert args[1]["status"] == "awaiting_confirmation"
+    assert args[1].get("report_markdown")
 
 
 @pytest.mark.asyncio
